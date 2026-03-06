@@ -1404,13 +1404,7 @@ else:
         "🤖 ML Results", "📐 Model Metrics", "📊 History & Chart", "🌍 Features", "💬 Chat", "🔔 Alerts"
     ])
     
-    # ... (The rest of your code inside tab1, tab2, etc. follows here) ...
-    
-
-    # ── TABS ──
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "🤖 ML Results", "📐 Model Metrics", "📊 History & Chart", "🌍 Features", "💬 Chat", "🔔 Alerts"
-    ])
+    # ... (The rest of your code inside tab1, tab2, etc. follows here) ...s
 
     # ════════ TAB 1: ML RESULTS ════════
     with tab1:

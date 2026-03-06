@@ -539,259 +539,302 @@ def maybe_refresh_signals(force: bool = False):
             st.session_state.global_signals_loading = False
 
 
-def render_global_signals_panel():
-    """
-    Renders the always-visible Global Signals panel at the top of the page.
-    Shows live crypto, FX, news, fear & greed, and Gemini's qualitative view.
-    Refreshes every 5 minutes automatically.
-    """
-    # Trigger refresh if stale
+def _sig_badge(score, invert=False):
+    """Return (label, fg_color, bg_color) for a score -100..+100.
+    Positive = USDT bullish (NGN weakens). invert=True flips logic."""
+    try: score = float(score)
+    except: score = 0
+    if invert: score = -score
+    if score > 15:   return "BEARISH", "#f0455a", "rgba(240,69,90,0.13)"
+    if score < -15:  return "BULLISH", "#05d68a", "rgba(5,214,138,0.13)"
+    return "NEUTRAL", "#f5a623", "rgba(245,166,35,0.13)"
+
+def _signal_card(icon, title, badge_label, badge_fg, badge_bg,
+                 source_label, source_tag, metrics_line, body):
+    """Renders one signal card exactly matching the reference design."""
+    return f"""
+<div style="background:var(--card);border:1px solid var(--border);border-radius:14px;
+padding:16px 18px;margin-bottom:10px;">
+  <div style="display:flex;align-items:flex-start;justify-content:space-between;
+  margin-bottom:8px;gap:8px;flex-wrap:wrap;">
+    <div style="display:flex;align-items:center;gap:7px;">
+      <span style="font-size:14px;">{icon}</span>
+      <span style="font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:700;
+      letter-spacing:.5px;color:var(--text);">{title}</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
+      <span style="background:{badge_bg};color:{badge_fg};border:1px solid {badge_fg}44;
+      border-radius:5px;padding:2px 9px;font-size:10px;font-family:'IBM Plex Mono',monospace;
+      font-weight:700;letter-spacing:.8px;">{badge_label}</span>
+      <span style="font-size:9px;color:var(--muted);font-family:'IBM Plex Mono',monospace;">
+        <span class="live-dot" style="width:5px;height:5px;display:inline-block;
+        border-radius:50%;background:var(--green);animation:blink 2s infinite;
+        margin-right:3px;vertical-align:middle;"></span>{source_label}
+        &nbsp;<span style="color:var(--border2);">·</span>&nbsp;
+        <span style="color:var(--blue);">{source_tag}</span>
+      </span>
+    </div>
+  </div>
+  <div style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--amber);
+  margin-bottom:6px;">{metrics_line}</div>
+  <div style="font-size:12px;color:var(--muted2);line-height:1.65;">{body}</div>
+</div>"""
+
+
+def render_global_signals_tab():
+    """Global Signals tab — structured signal cards, refreshes every 5 min."""
     maybe_refresh_signals()
 
     sig  = st.session_state.global_signals or {}
     anal = sig.get("analysis", {})
     now  = st.session_state.global_signals_time
-    age_str = ""
-    if now:
-        age_s = int((datetime.datetime.now() - now).total_seconds())
-        if age_s < 60:
-            age_str = f"{age_s}s ago"
-        else:
-            age_str = f"{age_s//60}m {age_s%60}s ago"
-    next_refresh = max(0, SIGNALS_TTL - (
-        int((datetime.datetime.now() - now).total_seconds()) if now else SIGNALS_TTL
-    ))
-    next_str = f"{next_refresh//60}m {next_refresh%60}s"
 
-    # ── Panel Header ──
-    st.markdown(f"""
-    <div style="background:linear-gradient(135deg,#0c1220,#111d2e);
-    border:1px solid #243550;border-radius:16px;padding:18px 22px;margin-bottom:18px;">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px;">
-        <div>
+    # ── Status bar ──
+    age_str, next_str = "never", "5m 0s"
+    if now:
+        age_s   = int((datetime.datetime.now() - now).total_seconds())
+        age_str = f"{age_s}s ago" if age_s < 60 else f"{age_s//60}m {age_s%60}s ago"
+        rem     = max(0, SIGNALS_TTL - age_s)
+        next_str = f"{rem//60}m {rem%60}s"
+
+    n_hl = sig.get("headline_count", 0)
+    n_src = len(sig.get("sources", []))
+
+    hcol1, hcol2 = st.columns([6, 1])
+    with hcol1:
+        st.markdown(f"""
+        <div style="margin-bottom:14px;">
           <div style="font-family:'IBM Plex Mono',monospace;font-size:9px;letter-spacing:3px;
-          text-transform:uppercase;color:var(--purple);margin-bottom:3px;">
-            🌐 LIVE GLOBAL SIGNALS FEED
-          </div>
+          text-transform:uppercase;color:var(--purple);margin-bottom:4px;">🌐 LIVE GLOBAL SIGNALS</div>
           <div style="font-size:11px;color:var(--muted2);">
-            {len(sig.get('headlines',[]))} headlines · {len(sig.get('sources',[]))} sources ·
-            <span style="color:var(--green);">Updated {age_str}</span> ·
+            {n_hl} headlines &nbsp;·&nbsp; {n_src} sources &nbsp;·&nbsp;
+            <span style="color:var(--green);">Updated {age_str}</span> &nbsp;·&nbsp;
             <span style="color:var(--muted);">Next refresh in {next_str}</span>
           </div>
-        </div>
-        <div style="display:flex;align-items:center;gap:10px;">
-    """, unsafe_allow_html=True)
-
-    col_refresh, col_spacer = st.columns([1, 8])
-    with col_refresh:
-        if st.button("↻ Refresh", key="refresh_signals_btn", use_container_width=True):
+        </div>""", unsafe_allow_html=True)
+    with hcol2:
+        if st.button("↻ Refresh", key="gs_refresh_btn", use_container_width=True):
             maybe_refresh_signals(force=True)
             st.rerun()
 
-    st.markdown("</div></div>", unsafe_allow_html=True)
-
     if not sig:
-        st.markdown('<p style="color:var(--muted2);font-size:12px;">Loading signals...</p>',
-                    unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("""<div class="ocard" style="text-align:center;padding:40px;">
+        <div style="font-size:32px;margin-bottom:12px;">📡</div>
+        <p style="color:var(--muted2);">Press ↻ Refresh to load live global signals.</p>
+        </div>""", unsafe_allow_html=True)
         return
 
-    # ── ROW 1: Crypto ticker ──
-    crypto_items = [
-        ("BTC",  sig.get("btc_usd"),  sig.get("btc_24h"),  "₿"),
-        ("ETH",  sig.get("eth_usd"),  sig.get("eth_24h"),  "Ξ"),
-        ("BNB",  sig.get("bnb_usd"),  sig.get("bnb_24h"),  "⬡"),
-        ("SOL",  sig.get("sol_usd"),  sig.get("sol_24h"),  "◎"),
-        ("XRP",  sig.get("xrp_usd"),  sig.get("xrp_24h"),  "✕"),
-    ]
-    ticker_html = '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">'
-    for name, price, chg, icon in crypto_items:
-        if price is None: continue
-        chg_val  = chg or 0
-        chg_col  = "#05d68a" if chg_val >= 0 else "#f0455a"
-        chg_arr  = "▲" if chg_val >= 0 else "▼"
-        price_str = f"${price:,.0f}" if price > 100 else f"${price:,.4f}"
-        ticker_html += f"""
-        <div style="background:#0c1220;border:1px solid #1a2942;border-radius:10px;
-        padding:8px 14px;min-width:100px;">
-          <div style="font-size:9px;color:#4a6080;font-family:'IBM Plex Mono',monospace;
-          letter-spacing:1px;">{icon} {name}</div>
-          <div style="font-family:'IBM Plex Mono',monospace;font-size:14px;
-          font-weight:700;color:#dce8f8;">{price_str}</div>
-          <div style="font-size:10px;color:{chg_col};font-family:'IBM Plex Mono',monospace;">
-            {chg_arr} {abs(chg_val):.2f}%
-          </div>
-        </div>"""
-    ticker_html += '</div>'
-    st.markdown(ticker_html, unsafe_allow_html=True)
-
-    # ── ROW 2: FX + Fear & Greed + Oil + Market mood ──
-    fng_val   = sig.get("fear_greed_value", 50)
-    fng_label = sig.get("fear_greed_label", "N/A")
-    fng_col   = "#05d68a" if fng_val >= 60 else "#f0455a" if fng_val <= 30 else "#f5a623"
-    mood      = anal.get("market_mood", "NEUTRAL")
-    mood_col  = "#05d68a" if mood == "RISK_ON" else "#f0455a" if mood == "RISK_OFF" else "#f5a623"
-    mood_icon = "📈" if mood == "RISK_ON" else "📉" if mood == "RISK_OFF" else "➡️"
-    q_dir     = anal.get("overall_qualitative_direction", "NEUTRAL")
-    q_dir_col = "#05d68a" if "BULLISH" in q_dir and "USDT" in q_dir else "#f0455a" if "BEARISH" in q_dir else "#f5a623"
-    bias_30   = anal.get("30min_bias", "HOLD")
-    bias_col  = "#05d68a" if bias_30 == "BUY" else "#f0455a" if bias_30 == "SELL" else "#f5a623"
-    eur_usd   = sig.get("eurusd")
-
-    row2_html = '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">'
-    for label, value, color, sublabel in [
-        ("EUR/USD",       f"{eur_usd:.4f}" if eur_usd else "N/A",              "#4f8ef7", "DXY proxy"),
-        ("USD/NGN Offcl", f"₦{sig.get('usd_ngn_official',0):,.1f}" if sig.get('usd_ngn_official') else "N/A", "#a78bfa", "CBN rate"),
-        ("USD/ZAR",       f"{sig.get('usd_zar',0):.2f}" if sig.get('usd_zar') else "N/A",   "#6b84a0", "EM proxy"),
-        ("Fear & Greed",  f"{fng_val} / 100",                                   fng_col,  fng_label),
-        ("Market Mood",   f"{mood_icon} {mood.replace('_',' ')}",               mood_col, "Global risk appetite"),
-        ("USDT/NGN Bias", q_dir.replace("_USDT","").replace("_"," "),           q_dir_col,"Qualitative signal"),
-        ("30m Bias",      f"⚡ {bias_30}",                                        bias_col, "Short-term"),
-    ]:
-        row2_html += f"""
-        <div style="background:#0c1220;border:1px solid #1a2942;border-radius:10px;
-        padding:8px 14px;flex:1;min-width:110px;">
-          <div style="font-size:9px;color:#4a6080;font-family:'IBM Plex Mono',monospace;
-          letter-spacing:1px;margin-bottom:3px;">{label}</div>
-          <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;
-          font-weight:700;color:{color};">{value}</div>
-          <div style="font-size:9px;color:#4a6080;margin-top:2px;">{sublabel}</div>
-        </div>"""
-    row2_html += '</div>'
-    st.markdown(row2_html, unsafe_allow_html=True)
-
-    # ── ROW 3: Top mover + Catalysts ──
-    top_mover = anal.get("top_mover_today", "")
-    breaking  = anal.get("breaking_event")
-    bull_cat  = anal.get("top_bullish_catalyst", "")
-    bear_cat  = anal.get("top_bearish_catalyst", "")
-    oil_str   = anal.get("oil_analysis", "")
-    geo_str   = anal.get("geopolitical_analysis", "")
-
-    if breaking and breaking not in ("null", "None", "N/A", None, ""):
+    # ── Breaking event banner ──
+    breaking = anal.get("breaking_event","")
+    if breaking and str(breaking).lower() not in ("null","none","n/a",""):
         st.markdown(f"""
         <div style="background:rgba(240,69,90,0.1);border:1px solid #f0455a;
-        border-left:4px solid #f0455a;border-radius:10px;padding:10px 16px;
-        margin-bottom:10px;">
+        border-left:4px solid #f0455a;border-radius:10px;padding:11px 16px;margin-bottom:12px;">
           <span style="font-size:9px;color:#f0455a;font-family:'IBM Plex Mono',monospace;
-          letter-spacing:2px;text-transform:uppercase;">⚡ BREAKING</span>
-          <span style="font-size:12px;color:#dce8f8;margin-left:10px;">{breaking}</span>
+          letter-spacing:2px;text-transform:uppercase;">⚡ BREAKING EVENT</span>
+          <div style="font-size:12px;color:#dce8f8;margin-top:4px;line-height:1.5;">{breaking}</div>
         </div>""", unsafe_allow_html=True)
 
+    # ── Top mover ──
+    top_mover = anal.get("top_mover_today","")
     if top_mover:
         st.markdown(f"""
-        <div style="background:#0c1220;border:1px solid #243550;border-radius:10px;
-        padding:10px 16px;margin-bottom:10px;">
-          <span style="font-size:9px;color:#f5a623;font-family:'IBM Plex Mono',monospace;
+        <div style="background:rgba(167,139,250,0.07);border:1px solid rgba(167,139,250,0.25);
+        border-radius:10px;padding:9px 16px;margin-bottom:12px;">
+          <span style="font-size:9px;color:var(--purple);font-family:'IBM Plex Mono',monospace;
           letter-spacing:2px;text-transform:uppercase;">🎯 TOP MOVER TODAY</span>
-          <span style="font-size:12px;color:#dce8f8;margin-left:10px;">{top_mover}</span>
+          <div style="font-size:12px;color:#dce8f8;margin-top:4px;line-height:1.5;">{top_mover}</div>
         </div>""", unsafe_allow_html=True)
 
-    cat_cols = st.columns(2)
-    with cat_cols[0]:
-        if bull_cat:
-            st.markdown(f"""
-            <div style="background:rgba(5,214,138,0.07);border:1px solid rgba(5,214,138,0.3);
-            border-radius:10px;padding:10px 14px;">
-              <div style="font-size:9px;color:#05d68a;letter-spacing:1.5px;text-transform:uppercase;
-              font-family:'IBM Plex Mono',monospace;margin-bottom:4px;">📈 Bullish for USDT</div>
-              <div style="font-size:11px;color:#b0c8e8;line-height:1.5;">{bull_cat}</div>
-            </div>""", unsafe_allow_html=True)
-    with cat_cols[1]:
-        if bear_cat:
-            st.markdown(f"""
-            <div style="background:rgba(240,69,90,0.07);border:1px solid rgba(240,69,90,0.3);
-            border-radius:10px;padding:10px 14px;">
-              <div style="font-size:9px;color:#f0455a;letter-spacing:1.5px;text-transform:uppercase;
-              font-family:'IBM Plex Mono',monospace;margin-bottom:4px;">📉 Bearish for USDT</div>
-              <div style="font-size:11px;color:#b0c8e8;line-height:1.5;">{bear_cat}</div>
-            </div>""", unsafe_allow_html=True)
+    # ── Extract values ──
+    btc_usd  = sig.get("btc_usd");  btc_24h  = sig.get("btc_24h") or 0
+    eth_usd  = sig.get("eth_usd");  eth_24h  = sig.get("eth_24h") or 0
+    bnb_usd  = sig.get("bnb_usd")
+    eurusd   = sig.get("eurusd");   gbp_r    = sig.get("usd_gbp") or 0
+    gbpusd   = round(1/gbp_r, 4) if gbp_r else None
+    zar      = sig.get("usd_zar");  kes      = sig.get("usd_kes")
+    official = sig.get("usd_ngn_official")
+    fng_val  = sig.get("fear_greed_value", 50)
+    fng_lbl  = sig.get("fear_greed_label","N/A")
+    oil_hl   = sig.get("oil_headline","")
+    now_dt   = datetime.datetime.now()
+    hour     = now_dt.hour; dow = now_dt.weekday()
+    dow_name = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"][dow]
+    session  = ("Lagos/London Overlap" if 8<=hour<=17
+                else "US Session" if 18<=hour<=22 else "Off-hours")
 
-    # ── ROW 4: Oil / Geo / Crypto / EM micro-cards ──
-    micro_items = [
-        ("🛢️ Oil",         anal.get("oil_analysis",""),       sig.get("oil_impact", anal.get("oil_impact",0))),
-        ("🌍 Geopolitics", anal.get("geopolitical_analysis",""), anal.get("geopolitical_risk",0)),
-        ("₿ Crypto",      anal.get("crypto_analysis",""),     anal.get("crypto_sentiment",0)),
-        ("📊 EM Markets",  anal.get("em_analysis",""),         anal.get("global_em_risk",0)),
-    ]
-    micro_cols = st.columns(4)
-    for col, (title, text, score) in zip(micro_cols, micro_items):
-        score = score or 0
-        try: score = float(score)
-        except: score = 0
-        sc  = "var(--red)" if score > 15 else "var(--green)" if score < -15 else "var(--amber)"
-        arr = "↑ USDT" if score > 15 else "↓ USDT" if score < -15 else "≈ FLAT"
-        with col:
-            st.markdown(f"""
-            <div style="background:#0c1220;border:1px solid #1a2942;border-radius:10px;
-            padding:10px 12px;margin-top:10px;height:100%;">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-                <div style="font-size:10px;color:#6b84a0;font-family:'IBM Plex Mono',monospace;">{title}</div>
-                <div style="font-size:9px;color:{sc};font-family:'IBM Plex Mono',monospace;font-weight:700;">{arr}</div>
-              </div>
-              <div style="font-size:11px;color:#b0c8e8;line-height:1.5;">{text[:140] if text else "N/A"}</div>
-            </div>""", unsafe_allow_html=True)
+    # ─── CARD 1: Crypto Market ───
+    crypto_b, crypto_fg, crypto_bg = _sig_badge(
+        anal.get("crypto_sentiment", -btc_24h * 2))  # positive BTC = bullish sentiment = USDT bearish
+    btc_str = f"BTC ${btc_usd:,.0f} ({btc_24h:+.1f}% 24h)" if btc_usd else "BTC N/A"
+    eth_str = f"ETH ${eth_usd:,.0f}" if eth_usd else "ETH N/A"
+    mood_txt = ("RISK-OFF (bearish sentiment)" if btc_24h < -1
+                else "RISK-ON (bullish sentiment)" if btc_24h > 1 else "Neutral")
+    crypto_body = (f"Crypto market sentiment: {mood_txt}. BTC moves affect P2P crypto volume in Nigeria. "
+                   f"{anal.get('crypto_analysis','')}")
+    st.markdown(_signal_card("📡","Crypto Market", crypto_b, crypto_fg, crypto_bg,
+        "CoinGecko","Live", f"{btc_str} | {eth_str}", crypto_body), unsafe_allow_html=True)
 
-    # ── ROW 5: Live news ticker (scrolling headlines) ──
-    headlines = sig.get("headlines", [])
-    if headlines:
-        ticker_items = " &nbsp;&nbsp;&nbsp;·&nbsp;&nbsp;&nbsp; ".join(
-            f'<span style="color:{get_headline_color(h["tag"])}">{h["tag"]}</span> '
-            f'<span style="color:#b0c8e8;">{h["title"][:80]}</span>'
-            for h in headlines[:20]
-        )
-        st.markdown(f"""
-        <div style="margin-top:12px;overflow:hidden;white-space:nowrap;
-        background:#0c1220;border:1px solid #1a2942;border-radius:8px;padding:8px 16px;">
-          <div style="font-size:9px;color:#4a6080;letter-spacing:2px;text-transform:uppercase;
-          font-family:'IBM Plex Mono',monospace;margin-bottom:6px;">📡 LIVE TICKER</div>
-          <div style="font-size:11px;line-height:1.8;white-space:normal;">{ticker_items}</div>
-        </div>""", unsafe_allow_html=True)
+    # ─── CARD 2: USD Strength ───
+    dxy = sig.get("dxy_proxy",0) or 0
+    usd_b, usd_fg, usd_bg = _sig_badge(dxy - 91)   # above 91 = strong USD = bearish NGN
+    eur_str = f"EUR/USD: {eurusd:.4f}" if eurusd else "EUR/USD: N/A"
+    gbp_str = f"GBP/USD: {gbpusd:.4f}" if gbpusd else "GBP/USD: N/A"
+    usd_body = ("Strong USD puts pressure on NGN — harder for CBN to defend. "
+                f"{anal.get('em_analysis','')}")
+    st.markdown(_signal_card("📡","USD Strength (DXY Proxy)", usd_b, usd_fg, usd_bg,
+        "ExchangeRate-API","Live", f"{eur_str} | {gbp_str}", usd_body), unsafe_allow_html=True)
 
-        # Full headlines expander
-        with st.expander(f"📋 All {len(headlines)} live headlines"):
-            for i, h in enumerate(headlines, 1):
-                col = get_headline_color(h["tag"])
-                st.markdown(
-                    f'<div style="padding:5px 0;border-bottom:1px solid #1a2942;'
-                    f'font-size:11px;font-family:IBM Plex Mono,monospace;">'
-                    f'<span style="color:{col}">{h["tag"]}</span> '
-                    f'<span style="color:#dce8f8;">{h["title"]}</span>'
-                    f'{"<br><span style=\'color:#4a6080;font-size:10px;\'>"+h["desc"]+"</span>" if h.get("desc") else ""}'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
+    # ─── CARD 3: EM Africa FX ───
+    em_score = anal.get("global_em_risk",0) or 0
+    em_b, em_fg, em_bg = _sig_badge(em_score)
+    zar_str = f"USD/ZAR: {zar:.2f}" if zar else "USD/ZAR: N/A"
+    kes_str = f"USD/KES: {kes:.2f}" if kes else "USD/KES: N/A"
+    st.markdown(_signal_card("📡","EM Africa FX Context", em_b, em_fg, em_bg,
+        "ExchangeRate-API","Live", f"{zar_str} | {kes_str}",
+        "South African Rand and Kenyan Shilling as African EM peers. "
+        "Broad EM selloff tends to drag NGN down too. Tracks global risk appetite."),
+        unsafe_allow_html=True)
+
+    # ─── CARD 4: Market Microstructure ───
+    vol_note = ("High volume — tighter spreads likely." if 9<=hour<=17 and dow<5
+                else "Off-hours — lower volume, price may drift.")
+    micro_b  = "BULLISH" if 9<=hour<=16 and dow<5 else "NEUTRAL"
+    micro_fg = "#05d68a" if micro_b=="BULLISH" else "#f5a623"
+    micro_bg = "rgba(5,214,138,0.1)" if micro_b=="BULLISH" else "rgba(245,166,35,0.1)"
+    st.markdown(_signal_card("📡","Market Microstructure", micro_b, micro_fg, micro_bg,
+        "Market Structure","",
+        f"Session: {dow_name} {now_dt.strftime('%H:%M')} WAT",
+        f"{vol_note} P2P spreads widen after 11 PM WAT and on weekends. "
+        "Best execution: 9 AM–5 PM WAT weekdays."), unsafe_allow_html=True)
+
+    # ─── CARD 5: CBN Policy ───
+    cbn_score = anal.get("cbn_policy",0) or 0
+    cbn_b, cbn_fg, cbn_bg = _sig_badge(cbn_score)
+    cbn_body  = anal.get("cbn_analysis",
+        "CBN unified official and I&E window rates in 2023. "
+        "Periodic FX auctions to authorised dealers. Diaspora remittance policy eased. "
+        "Watch for surprise interventions.")
+    st.markdown(_signal_card("📡","CBN Policy Framework", cbn_b, cbn_fg, cbn_bg,
+        "Policy Context","",
+        "CBN Managed Float + FX Unification (2023–present)",
+        cbn_body), unsafe_allow_html=True)
+
+    # ─── CARD 6: Oil Revenue ───
+    oil_score = anal.get("oil_impact",0) or 0
+    oil_b, oil_fg, oil_bg = _sig_badge(oil_score)
+    oil_body  = anal.get("oil_analysis",
+        "Nigeria earns most of its USD from crude oil exports. "
+        "Brent crude above $80/bbl is generally supportive of NGN. "
+        "OPEC+ cuts affect volume. Pipeline vandalism reduces output.")
+    if oil_hl:
+        oil_body += f" Latest: {oil_hl[:120]}"
+    st.markdown(_signal_card("📡","Oil Revenue", oil_b, oil_fg, oil_bg,
+        "Google News RSS","Live",
+        "Nigeria Oil Dependency: ~90% of FX Earnings",
+        oil_body), unsafe_allow_html=True)
+
+    # ─── CARD 7: Crypto P2P Dynamics ───
+    ng_score = anal.get("crypto_sentiment",0) or 0
+    ng_b, ng_fg, ng_bg = _sig_badge(ng_score)
+    st.markdown(_signal_card("📡","Crypto P2P Dynamics", ng_b, ng_fg, ng_bg,
+        "Crypto Context","",
+        "Binance P2P + KuCoin + LocalBitcoins Nigeria",
+        "After CBN Binance ban in 2024, P2P shifted to other platforms. "
+        "USDT demand surged as Nigerians hedge against inflation. "
+        "P2P rate = best proxy for true black market rate."),
+        unsafe_allow_html=True)
+
+    # ─── CARD 8: Inflation Differential ───
+    inf_score = anal.get("nigeria_macro",0) or 0
+    inf_b, inf_fg, inf_bg = _sig_badge(inf_score)
+    st.markdown(_signal_card("📡","Inflation Differential", inf_b, inf_fg, inf_bg,
+        "Macro Structural","",
+        "Nigeria Inflation ~28–32% vs US ~3% (2025 est.)",
+        "High inflation differential means NGN structurally weakens over time vs USD. "
+        "This creates long-term USDT demand pressure. "
+        "Short-term volatility around MPC meetings."),
+        unsafe_allow_html=True)
+
+    # ─── CARD 9: Remittances ───
+    rem_score = anal.get("remittance_flow",0) or 0
+    rem_b, rem_fg, rem_bg = _sig_badge(rem_score, invert=True)  # high flow = bullish NGN
+    st.markdown(_signal_card("📡","Remittances", rem_b, rem_fg, rem_bg,
+        "Macro Structural","",
+        "Diaspora Remittances ~$20–25B/Year",
+        "Remittances are Nigeria's second-largest FX inflow. "
+        "Festive seasons (Dec, Eid) see USD supply spikes → NGN strengthens. "
+        "Policy on transfer fees and receiving channels affects volumes."),
+        unsafe_allow_html=True)
+
+    # ─── CARD 10: Geopolitical Risk ───
+    geo_score = anal.get("geopolitical_risk",0) or 0
+    geo_b, geo_fg, geo_bg = _sig_badge(geo_score)
+    geo_body  = anal.get("geopolitical_analysis",
+        "Active conflicts and sanctions affect oil supply and USD safe-haven demand.")
+    st.markdown(_signal_card("📡","Geopolitical Risk", geo_b, geo_fg, geo_bg,
+        "Google News RSS","Live",
+        f"Risk Score: {geo_score:+.0f}/100",
+        geo_body), unsafe_allow_html=True)
+
+    # ── Bullish / Bearish summary ──
+    bull = anal.get("top_bullish_catalyst","")
+    bear = anal.get("top_bearish_catalyst","")
+    if bull or bear:
+        st.markdown("<br>", unsafe_allow_html=True)
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            if bull:
+                st.markdown(f"""
+                <div style="background:rgba(5,214,138,0.07);border:1px solid rgba(5,214,138,0.28);
+                border-radius:12px;padding:14px 16px;">
+                  <div style="font-size:9px;color:#05d68a;letter-spacing:1.5px;text-transform:uppercase;
+                  font-family:'IBM Plex Mono',monospace;margin-bottom:6px;">📈 Top Bullish Catalyst for USDT</div>
+                  <div style="font-size:12px;color:#b0c8e8;line-height:1.65;">{bull}</div>
+                </div>""", unsafe_allow_html=True)
+        with cc2:
+            if bear:
+                st.markdown(f"""
+                <div style="background:rgba(240,69,90,0.07);border:1px solid rgba(240,69,90,0.28);
+                border-radius:12px;padding:14px 16px;">
+                  <div style="font-size:9px;color:#f0455a;letter-spacing:1.5px;text-transform:uppercase;
+                  font-family:'IBM Plex Mono',monospace;margin-bottom:6px;">📉 Top Bearish Catalyst for USDT</div>
+                  <div style="font-size:12px;color:#b0c8e8;line-height:1.65;">{bear}</div>
+                </div>""", unsafe_allow_html=True)
 
     # ── Watch items ──
-    watch = anal.get("key_watch_items", [])
+    watch = anal.get("key_watch_items",[])
     if watch:
-        watch_str = " &nbsp;|&nbsp; ".join(
-            f'<span style="color:#f5a623;">👁 {w}</span>' for w in watch
-        )
         st.markdown(f"""
-        <div style="margin-top:10px;font-size:11px;color:#6b84a0;
-        border-top:1px solid #1a2942;padding-top:10px;">
+        <div style="margin-top:14px;font-size:11px;color:#6b84a0;border-top:1px solid var(--border);
+        padding-top:12px;">
           <strong style="color:#4a6080;font-family:'IBM Plex Mono',monospace;font-size:9px;
-          letter-spacing:1.5px;text-transform:uppercase;">WATCH THIS WEEK:</strong>
-          &nbsp; {watch_str}
+          letter-spacing:1.5px;text-transform:uppercase;">👁 WATCH THIS WEEK:</strong>
+          {"  ·  ".join(f'<span style="color:#f5a623;">{w}</span>' for w in watch)}
         </div>""", unsafe_allow_html=True)
 
-    st.markdown('</div>', unsafe_allow_html=True)  # close panel
+    # ── Full headlines expander ──
+    headlines = sig.get("headlines",[])
+    if headlines:
+        st.markdown("<br>", unsafe_allow_html=True)
+        with st.expander(f"📋 All {len(headlines)} live scraped headlines"):
+            for h in headlines:
+                c = get_headline_color(h.get("tag",""))
+                desc_part = f'<br><span style="color:#4a6080;font-size:10px;">{h["desc"]}</span>' if h.get("desc") else ""
+                st.markdown(
+                    f'<div style="padding:5px 0;border-bottom:1px solid #1a2942;font-size:11px;">'
+                    f'<span style="color:{c};font-family:IBM Plex Mono,monospace;">{h.get("tag","")}</span> '
+                    f'<span style="color:#dce8f8;">{h.get("title","")}</span>{desc_part}</div>',
+                    unsafe_allow_html=True)
 
 
 def get_headline_color(tag: str) -> str:
-    """Return color based on headline tag."""
-    tag_upper = tag.upper()
-    if any(x in tag_upper for x in ["IRAN","MIDEAST","RUSSIA","WAR","CONFLICT","SANCTION"]):
-        return "#f0455a"
-    if any(x in tag_upper for x in ["OIL","OPEC","BRENT"]):
-        return "#f5a623"
-    if any(x in tag_upper for x in ["NGN","NAIRA","CBN","NG "]):
-        return "#05d68a"
-    if any(x in tag_upper for x in ["BTC","CRYPTO","BITCOIN"]):
-        return "#a78bfa"
-    if any(x in tag_upper for x in ["FED","USD","DXY","CPI"]):
-        return "#4f8ef7"
+    t = tag.upper()
+    if any(x in t for x in ["IRAN","MIDEAST","RUSSIA","WAR","CONFLICT","SANCTION"]): return "#f0455a"
+    if any(x in t for x in ["OIL","OPEC","BRENT","🛢"]): return "#f5a623"
+    if any(x in t for x in ["NGN","NAIRA","CBN","🇳🇬","🏦"]): return "#05d68a"
+    if any(x in t for x in ["BTC","CRYPTO","BITCOIN","₿"]): return "#a78bfa"
+    if any(x in t for x in ["FED","USD","DXY","CPI","🇺🇸"]): return "#4f8ef7"
     return "#6b84a0"
 # Returns a flat dict of ALL numeric features
 # ─────────────────────────────────────────────
@@ -1743,8 +1786,7 @@ st.markdown("""
   Run it at least 5–10 times to build training data for statistically meaningful predictions.
 </div>""", unsafe_allow_html=True)
 
-# ── GLOBAL SIGNALS PANEL ── (always visible, refreshes every 5 mins)
-render_global_signals_panel()
+# ── GLOBAL SIGNALS: loaded on demand inside its tab ──
 
 
 # ── RUN ──
@@ -1819,56 +1861,79 @@ else:
     pred_high = ml.get("pred_high", 0)
     n_pts     = ml.get("n_training_points", 0)
     cold      = ml.get("cold_start", True)
+    prem      = feat.get("premium_pct", 0)
+    p2p_buy   = raw.get("p2p_buy", 0)
+    p2p_sell  = raw.get("p2p_sell", 0)
+    spread    = (p2p_buy - p2p_sell) if p2p_buy and p2p_sell else 0
 
-    # ── TOP METRIC CARDS ──
-    dc = "var(--green)" if direction == "BULLISH" else "var(--red)" if direction == "BEARISH" else "var(--amber)"
-    da = "▲" if direction == "BULLISH" else "▼" if direction == "BEARISH" else "◆"
-    cc = "var(--green)" if conf >= 65 else "var(--amber)" if conf >= 45 else "var(--red)"
-    prem = feat.get("premium_pct", 0)
+    # Pull cached signal data for top cards
+    _sig   = st.session_state.global_signals or {}
+    _anal  = _sig.get("analysis", {})
+    _qdir  = _anal.get("overall_qualitative_direction","NEUTRAL")
+    _bias  = _anal.get("30min_bias","—")
+    _fng   = _sig.get("fear_greed_value","—")
+    _fng_l = _sig.get("fear_greed_label","N/A")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    dc = "var(--green)" if direction=="BULLISH" else "var(--red)" if direction=="BEARISH" else "var(--amber)"
+    da = "▲" if direction=="BULLISH" else "▼" if direction=="BEARISH" else "◆"
+    cc = "var(--green)" if conf>=65 else "var(--amber)" if conf>=45 else "var(--red)"
+    prem_col = "var(--red)" if prem>8 else "var(--amber)" if prem>4 else "var(--green)"
+    qd_col = ("var(--green)" if "BEARISH" in _qdir   # bearish USDT = NGN strengthening
+              else "var(--red)" if "BULLISH" in _qdir else "var(--amber)")
+    qd_lbl = _qdir.replace("_USDT","").replace("_"," ")
+    bias_col = "var(--green)" if _bias=="BUY" else "var(--red)" if _bias=="SELL" else "var(--amber)"
+    fng_col  = ("var(--green)" if _fng!="—" and int(_fng)>=60
+                else "var(--red)" if _fng!="—" and int(_fng)<=30 else "var(--amber)")
+
+    # ── 6 USDT/NGN-focused top cards ──
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1:
         st.markdown(f"""<div class="mcard mcard-green">
-        <div class="mcard-label">Live P2P Rate</div>
-        <div class="mcard-value" style="color:var(--green);">₦{p2p_mid:,.0f}</div>
-        <div class="mcard-sub">Binance P2P midpoint</div>
+        <div class="mcard-label">P2P Buy / Sell</div>
+        <div class="mcard-value" style="color:var(--green);">₦{p2p_buy:,.0f}</div>
+        <div class="mcard-sub">Sell ₦{p2p_sell:,.0f} · Spread ₦{spread:.0f}</div>
         </div>""", unsafe_allow_html=True)
     with c2:
-        st.markdown(f"""<div class="mcard mcard-purple">
-        <div class="mcard-label">ML Ensemble Target</div>
-        <div class="mcard-value" style="color:var(--purple);">₦{ensemble:,.0f}</div>
-        <div class="mcard-sub">₦{pred_low:,.0f} – ₦{pred_high:,.0f}</div>
+        st.markdown(f"""<div class="mcard mcard-amber">
+        <div class="mcard-label">Black Mkt Premium</div>
+        <div class="mcard-value" style="color:{prem_col};">{prem:+.2f}%</div>
+        <div class="mcard-sub">vs CBN ₦{official:,.0f}</div>
         </div>""", unsafe_allow_html=True)
     with c3:
         st.markdown(f"""<div class="mcard mcard-{'green' if direction=='BULLISH' else 'red' if direction=='BEARISH' else 'amber'}">
-        <div class="mcard-label">Direction</div>
-        <div class="mcard-value" style="color:{dc};">{da} {direction}</div>
-        <div class="mcard-sub">Statistical model vote</div>
+        <div class="mcard-label">ML Prediction</div>
+        <div class="mcard-value" style="color:{dc};">{da} ₦{ensemble:,.0f}</div>
+        <div class="mcard-sub">₦{pred_low:,.0f} – ₦{pred_high:,.0f}</div>
         </div>""", unsafe_allow_html=True)
     with c4:
         st.markdown(f"""<div class="mcard mcard-purple">
-        <div class="mcard-label">Statistical Confidence</div>
+        <div class="mcard-label">ML Confidence</div>
         <div class="mcard-value" style="color:{cc};">{conf}%</div>
-        <div class="mcard-sub">Model agreement + CV MAE</div>
+        <div class="mcard-sub">{"⚠️ Cold start" if cold else f"✅ {n_pts} training pts"}</div>
         </div>""", unsafe_allow_html=True)
     with c5:
-        status = "⚠️ Cold Start" if cold else f"✅ {n_pts} pts"
         st.markdown(f"""<div class="mcard mcard-blue">
-        <div class="mcard-label">Training Data</div>
-        <div class="mcard-value" style="color:var(--blue);">{n_pts}</div>
-        <div class="mcard-sub">{status}</div>
+        <div class="mcard-label">News Signal</div>
+        <div class="mcard-value" style="color:{qd_col};font-size:16px;">{qd_lbl}</div>
+        <div class="mcard-sub">F&G: {_fng} — {_fng_l}</div>
+        </div>""", unsafe_allow_html=True)
+    with c6:
+        st.markdown(f"""<div class="mcard mcard-{'green' if _bias=='BUY' else 'red' if _bias=='SELL' else 'amber'}">
+        <div class="mcard-label">30-Min Bias</div>
+        <div class="mcard-value" style="color:{bias_col};">⚡ {_bias}</div>
+        <div class="mcard-sub">Qualitative signal</div>
         </div>""", unsafe_allow_html=True)
 
     if cold:
         st.markdown(f"""
-        <div class="alert-box alert-warn">
+        <div class="alert-box alert-warn" style="margin-top:12px;">
           <strong>⚠️ Cold Start Mode</strong> — {ml.get("note","")}
-          Confidence is intentionally capped at 35%. Keep running the analysis to build training data.
+          Confidence capped at 35%. Run analysis 5+ times to unlock full ML predictions.
         </div>""", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── ALERT BANNERS (shown at top if triggered) ──
+    # ── ALERT BANNERS ──
     triggered_alerts = check_and_trigger_alerts(p2p_mid, ml, interp)
     for _, msg in triggered_alerts:
         st.markdown(f'<div class="alert-box alert-warn">{msg}</div>', unsafe_allow_html=True)
@@ -1876,22 +1941,22 @@ else:
     # ── RATE SOURCE BADGE ──
     src = raw.get("rate_source", "unknown")
     status = raw.get("rate_status", "unknown")
-    src_color = "var(--green)" if status == "live" else "var(--amber)" if status == "estimated" else "var(--red)"
+    src_color = "var(--green)" if status=="live" else "var(--amber)" if status=="estimated" else "var(--red)"
     st.markdown(
         f'<p style="font-size:11px;font-family:IBM Plex Mono,monospace;color:{src_color};">'
         f'<span class="live-dot" style="background:{src_color};"></span>'
         f'Rate source: {src} &nbsp;·&nbsp; '
-        f'Buy ₦{raw.get("p2p_buy",0):,.0f} &nbsp;|&nbsp; Sell ₦{raw.get("p2p_sell",0):,.0f}'
-        f'</p>',
-        unsafe_allow_html=True
-    )
+        f'Buy ₦{p2p_buy:,.0f} &nbsp;|&nbsp; Sell ₦{p2p_sell:,.0f}'
+        f'</p>', unsafe_allow_html=True)
 
     # ── TABS ──
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "🤖 ML Results", "📐 Model Metrics", "📊 History & Chart", "🌍 Features", "💬 Chat", "🔔 Alerts"
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "📊 Analysis", "🌍 Global Signals", "💱 Converter",
+        "📈 History", "💬 Chat", "🔔 Alerts", "📐 Model Metrics"
     ])
 
-    # ════════ TAB 1: ML RESULTS ════════
+
+    # ════════ TAB 1: ANALYSIS ════════
     with tab1:
         left, right = st.columns([3, 2])
 
@@ -2232,8 +2297,59 @@ else:
                             unsafe_allow_html=True
                         )
 
-    # ════════ TAB 2: MODEL METRICS ════════
+    # ════════ TAB 2: GLOBAL SIGNALS ════════
     with tab2:
+        render_global_signals_tab()
+
+    # ════════ TAB 3: CONVERTER ════════
+    with tab3:
+        st.markdown("""<div class="ocard">
+        <div class="ocard-title">💱 USDT / NGN Converter</div>""", unsafe_allow_html=True)
+        cv1, cv2 = st.columns(2)
+        with cv1:
+            usdt_in = st.number_input("USDT Amount", min_value=0.0, value=100.0, step=10.0, key="conv_usdt")
+            st.markdown(f"""
+            <div style="background:var(--bg2);border:1px solid var(--border2);border-radius:10px;
+            padding:14px 18px;margin-top:8px;text-align:center;">
+              <div style="font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;
+              font-family:IBM Plex Mono,monospace;margin-bottom:6px;">USDT → NGN (P2P mid)</div>
+              <div style="font-family:IBM Plex Mono,monospace;font-size:26px;font-weight:700;
+              color:var(--green);">₦{usdt_in * p2p_mid:,.2f}</div>
+              <div style="font-size:11px;color:var(--muted2);margin-top:4px;">At ₦{p2p_mid:,.2f}/USDT</div>
+            </div>""", unsafe_allow_html=True)
+        with cv2:
+            ngn_in = st.number_input("NGN Amount (₦)", min_value=0.0, value=100000.0, step=1000.0, key="conv_ngn")
+            usdt_out = ngn_in / p2p_mid if p2p_mid else 0
+            st.markdown(f"""
+            <div style="background:var(--bg2);border:1px solid var(--border2);border-radius:10px;
+            padding:14px 18px;margin-top:8px;text-align:center;">
+              <div style="font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;
+              font-family:IBM Plex Mono,monospace;margin-bottom:6px;">NGN → USDT (P2P mid)</div>
+              <div style="font-family:IBM Plex Mono,monospace;font-size:26px;font-weight:700;
+              color:var(--purple);">{usdt_out:,.4f} USDT</div>
+              <div style="font-size:11px;color:var(--muted2);margin-top:4px;">At ₦{p2p_mid:,.2f}/USDT</div>
+            </div>""", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("""<table class="spread-table">
+        <tr><th>Rate</th><th>₦/USDT</th><th>For $100 USDT</th><th>Note</th></tr>""",
+            unsafe_allow_html=True)
+        for lbl, rate, note in [
+            ("P2P Buy",     p2p_buy,          "You pay this to get USDT"),
+            ("P2P Sell",    p2p_sell,         "You receive this selling USDT"),
+            ("P2P Mid",     p2p_mid,          "Fair value midpoint"),
+            ("ML Target",   ensemble,         "Model next-step prediction"),
+            ("Official",    official or 0,    "CBN interbank benchmark"),
+        ]:
+            st.markdown(
+                f'<tr><td style="font-size:12px;">{lbl}</td>'
+                f'<td style="font-family:IBM Plex Mono,monospace;color:var(--amber);">₦{rate:,.2f}</td>'
+                f'<td style="font-family:IBM Plex Mono,monospace;color:var(--green);">₦{rate*100:,.0f}</td>'
+                f'<td style="font-size:11px;color:var(--muted2);">{note}</td></tr>',
+                unsafe_allow_html=True)
+        st.markdown('</table></div>', unsafe_allow_html=True)
+
+    # ════════ TAB 7: MODEL METRICS ════════
+    with tab7:
         st.markdown("""
         <div class="alert-box alert-info" style="margin-bottom:16px;">
           <strong>📐 What these metrics mean:</strong>
@@ -2332,8 +2448,8 @@ else:
                   </div>
                 </div>""", unsafe_allow_html=True)
 
-    # ════════ TAB 3: HISTORY & CHART ════════
-    with tab3:
+    # ════════ TAB 4: HISTORY ════════
+    with tab4:
         hist = st.session_state.rate_history
         if len(hist) < 2:
             st.markdown("""<div class="ocard" style="text-align:center;padding:40px;">
@@ -2479,53 +2595,8 @@ else:
                 </tr>""", unsafe_allow_html=True)
             st.markdown('</table></div>', unsafe_allow_html=True)
 
-    # ════════ TAB 4: FEATURES ════════
-    with tab4:
-        st.markdown("""<div class="ocard">
-        <div class="ocard-title">🔬 All Live Feature Values</div>
-        <p style="font-size:12px;color:var(--muted2);margin-bottom:14px;">
-          Every numeric signal fed into the ML models. These are the raw inputs — transparent and auditable.
-        </p>""", unsafe_allow_html=True)
-
-        feat_groups = {
-            "P2P / Rate": ["p2p_spread_abs", "p2p_spread_pct", "p2p_buy_std", "p2p_sell_std",
-                           "premium_pct", "premium_abs", "official_rate"],
-            "Crypto Market": ["btc_24h_change", "eth_24h_change", "usdt_ngn_cg",
-                              "chainlink_change", "uniswap_change"],
-            "USD / FX": ["eurusd", "dxy_proxy", "usd_zar", "usd_kes", "usd_ghs"],
-            "Time Features": ["hour_sin", "hour_cos", "dow_sin", "dow_cos",
-                               "is_weekend", "is_business"],
-            "News Sentiment": ["news_overall", "news_nigeria", "news_cbn",
-                               "news_oil", "news_usd", "news_crypto"],
-            "Momentum / Trend": ["momentum_1", "momentum_avg", "volatility",
-                                  "trend_slope", "trend_accel", "rate_ma5_dev"],
-        }
-
-        for group_name, keys in feat_groups.items():
-            st.markdown(f"""
-            <div style="margin-bottom:16px;">
-              <div style="font-size:9px;letter-spacing:2px;text-transform:uppercase;
-              color:var(--blue);margin-bottom:8px;font-family:'IBM Plex Mono',monospace;">
-                {group_name}
-              </div>
-              <table class="spread-table" style="font-size:12px;">
-                <tr><th>Feature</th><th>Value</th><th>Importance (RF)</th></tr>""",
-                        unsafe_allow_html=True)
-            fi = metrics.get("rf_feature_importance", {})
-            for k in keys:
-                v = feat.get(k)
-                imp = fi.get(k, 0)
-                vstr = f"{v:.4f}" if isinstance(v, float) else str(v) if v is not None else "—"
-                imp_bar = f'<div style="width:{int(imp*500)}px;max-width:80px;height:4px;background:var(--purple);border-radius:2px;"></div>'
-                st.markdown(
-                    f'<tr><td style="font-family:IBM Plex Mono,monospace;font-size:11px;">{k}</td>'
-                    f'<td style="color:var(--amber);">{vstr}</td>'
-                    f'<td>{imp_bar if imp > 0 else "—"}</td></tr>',
-                    unsafe_allow_html=True
-                )
-            st.markdown('</table></div>', unsafe_allow_html=True)
-
-        st.markdown('</div>', unsafe_allow_html=True)
+    # ── FEATURES: shown as expander inside Analysis tab (tab1) ──
+    # (rendered in tab1 at the bottom — see "Feature Values" expander in qualitative section)
 
     # ════════ TAB 5: CHAT ════════
     with tab5:

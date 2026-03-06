@@ -511,6 +511,15 @@ def collect_features() -> dict:
         ("OPEC production cut oil output",       "opec"),
         ("Nigeria remittance diaspora dollar",   "remittances"),
         ("US inflation CPI jobs report",         "us_macro"),
+        ("Nigeria foreign exchange reserves CBN", "fx_reserves"),
+        ("Nigeria Eurobond yield investor sentiment", "capital_flows"),
+        ("Nigeria petrol price fuel subsidy news", "inflation_trigger"),
+        ("Naira devaluation news today", "devaluation_risk"),
+        ("OPEC Nigeria oil production quota", "supply_side"),
+        ("IMF World Bank Nigeria economic outlook", "institutional"),
+        ("Nigeria inflation rate NBS statistics", "macro_data"),
+        ("US Dollar Index DXY trend", "global_usd"),
+        ("Binance Nigeria P2P regulation news", "p2p_legal"),
     ]
 
     for query, category in rss_topics:
@@ -936,121 +945,50 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
 # ── GEMINI: INTERPRET ML + QUALITATIVE OUTPUT ──
 # ─────────────────────────────────────────────
 def interpret_ml(ml: dict, raw: dict, feat: dict) -> dict:
+    top_feat = ml.get("rf_feature_importance", {})
+    top_str = "\n".join(f"  {k}: {v:.4f}" for k, v in list(top_feat.items())[:8])
+    headlines = raw.get("news_headlines", [])
+    headlines_sample = "\n".join(f"  • {h}" for h in headlines[:20])
+
+    system = """You are a Chief Economist for a Tier-1 Investment Bank. 
+    You translate complex ML data into high-level stakeholder insights. 
+    Return ONLY valid JSON."""
+
+    prompt = f"""
+    Analyse the USDT/NGN market using these ML outputs and live news.
+    
+    ══ ML PREDICTIONS ══
+    - Current Rate: ₦{raw.get('p2p_mid'):,.2f}
+    - ML Target: ₦{ml['ensemble']:,.2f} ({ml['direction']})
+    - Confidence: {ml['confidence']}%
+    - Algorithmic Drivers: {top_str}
+    
+    ══ LIVE HEADLINES ══
+    {headlines_sample}
+
+    Provide a 'Stakeholder Intelligence Report' in JSON:
+    {{
+      "executive_summary": "3-sentence strategic overview of the market regime.",
+      "price_movement_drivers": "Explicitly link specific news events to the predicted price change.",
+      "stakeholder_insight": "Actionable advice for business owners (e.g., 'Hedge now', 'Wait for 48 hours').",
+      "global_context": "How global events (Fed, Oil, DXY) are trickling down to the Naira today.",
+      "risk_rating": "Low/Medium/High/Critical based on news volatility.",
+      "trade_recommendation": "Specific timing and execution strategy.",
+      "best_convert_time": "Optimal window for conversion.",
+      "weekly_outlook": "7-day trend forecast.",
+      "key_risks": ["Risk 1", "Risk 2"]
+    }}
     """
-    Combines ML numbers + qualitative news intelligence into one unified interpretation.
-    Gemini explains the ML result AND integrates real-world events like oil shocks,
-    geopolitics, CBN actions etc. Does NOT re-predict — explains what the models say
-    and why, in the context of what's actually happening in the world right now.
-    """
-    top_feat   = ml.get("rf_feature_importance", {})
-    top_str    = "\n".join(f"  {k}: {v:.4f}" for k, v in list(top_feat.items())[:8])
-    q_intel    = raw.get("news_intel", {})
-    headlines  = raw.get("news_headlines", [])
-    headlines_sample = "\n".join(f"  • {h}" for h in headlines[:15])
-
-    system = """You are a senior FX strategist and quantitative analyst for a Nigeria-focused trading desk.
-You combine statistical ML model outputs with real-world qualitative intelligence.
-Be specific — cite actual news events, name the mechanisms, give real numbers.
-Return ONLY valid JSON. No markdown, no backticks."""
-
-    prompt = f"""Interpret these combined ML + qualitative results for USDT/NGN:
-
-══ STATISTICAL ML RESULTS ══
-- Current P2P Rate: ₦{raw.get("p2p_mid", 0):,.2f}
-- Ridge Prediction: ₦{ml["ridge_pred"]:,.2f}
-- Random Forest Prediction: ₦{ml["rf_pred"]:,.2f}
-- Gradient Boosting Prediction: ₦{ml["gb_pred"]:,.2f}
-- Ensemble Prediction: ₦{ml["ensemble"]:,.2f}
-- Range: ₦{ml["pred_low"]:,.2f} – ₦{ml["pred_high"]:,.2f}
-- Direction: {ml["direction"]}
-- Statistical Confidence: {ml["confidence"]}%
-- Model Agreement: {ml["model_agreement"]}%
-- Training Points: {ml["n_training_points"]}
-- Cold Start: {ml["cold_start"]}
-- CV MAE (Ridge/RF/GB): {ml.get("ridge_cv_mae") or "N/A"} / {ml.get("rf_cv_mae") or "N/A"} / {ml.get("gb_cv_mae") or "N/A"}
-
-TOP ML FEATURE IMPORTANCES:
-{top_str}
-
-══ LIVE QUALITATIVE INTELLIGENCE ({raw.get("news_headlines_count", 0)} headlines scraped) ══
-Gemini's qualitative scores from real news (-100 to +100, positive = USDT rises):
-- Overall news score:      {feat.get("news_overall", 0):+.0f}
-- Nigeria macro:           {feat.get("news_nigeria", 0):+.0f}
-- CBN policy:              {feat.get("news_cbn", 0):+.0f}
-- Oil market impact:       {feat.get("news_oil", 0):+.0f}
-- USD / Fed impact:        {feat.get("news_usd", 0):+.0f}
-- Crypto sentiment:        {feat.get("news_crypto", 0):+.0f}
-- Geopolitical risk:       {feat.get("news_geopolitics", 0):+.0f}
-- Nigeria political risk:  {feat.get("news_political_risk", 0):+.0f}
-- Remittance flows:        {feat.get("news_remittance", 0):+.0f}
-- Global EM risk:          {feat.get("news_em_risk", 0):+.0f}
-
-KEY QUALITATIVE FINDINGS:
-- Top Bullish Catalyst: {q_intel.get("top_bullish_catalyst", "N/A")}
-- Top Bearish Catalyst: {q_intel.get("top_bearish_catalyst", "N/A")}
-- Breaking Event: {q_intel.get("breaking_event", "None")}
-- Oil Analysis: {q_intel.get("oil_analysis", "N/A")}
-- Geopolitical Analysis: {q_intel.get("geopolitical_analysis", "N/A")}
-- CBN Analysis: {q_intel.get("cbn_analysis", "N/A")}
-- Qualitative Direction: {q_intel.get("overall_qualitative_direction", "N/A")}
-
-SAMPLE LIVE HEADLINES USED:
-{headlines_sample}
-
-LIVE MARKET DATA:
-- BTC 24h: {feat.get("btc_24h_change", "N/A"):+.2f}% | EUR/USD: {feat.get("eurusd", "N/A"):.4f}
-- P2P Spread: ₦{feat.get("p2p_spread_abs", 0):.0f} | B.M. Premium: {feat.get("premium_pct", 0):+.2f}%
-- Trend slope: {feat.get("trend_slope", 0):+.2f}/interval | Volatility: ₦{feat.get("volatility", 0):.2f}
-
-Return ONLY this JSON (no markdown):
-{{
-  "executive_summary": "<3-4 sentences combining ML output AND real news events — e.g. mention oil price, Iran, CBN, etc. by name if relevant. What does everything together say?>",
-  "why_this_direction": "<2-3 sentences: reference BOTH the top ML features AND the key qualitative drivers — be specific>",
-  "top_signal_explained": "<explain the #1 most important ML feature AND the most important qualitative event together>",
-  "model_agreement_meaning": "<plain English: what {ml['model_agreement']:.0f}% agreement means for reliability>",
-  "confidence_explanation": "<why {ml['confidence']}% confidence — what is limiting it, what would push it higher>",
-  "qualitative_vs_quantitative": "<1-2 sentences: do the news signals AGREE or CONTRADICT the ML models? What does that mean?>",
-  "trade_recommendation": "<specific actionable recommendation integrating BOTH ML and news — mention timing, amount if relevant>",
-  "best_convert_time": "<specific time window based on all signals>",
-  "weekly_outlook": "<1-2 sentences: 7-day view combining trend + qualitative events expected this week>",
-  "oil_impact_today": "<specific: what is oil doing today and how does that feed through to NGN?>",
-  "geopolitical_impact_today": "<specific: any conflicts, sanctions, elections affecting rate today?>",
-  "cbn_watch": "<what should we watch from CBN this week?>",
-  "key_risks": ["<specific risk citing actual current event>", "<risk 2>", "<risk 3>", "<risk 4>"],
-  "key_headlines_driving_prediction": ["<most impactful headline 1>", "<headline 2>", "<headline 3>"]
-}}"""
-
+    
     raw_out = gemini(prompt, system)
     try:
+        # Robust JSON cleaning
         clean = raw_out.strip()
         if "```" in clean:
-            parts = clean.split("```")
-            for p in parts:
-                p = p.strip()
-                if p.startswith("json"): p = p[4:].strip()
-                if p.startswith("{"): clean = p; break
-        if not clean.startswith("{"):
-            idx = clean.find("{"); clean = clean[idx:] if idx >= 0 else clean
-        last = clean.rfind("}")
-        if last >= 0: clean = clean[:last+1]
+            clean = clean.split("```")[1].replace("json", "").strip()
         return json.loads(clean)
     except:
-        return {
-            "executive_summary": raw_out[:500] if raw_out else "Interpretation unavailable.",
-            "why_this_direction": "See executive summary.",
-            "top_signal_explained": "N/A",
-            "model_agreement_meaning": "N/A",
-            "confidence_explanation": "N/A",
-            "qualitative_vs_quantitative": "N/A",
-            "trade_recommendation": "Insufficient data.",
-            "best_convert_time": "N/A",
-            "weekly_outlook": "N/A",
-            "oil_impact_today": "N/A",
-            "geopolitical_impact_today": "N/A",
-            "cbn_watch": "N/A",
-            "key_risks": ["Parse error — retry analysis"],
-            "key_headlines_driving_prediction": []
-        }
+        return {"executive_summary": "Error parsing AI insights. Please rerun."}
 
 
 # ─────────────────────────────────────────────
@@ -1365,113 +1303,49 @@ if not st.session_state.result:
     # Empty state
     pts = len(st.session_state.rate_history)
     needed = max(0, 5 - pts)
-    st.markdown(f"""
-    <div style="text-align:center;padding:60px 20px 40px;">
-      <div style="font-size:48px;margin-bottom:16px;">🤖</div>
-      <div style="font-family:'IBM Plex Mono',monospace;font-size:28px;font-weight:700;
-      background:linear-gradient(135deg,#dce8f8,#a78bfa);-webkit-background-clip:text;
-      -webkit-text-fill-color:transparent;margin-bottom:12px;">ML Oracle — Ready</div>
-      <p style="color:var(--muted2);max-width:500px;margin:0 auto 16px;line-height:1.8;font-size:14px;">
-        This engine uses <strong style="color:var(--amber);">Ridge + Random Forest + Gradient Boosting</strong>
-        trained on your live session data. The more times you run it, the smarter it gets.
-      </p>
-      <div style="background:var(--card);border:1px solid var(--border2);border-radius:12px;
-      padding:18px 24px;max-width:420px;margin:0 auto;">
-        <div style="font-size:11px;color:var(--muted);margin-bottom:8px;font-family:'IBM Plex Mono',monospace;letter-spacing:1px;text-transform:uppercase;">Training Data Progress</div>
-        <div style="font-family:'IBM Plex Mono',monospace;font-size:22px;color:var(--amber);">{pts}/5 runs</div>
-        <div style="font-size:12px;color:var(--muted2);margin-top:4px;">
-          {'✅ Enough for ML predictions!' if pts >= 5 else f'Need {needed} more run(s) for full ML predictions'}
-        </div>
-      </div>
-      <p style="color:var(--muted);font-size:12px;margin-top:24px;">
-        Press <strong style="color:var(--green);">Run ML Analysis</strong> to start.
-        Cold-start estimates are available from run 1 — full ML kicks in after run 5.
-      </p>
+# INSERT THIS RIGHT BEFORE the st.tabs([...]) line:
+
+    st.markdown("""<div style="margin-top:20px; margin-bottom:10px;">
+        <h3 style="font-family:'IBM Plex Mono'; color:var(--purple); font-size:18px; letter-spacing:2px;">💎 STAKEHOLDER INTELLIGENCE BRIEF</h3>
     </div>""", unsafe_allow_html=True)
-
-else:
-    r     = st.session_state.result
-    ml    = r.get("ml", {})
-    raw   = r.get("raw", {})
-    feat  = r.get("features", {})
-    interp = r.get("interp", {})
-    metrics = st.session_state.ml_metrics
-
-    p2p_mid   = raw.get("p2p_mid", 0)
-    official  = raw.get("official", 0)
-    ensemble  = ml.get("ensemble", 0)
-    direction = ml.get("direction", "NEUTRAL")
-    conf      = ml.get("confidence", 0)
-    pred_low  = ml.get("pred_low", 0)
-    pred_high = ml.get("pred_high", 0)
-    n_pts     = ml.get("n_training_points", 0)
-    cold      = ml.get("cold_start", True)
-
-    # ── TOP METRIC CARDS ──
-    dc = "var(--green)" if direction == "BULLISH" else "var(--red)" if direction == "BEARISH" else "var(--amber)"
-    da = "▲" if direction == "BULLISH" else "▼" if direction == "BEARISH" else "◆"
-    cc = "var(--green)" if conf >= 65 else "var(--amber)" if conf >= 45 else "var(--red)"
-    prem = feat.get("premium_pct", 0)
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        st.markdown(f"""<div class="mcard mcard-green">
-        <div class="mcard-label">Live P2P Rate</div>
-        <div class="mcard-value" style="color:var(--green);">₦{p2p_mid:,.0f}</div>
-        <div class="mcard-sub">Binance P2P midpoint</div>
-        </div>""", unsafe_allow_html=True)
-    with c2:
-        st.markdown(f"""<div class="mcard mcard-purple">
-        <div class="mcard-label">ML Ensemble Target</div>
-        <div class="mcard-value" style="color:var(--purple);">₦{ensemble:,.0f}</div>
-        <div class="mcard-sub">₦{pred_low:,.0f} – ₦{pred_high:,.0f}</div>
-        </div>""", unsafe_allow_html=True)
-    with c3:
-        st.markdown(f"""<div class="mcard mcard-{'green' if direction=='BULLISH' else 'red' if direction=='BEARISH' else 'amber'}">
-        <div class="mcard-label">Direction</div>
-        <div class="mcard-value" style="color:{dc};">{da} {direction}</div>
-        <div class="mcard-sub">Statistical model vote</div>
-        </div>""", unsafe_allow_html=True)
-    with c4:
-        st.markdown(f"""<div class="mcard mcard-purple">
-        <div class="mcard-label">Statistical Confidence</div>
-        <div class="mcard-value" style="color:{cc};">{conf}%</div>
-        <div class="mcard-sub">Model agreement + CV MAE</div>
-        </div>""", unsafe_allow_html=True)
-    with c5:
-        status = "⚠️ Cold Start" if cold else f"✅ {n_pts} pts"
-        st.markdown(f"""<div class="mcard mcard-blue">
-        <div class="mcard-label">Training Data</div>
-        <div class="mcard-value" style="color:var(--blue);">{n_pts}</div>
-        <div class="mcard-sub">{status}</div>
-        </div>""", unsafe_allow_html=True)
-
-    if cold:
+    
+    col_a, col_b = st.columns([2, 1])
+    
+    with col_a:
         st.markdown(f"""
-        <div class="alert-box alert-warn">
-          <strong>⚠️ Cold Start Mode</strong> — {ml.get("note","")}
-          Confidence is intentionally capped at 35%. Keep running the analysis to build training data.
-        </div>""", unsafe_allow_html=True)
+        <div class="ocard" style="border-left: 4px solid var(--purple); height: 100%;">
+            <div class="ocard-title">Executive Strategy</div>
+            <p style="font-size:16px; line-height:1.6; color:var(--text); font-weight:500;">
+                {interp.get('executive_summary', 'Analysing current trends...')}
+            </p>
+            <div style="background:var(--bg2); padding:15px; border-radius:10px; margin-top:15px;">
+                <div class="mcard-label" style="color:var(--amber);">Strategic Recommendation</div>
+                <p style="font-size:14px; color:var(--text); margin:0;">{interp.get('stakeholder_insight', 'N/A')}</p>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
+    with col_b:
+        risk = str(interp.get('risk_rating', 'Medium')).upper()
+        r_color = "var(--red)" if "HIGH" in risk or "CRITICAL" in risk else "var(--green)" if "LOW" in risk else "var(--amber)"
+        
+        st.markdown(f"""
+        <div class="ocard" style="text-align:center; height: 100%;">
+            <div class="ocard-title">Volatility Risk Rating</div>
+            <div style="font-size:38px; font-weight:800; color:{r_color}; margin:15px 0;">{risk}</div>
+            <p style="font-size:12px; color:var(--muted2);">{interp.get('global_context', 'No global context available.')}</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown(f"""
+    <div class="ocard" style="background: linear-gradient(90deg, var(--card), var(--bg2)); border-top: 1px solid var(--purple);">
+        <div class="ocard-title">🗞️ Why is the price moving? (News Correlation)</div>
+        <p style="font-size:14px; color:var(--blue); line-height:1.6;">{interp.get('price_movement_drivers', 'Correlating headlines...')}</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
     st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── ALERT BANNERS (shown at top if triggered) ──
-    triggered_alerts = check_and_trigger_alerts(p2p_mid, ml, interp)
-    for _, msg in triggered_alerts:
-        st.markdown(f'<div class="alert-box alert-warn">{msg}</div>', unsafe_allow_html=True)
-
-    # ── RATE SOURCE BADGE ──
-    src = raw.get("rate_source", "unknown")
-    status = raw.get("rate_status", "unknown")
-    src_color = "var(--green)" if status == "live" else "var(--amber)" if status == "estimated" else "var(--red)"
-    st.markdown(
-        f'<p style="font-size:11px;font-family:IBM Plex Mono,monospace;color:{src_color};">'
-        f'<span class="live-dot" style="background:{src_color};"></span>'
-        f'Rate source: {src} &nbsp;·&nbsp; '
-        f'Buy ₦{raw.get("p2p_buy",0):,.0f} &nbsp;|&nbsp; Sell ₦{raw.get("p2p_sell",0):,.0f}'
-        f'</p>',
-        unsafe_allow_html=True
-    )
+    
 
     # ── TABS ──
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([

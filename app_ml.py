@@ -1399,12 +1399,12 @@ else:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # 4. ORIGINAL TABS START HERE
+    
+
+    # ── TABS ──
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🤖 ML Results", "📐 Model Metrics", "📊 History & Chart", "🌍 Features", "💬 Chat", "🔔 Alerts"
     ])
-    
-    # ... (The rest of your code inside tab1, tab2, etc. follows here) ...s
 
     # ════════ TAB 1: ML RESULTS ════════
     with tab1:

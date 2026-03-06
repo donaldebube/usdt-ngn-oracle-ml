@@ -19,6 +19,7 @@ Streamlit Cloud: set GEMINI_KEY (and optionally NEWS_KEY) in Secrets.
 import streamlit as st
 import requests
 import json
+import os
 import datetime
 import time
 import re
@@ -141,6 +142,38 @@ h1,h2,h3 { font-family: 'IBM Plex Mono', monospace !important; }
 # ─────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# PERSISTENCE — rate history survives restarts
+# ─────────────────────────────────────────────
+HISTORY_FILE = "rate_history.json"
+MAX_HISTORY  = 2000   # cap so the file never grows unbounded (~10 MB at most)
+
+def _save_history():
+    """Write session rate_history to disk. Called after every new data point."""
+    try:
+        data = st.session_state.rate_history[-MAX_HISTORY:]
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(data, f, default=str)   # default=str handles datetime objects
+    except Exception:
+        pass   # never crash the app over a save failure
+
+def _load_history() -> list:
+    """Load rate_history from disk on startup. Returns [] if file missing/corrupt."""
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            data = json.load(f)
+        # Basic validation — each entry needs at least a timestamp and p2p_mid
+        valid = [
+            d for d in data
+            if isinstance(d, dict) and d.get("p2p_mid") and d.get("timestamp")
+        ]
+        return valid[-MAX_HISTORY:]
+    except Exception:
+        return []
+
+
 def init():
     defaults = {
         "chat": [], "result": None, "last_time": None,
@@ -152,13 +185,27 @@ def init():
         "ml_metrics": {},
         "user_email": "",
         # ── Global signals cache (refreshes every 5 mins independently) ──
-        "global_signals": None,          # full signals dict
-        "global_signals_time": None,     # datetime of last fetch
-        "global_signals_loading": False, # prevent double-fetch
+        "global_signals": None,
+        "global_signals_time": None,
+        "global_signals_loading": False,
+        # ── Persistence flags ──
+        "history_loaded": False,   # only load from disk once per session
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+    # Load persisted history exactly once per session
+    if not st.session_state.history_loaded:
+        saved = _load_history()
+        if saved:
+            # Merge: saved data first, then any points already in session
+            # (handles hot-reload edge case)
+            existing_times = {d.get("timestamp") for d in st.session_state.rate_history}
+            new_points     = [d for d in saved if d.get("timestamp") not in existing_times]
+            st.session_state.rate_history = new_points + st.session_state.rate_history
+        st.session_state.history_loaded = True
+
 init()
 
 
@@ -1525,6 +1572,7 @@ def run_full_analysis() -> dict:
         "official":  raw.get("official"),
         "features":  feat,
     })
+    _save_history()   # ← persist to disk immediately
 
     # Step 3: Train ML models and predict
     ml = train_and_predict(feat, p2p_mid)
@@ -1817,9 +1865,15 @@ if auto_ref and st.session_state.last_time and GEMINI_KEY:
 
 # ── MAIN DISPLAY ──
 if not st.session_state.result:
-    # Empty state
-    pts = len(st.session_state.rate_history)
+    pts    = len(st.session_state.rate_history)
     needed = max(0, 5 - pts)
+    persisted_note = (
+        f'<div style="background:rgba(5,214,138,0.08);border:1px solid rgba(5,214,138,0.25);'
+        f'border-radius:8px;padding:10px 16px;margin-top:12px;font-size:12px;color:#05d68a;">'
+        f'📂 Loaded <strong>{pts}</strong> data points from previous sessions. '
+        f'{"✅ ML is ready!" if pts >= 5 else f"Need {needed} more run(s) to unlock full ML."}'
+        f'</div>'
+    ) if pts > 0 else ""
     st.markdown(f"""
     <div style="text-align:center;padding:60px 20px 40px;">
       <div style="font-size:48px;margin-bottom:16px;">🤖</div>
@@ -1842,6 +1896,7 @@ if not st.session_state.result:
         Press <strong style="color:var(--green);">Run ML Analysis</strong> to start.
         Cold-start estimates are available from run 1 — full ML kicks in after run 5.
       </p>
+      {persisted_note}
     </div>""", unsafe_allow_html=True)
 
 else:
@@ -2451,6 +2506,63 @@ else:
     # ════════ TAB 4: HISTORY ════════
     with tab4:
         hist = st.session_state.rate_history
+
+        # ── Persistence status bar ──
+        file_exists  = os.path.exists(HISTORY_FILE)
+        file_size_kb = round(os.path.getsize(HISTORY_FILE) / 1024, 1) if file_exists else 0
+        n_saved      = len(_load_history()) if file_exists else 0
+        oldest       = hist[0].get("timestamp","")[:16].replace("T"," ") if hist else "—"
+        newest       = hist[-1].get("timestamp","")[:16].replace("T"," ") if hist else "—"
+
+        ps1, ps2, ps3, ps4 = st.columns(4)
+        with ps1:
+            st.markdown(f"""<div class="mcard mcard-green">
+            <div class="mcard-label">Total Data Points</div>
+            <div class="mcard-value" style="color:var(--green);">{len(hist)}</div>
+            <div class="mcard-sub">{"✅ Persisted to disk" if file_exists else "⚠️ Not saved yet"}</div>
+            </div>""", unsafe_allow_html=True)
+        with ps2:
+            st.markdown(f"""<div class="mcard mcard-blue">
+            <div class="mcard-label">History File</div>
+            <div class="mcard-value" style="color:var(--blue);font-size:16px;">
+              {"✅ " + str(file_size_kb) + " KB" if file_exists else "✗ Missing"}
+            </div>
+            <div class="mcard-sub">{n_saved} records on disk</div>
+            </div>""", unsafe_allow_html=True)
+        with ps3:
+            st.markdown(f"""<div class="mcard mcard-amber">
+            <div class="mcard-label">Date Range</div>
+            <div class="mcard-value" style="color:var(--amber);font-size:13px;">{oldest}</div>
+            <div class="mcard-sub">→ {newest}</div>
+            </div>""", unsafe_allow_html=True)
+        with ps4:
+            st.markdown(f"""<div class="mcard mcard-purple">
+            <div class="mcard-label">ML Training Quality</div>
+            <div class="mcard-value" style="color:var(--purple);">
+              {"🔥 Strong" if len(hist)>=50 else "✅ Good" if len(hist)>=20 else "📈 Building" if len(hist)>=5 else "🌱 Cold start"}
+            </div>
+            <div class="mcard-sub">
+              {"50+ pts: full patterns" if len(hist)>=50 else "20+ pts: reliable" if len(hist)>=20 else "5+ pts: ML active" if len(hist)>=5 else "Need 5 pts for ML"}
+            </div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Clear / export controls
+        hc1, hc2, hc3 = st.columns([2, 2, 7])
+        with hc1:
+            if st.button("🗑 Clear History", key="clear_hist_btn", use_container_width=True):
+                st.session_state.rate_history = []
+                if os.path.exists(HISTORY_FILE):
+                    os.remove(HISTORY_FILE)
+                st.session_state.history_loaded = True
+                st.success("History cleared.")
+                st.rerun()
+        with hc2:
+            if hist and st.button("💾 Force Save Now", key="force_save_btn", use_container_width=True):
+                _save_history()
+                st.success(f"Saved {len(hist)} points to {HISTORY_FILE}")
+
         if len(hist) < 2:
             st.markdown("""<div class="ocard" style="text-align:center;padding:40px;">
             <p style="color:var(--muted2);">Run analysis at least twice to see charts.</p>

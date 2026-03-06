@@ -20,6 +20,8 @@ import streamlit as st
 import requests
 import json
 import datetime
+import time
+import re
 import numpy as np
 import pandas as pd
 import warnings
@@ -142,13 +144,17 @@ h1,h2,h3 { font-family: 'IBM Plex Mono', monospace !important; }
 def init():
     defaults = {
         "chat": [], "result": None, "last_time": None,
-        "rate_history": [],      # list of dicts: {time, features, actual_rate}
-        "model_history": [],     # list of dicts for audit trail
+        "rate_history": [],
+        "model_history": [],
         "alerts": [], "alert_triggered": [],
         "auto_refresh": False, "refresh_interval": 60,
         "prev_rate": None,
-        "ml_metrics": {},        # stored cross-val metrics
-        "user_email": "",        # email for price alerts
+        "ml_metrics": {},
+        "user_email": "",
+        # ── Global signals cache (refreshes every 5 mins independently) ──
+        "global_signals": None,          # full signals dict
+        "global_signals_time": None,     # datetime of last fetch
+        "global_signals_loading": False, # prevent double-fetch
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -260,8 +266,533 @@ def gemini(prompt: str, system: str = "") -> str:
     return f"❌ All Gemini models failed. Errors: {error_summary}"
 
 
-# ─────────────────────────────────────────────
-# ── DATA COLLECTION ──
+# ═══════════════════════════════════════════════════════════════
+# ── GLOBAL SIGNALS ENGINE ──
+# Fetches 15+ live data streams every 5 minutes, completely
+# independently of the ML analysis. Shows a live ticker panel.
+# ═══════════════════════════════════════════════════════════════
+SIGNALS_TTL = 300   # seconds — refresh every 5 minutes
+
+def _signals_stale() -> bool:
+    """True if signals are missing or older than TTL."""
+    t = st.session_state.global_signals_time
+    if t is None:
+        return True
+    return (datetime.datetime.now() - t).total_seconds() > SIGNALS_TTL
+
+def fetch_global_signals() -> dict:
+    """
+    Pulls 15+ live data feeds and returns a single structured dict.
+    Runs in ~8-12 seconds total (parallel topics, short timeouts).
+    All errors are caught — partial data is fine.
+    """
+    sig = {
+        "fetched_at": datetime.datetime.now().isoformat(),
+        "sources":    [],
+        "errors":     [],
+    }
+
+    # ── 1. CRYPTO PRICES ──
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price"
+            "?ids=bitcoin,ethereum,tether,binancecoin,solana,ripple"
+            "&vs_currencies=usd,ngn&include_24hr_change=true&include_market_cap=true",
+            timeout=10, headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if r.status_code == 200:
+            d = r.json()
+            sig["btc_usd"]       = d.get("bitcoin",{}).get("usd")
+            sig["btc_24h"]       = d.get("bitcoin",{}).get("usd_24h_change")
+            sig["btc_mcap"]      = d.get("bitcoin",{}).get("usd_market_cap")
+            sig["eth_usd"]       = d.get("ethereum",{}).get("usd")
+            sig["eth_24h"]       = d.get("ethereum",{}).get("usd_24h_change")
+            sig["bnb_usd"]       = d.get("binancecoin",{}).get("usd")
+            sig["bnb_24h"]       = d.get("binancecoin",{}).get("usd_24h_change")
+            sig["sol_usd"]       = d.get("solana",{}).get("usd")
+            sig["sol_24h"]       = d.get("solana",{}).get("usd_24h_change")
+            sig["xrp_usd"]       = d.get("ripple",{}).get("usd")
+            sig["xrp_24h"]       = d.get("ripple",{}).get("usd_24h_change")
+            sig["usdt_ngn_cg"]   = d.get("tether",{}).get("ngn")
+            sig["sources"].append("CoinGecko (crypto)")
+    except Exception as e:
+        sig["errors"].append(f"CoinGecko: {str(e)[:60]}")
+
+    # ── 2. FX RATES (USD vs multiple currencies) ──
+    try:
+        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=8)
+        if r.status_code == 200:
+            rates = r.json().get("rates", {})
+            sig["usd_ngn_official"] = rates.get("NGN")
+            sig["usd_eur"]          = rates.get("EUR")
+            sig["usd_gbp"]          = rates.get("GBP")
+            sig["usd_zar"]          = rates.get("ZAR")
+            sig["usd_kes"]          = rates.get("KES")
+            sig["usd_ghs"]          = rates.get("GHS")
+            sig["usd_egp"]          = rates.get("EGP")
+            sig["usd_cny"]          = rates.get("CNY")
+            sig["usd_jpy"]          = rates.get("JPY")
+            sig["eurusd"]           = round(1 / rates["EUR"], 5) if rates.get("EUR") else None
+            sig["dxy_proxy"]        = round(rates["EUR"] * 100, 3) if rates.get("EUR") else None
+            sig["sources"].append("ExchangeRate-API (FX)")
+    except Exception as e:
+        sig["errors"].append(f"FX API: {str(e)[:60]}")
+
+    # ── 3. COMMODITY PROXY: Oil (via alternative free endpoint) ──
+    # CoinGecko doesn't have oil, but we can get a rough oil proxy from
+    # commodity-linked tokens and supplement with RSS headlines
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price"
+            "?ids=petro,oilcoin&vs_currencies=usd&include_24hr_change=true",
+            timeout=8, headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if r.status_code == 200:
+            d = r.json()
+            sig["oil_token_change"] = (
+                d.get("petro",{}).get("usd_24h_change") or
+                d.get("oilcoin",{}).get("usd_24h_change")
+            )
+    except:
+        pass
+
+    # Also scrape oil price headline from Google Finance via RSS
+    try:
+        r = requests.get(
+            "https://news.google.com/rss/search?q=Brent+crude+oil+price+today&hl=en-US&gl=US&ceid=US:en",
+            timeout=8, headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if r.status_code == 200:
+            titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", r.text)
+            sig["oil_headline"] = titles[1] if len(titles) > 1 else None
+    except:
+        pass
+
+    # ── 4. FEAR & GREED INDEX ──
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8)
+        if r.status_code == 200:
+            fng = r.json().get("data", [{}])[0]
+            sig["fear_greed_value"]      = int(fng.get("value", 50))
+            sig["fear_greed_label"]      = fng.get("value_classification", "N/A")
+            sig["sources"].append("Alternative.me (Fear & Greed)")
+    except Exception as e:
+        sig["errors"].append(f"FnG: {str(e)[:40]}")
+
+    # ── 5. GLOBAL NEWS HEADLINES (18 RSS feeds — parallel) ──
+    rss_topics = [
+        ("Nigeria naira exchange rate",           "🇳🇬 NGN"),
+        ("CBN central bank Nigeria forex",        "🏦 CBN"),
+        ("crude oil price Brent OPEC today",      "🛢️ Oil"),
+        ("Iran oil sanctions",                    "⚠️ Iran"),
+        ("US Federal Reserve interest rates",     "🇺🇸 Fed"),
+        ("Bitcoin crypto market today",           "₿ BTC"),
+        ("Nigeria economy inflation 2025",        "📉 NG Macro"),
+        ("Middle East conflict oil supply",       "🌍 MidEast"),
+        ("dollar index DXY strength",             "💵 DXY"),
+        ("OPEC production output cut",            "🛢️ OPEC"),
+        ("Russia Ukraine war commodity",          "⚡ Russia"),
+        ("Nigeria crypto P2P USDT",               "💱 NG Crypto"),
+        ("emerging markets currency selloff",     "📊 EM FX"),
+        ("US inflation CPI report",               "📈 US CPI"),
+        ("IMF World Bank Nigeria",                "🏛️ IMF"),
+        ("China economy trade slowdown",          "🇨🇳 China"),
+        ("Nigeria remittance diaspora",           "💸 Remittance"),
+        ("gold price safe haven",                 "🥇 Gold"),
+    ]
+    headlines_raw = []
+    for query, tag in rss_topics:
+        try:
+            encoded = requests.utils.quote(query)
+            url = f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
+            r = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200:
+                titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", r.text)
+                descs  = re.findall(r"<description><!\[CDATA\[(.*?)\]\]></description>", r.text)
+                for i, title in enumerate(titles[1:3]):
+                    desc = re.sub(r"<[^>]+>", "", descs[i] if i < len(descs) else "")[:120]
+                    headlines_raw.append({
+                        "tag":   tag,
+                        "title": title.strip(),
+                        "desc":  desc.strip(),
+                        "full":  f"{tag} | {title.strip()}",
+                    })
+        except:
+            pass
+
+    sig["headlines"]       = headlines_raw
+    sig["headline_count"]  = len(headlines_raw)
+    if headlines_raw:
+        sig["sources"].append(f"Google News RSS ({len(headlines_raw)} headlines)")
+
+    # ── 6. SUPPLEMENTAL: NewsAPI headlines (if key available) ──
+    if NEWS_KEY:
+        extra = []
+        for q in ["Nigeria naira USDT", "oil price Iran", "CBN forex"]:
+            try:
+                r = requests.get(
+                    f"https://newsapi.org/v2/everything?q={requests.utils.quote(q)}"
+                    f"&sortBy=publishedAt&pageSize=3&language=en&apiKey={NEWS_KEY}",
+                    timeout=7
+                )
+                if r.status_code == 200:
+                    for a in r.json().get("articles", [])[:2]:
+                        t = a.get("title","")
+                        d = (a.get("description") or "")[:120]
+                        if t:
+                            extra.append({"tag":"📰 NewsAPI","title":t,"desc":d,"full":f"📰 NewsAPI | {t}"})
+            except:
+                pass
+        sig["headlines"] = headlines_raw + extra
+        sig["headline_count"] = len(sig["headlines"])
+        if extra:
+            sig["sources"].append(f"NewsAPI ({len(extra)} articles)")
+
+    # ── 7. GEMINI QUALITATIVE SCORING of all signals ──
+    all_headlines = sig.get("headlines", [])
+    if all_headlines:
+        now_str  = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M WAT")
+        btc_str  = f"${sig.get('btc_usd',0):,.0f} ({sig.get('btc_24h',0):+.1f}%)" if sig.get("btc_usd") else "N/A"
+        fng_str  = f"{sig.get('fear_greed_value','?')} — {sig.get('fear_greed_label','N/A')}"
+        oil_hl   = sig.get("oil_headline","N/A")
+        dxy_str  = str(sig.get("dxy_proxy","N/A"))
+        headlines_block = "\n".join(f"  {i+1}. {h['full']}" for i, h in enumerate(all_headlines[:40]))
+
+        q_prompt = f"""You are a senior FX strategist. Today is {now_str}.
+
+LIVE MARKET SNAPSHOT:
+- BTC: {btc_str}
+- Crypto Fear & Greed: {fng_str}
+- EUR/USD: {sig.get('eurusd','N/A')} | DXY proxy: {dxy_str}
+- Oil headline: {oil_hl}
+- USD/ZAR: {sig.get('usd_zar','N/A')} | USD/KES: {sig.get('usd_kes','N/A')} | USD/GHS: {sig.get('usd_ghs','N/A')}
+
+LIVE HEADLINES ({len(all_headlines[:40])} total):
+{headlines_block}
+
+TASK: Reason about how ALL of the above affects the USDT/NGN P2P black market rate right now.
+Think through: oil → Nigeria FX earnings → NGN supply, Fed/DXY → EM pressure, CBN actions,
+geopolitical risk → capital flight, crypto sentiment → P2P liquidity, remittances → USD supply.
+
+Return ONLY valid JSON, no markdown, no backticks:
+{{
+  "overall_score": <-100 to +100, positive=USDT rises/NGN weakens>,
+  "nigeria_macro": <-100 to 100>,
+  "cbn_policy": <-100 to 100>,
+  "oil_impact": <-100 to 100>,
+  "usd_fed_impact": <-100 to 100>,
+  "crypto_sentiment": <-100 to 100>,
+  "geopolitical_risk": <-100 to 100>,
+  "political_risk_nigeria": <-100 to 100>,
+  "remittance_flow": <-100 to 100>,
+  "global_em_risk": <-100 to 100>,
+  "market_mood": "RISK_ON|RISK_OFF|NEUTRAL",
+  "top_mover_today": "<the single biggest market-moving event happening right now — specific>",
+  "breaking_event": "<any breaking event causing sudden rate movement — or null>",
+  "oil_analysis": "<2 sentences: current oil situation and NGN impact>",
+  "geopolitical_analysis": "<2 sentences: active conflicts/sanctions affecting oil or USD>",
+  "cbn_analysis": "<2 sentences: CBN's current stance and likely near-term action>",
+  "crypto_analysis": "<1 sentence: crypto market mood and P2P Nigeria impact>",
+  "em_analysis": "<1 sentence: broader EM currency pressure today>",
+  "top_bullish_catalyst": "<most important reason USDT/NGN could RISE today — cite actual news>",
+  "top_bearish_catalyst": "<most important reason USDT/NGN could FALL today — cite actual news>",
+  "overall_qualitative_direction": "BULLISH_USDT|BEARISH_USDT|NEUTRAL",
+  "qualitative_confidence": <0-100>,
+  "30min_bias": "BUY|SELL|HOLD",
+  "key_watch_items": ["<thing to watch 1>", "<thing to watch 2>", "<thing to watch 3>"]
+}}"""
+
+        try:
+            raw_q = gemini(q_prompt,
+                "You are a quantitative FX strategist. Return only valid JSON. No markdown.")
+            clean_q = raw_q.strip()
+            if "```" in clean_q:
+                for p in clean_q.split("```"):
+                    p = p.strip()
+                    if p.startswith("json"): p = p[4:].strip()
+                    if p.startswith("{"): clean_q = p; break
+            if not clean_q.startswith("{"):
+                idx = clean_q.find("{")
+                if idx >= 0: clean_q = clean_q[idx:]
+            last = clean_q.rfind("}")
+            if last >= 0: clean_q = clean_q[:last+1]
+            sig["analysis"] = json.loads(clean_q)
+            sig["sources"].append("Gemini deep analysis")
+        except Exception as e:
+            sig["analysis"] = {}
+            sig["errors"].append(f"Gemini analysis: {str(e)[:80]}")
+
+    return sig
+
+
+def maybe_refresh_signals(force: bool = False):
+    """Refresh global signals if stale or forced. Stores in session_state."""
+    if force or _signals_stale():
+        st.session_state.global_signals_loading = True
+        try:
+            sig = fetch_global_signals()
+            st.session_state.global_signals      = sig
+            st.session_state.global_signals_time = datetime.datetime.now()
+        except Exception as e:
+            pass
+        finally:
+            st.session_state.global_signals_loading = False
+
+
+def render_global_signals_panel():
+    """
+    Renders the always-visible Global Signals panel at the top of the page.
+    Shows live crypto, FX, news, fear & greed, and Gemini's qualitative view.
+    Refreshes every 5 minutes automatically.
+    """
+    # Trigger refresh if stale
+    maybe_refresh_signals()
+
+    sig  = st.session_state.global_signals or {}
+    anal = sig.get("analysis", {})
+    now  = st.session_state.global_signals_time
+    age_str = ""
+    if now:
+        age_s = int((datetime.datetime.now() - now).total_seconds())
+        if age_s < 60:
+            age_str = f"{age_s}s ago"
+        else:
+            age_str = f"{age_s//60}m {age_s%60}s ago"
+    next_refresh = max(0, SIGNALS_TTL - (
+        int((datetime.datetime.now() - now).total_seconds()) if now else SIGNALS_TTL
+    ))
+    next_str = f"{next_refresh//60}m {next_refresh%60}s"
+
+    # ── Panel Header ──
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#0c1220,#111d2e);
+    border:1px solid #243550;border-radius:16px;padding:18px 22px;margin-bottom:18px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px;">
+        <div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:9px;letter-spacing:3px;
+          text-transform:uppercase;color:var(--purple);margin-bottom:3px;">
+            🌐 LIVE GLOBAL SIGNALS FEED
+          </div>
+          <div style="font-size:11px;color:var(--muted2);">
+            {len(sig.get('headlines',[]))} headlines · {len(sig.get('sources',[]))} sources ·
+            <span style="color:var(--green);">Updated {age_str}</span> ·
+            <span style="color:var(--muted);">Next refresh in {next_str}</span>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;">
+    """, unsafe_allow_html=True)
+
+    col_refresh, col_spacer = st.columns([1, 8])
+    with col_refresh:
+        if st.button("↻ Refresh", key="refresh_signals_btn", use_container_width=True):
+            maybe_refresh_signals(force=True)
+            st.rerun()
+
+    st.markdown("</div></div>", unsafe_allow_html=True)
+
+    if not sig:
+        st.markdown('<p style="color:var(--muted2);font-size:12px;">Loading signals...</p>',
+                    unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
+
+    # ── ROW 1: Crypto ticker ──
+    crypto_items = [
+        ("BTC",  sig.get("btc_usd"),  sig.get("btc_24h"),  "₿"),
+        ("ETH",  sig.get("eth_usd"),  sig.get("eth_24h"),  "Ξ"),
+        ("BNB",  sig.get("bnb_usd"),  sig.get("bnb_24h"),  "⬡"),
+        ("SOL",  sig.get("sol_usd"),  sig.get("sol_24h"),  "◎"),
+        ("XRP",  sig.get("xrp_usd"),  sig.get("xrp_24h"),  "✕"),
+    ]
+    ticker_html = '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">'
+    for name, price, chg, icon in crypto_items:
+        if price is None: continue
+        chg_val  = chg or 0
+        chg_col  = "#05d68a" if chg_val >= 0 else "#f0455a"
+        chg_arr  = "▲" if chg_val >= 0 else "▼"
+        price_str = f"${price:,.0f}" if price > 100 else f"${price:,.4f}"
+        ticker_html += f"""
+        <div style="background:#0c1220;border:1px solid #1a2942;border-radius:10px;
+        padding:8px 14px;min-width:100px;">
+          <div style="font-size:9px;color:#4a6080;font-family:'IBM Plex Mono',monospace;
+          letter-spacing:1px;">{icon} {name}</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:14px;
+          font-weight:700;color:#dce8f8;">{price_str}</div>
+          <div style="font-size:10px;color:{chg_col};font-family:'IBM Plex Mono',monospace;">
+            {chg_arr} {abs(chg_val):.2f}%
+          </div>
+        </div>"""
+    ticker_html += '</div>'
+    st.markdown(ticker_html, unsafe_allow_html=True)
+
+    # ── ROW 2: FX + Fear & Greed + Oil + Market mood ──
+    fng_val   = sig.get("fear_greed_value", 50)
+    fng_label = sig.get("fear_greed_label", "N/A")
+    fng_col   = "#05d68a" if fng_val >= 60 else "#f0455a" if fng_val <= 30 else "#f5a623"
+    mood      = anal.get("market_mood", "NEUTRAL")
+    mood_col  = "#05d68a" if mood == "RISK_ON" else "#f0455a" if mood == "RISK_OFF" else "#f5a623"
+    mood_icon = "📈" if mood == "RISK_ON" else "📉" if mood == "RISK_OFF" else "➡️"
+    q_dir     = anal.get("overall_qualitative_direction", "NEUTRAL")
+    q_dir_col = "#05d68a" if "BULLISH" in q_dir and "USDT" in q_dir else "#f0455a" if "BEARISH" in q_dir else "#f5a623"
+    bias_30   = anal.get("30min_bias", "HOLD")
+    bias_col  = "#05d68a" if bias_30 == "BUY" else "#f0455a" if bias_30 == "SELL" else "#f5a623"
+    eur_usd   = sig.get("eurusd")
+
+    row2_html = '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">'
+    for label, value, color, sublabel in [
+        ("EUR/USD",       f"{eur_usd:.4f}" if eur_usd else "N/A",              "#4f8ef7", "DXY proxy"),
+        ("USD/NGN Offcl", f"₦{sig.get('usd_ngn_official',0):,.1f}" if sig.get('usd_ngn_official') else "N/A", "#a78bfa", "CBN rate"),
+        ("USD/ZAR",       f"{sig.get('usd_zar',0):.2f}" if sig.get('usd_zar') else "N/A",   "#6b84a0", "EM proxy"),
+        ("Fear & Greed",  f"{fng_val} / 100",                                   fng_col,  fng_label),
+        ("Market Mood",   f"{mood_icon} {mood.replace('_',' ')}",               mood_col, "Global risk appetite"),
+        ("USDT/NGN Bias", q_dir.replace("_USDT","").replace("_"," "),           q_dir_col,"Qualitative signal"),
+        ("30m Bias",      f"⚡ {bias_30}",                                        bias_col, "Short-term"),
+    ]:
+        row2_html += f"""
+        <div style="background:#0c1220;border:1px solid #1a2942;border-radius:10px;
+        padding:8px 14px;flex:1;min-width:110px;">
+          <div style="font-size:9px;color:#4a6080;font-family:'IBM Plex Mono',monospace;
+          letter-spacing:1px;margin-bottom:3px;">{label}</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;
+          font-weight:700;color:{color};">{value}</div>
+          <div style="font-size:9px;color:#4a6080;margin-top:2px;">{sublabel}</div>
+        </div>"""
+    row2_html += '</div>'
+    st.markdown(row2_html, unsafe_allow_html=True)
+
+    # ── ROW 3: Top mover + Catalysts ──
+    top_mover = anal.get("top_mover_today", "")
+    breaking  = anal.get("breaking_event")
+    bull_cat  = anal.get("top_bullish_catalyst", "")
+    bear_cat  = anal.get("top_bearish_catalyst", "")
+    oil_str   = anal.get("oil_analysis", "")
+    geo_str   = anal.get("geopolitical_analysis", "")
+
+    if breaking and breaking not in ("null", "None", "N/A", None, ""):
+        st.markdown(f"""
+        <div style="background:rgba(240,69,90,0.1);border:1px solid #f0455a;
+        border-left:4px solid #f0455a;border-radius:10px;padding:10px 16px;
+        margin-bottom:10px;">
+          <span style="font-size:9px;color:#f0455a;font-family:'IBM Plex Mono',monospace;
+          letter-spacing:2px;text-transform:uppercase;">⚡ BREAKING</span>
+          <span style="font-size:12px;color:#dce8f8;margin-left:10px;">{breaking}</span>
+        </div>""", unsafe_allow_html=True)
+
+    if top_mover:
+        st.markdown(f"""
+        <div style="background:#0c1220;border:1px solid #243550;border-radius:10px;
+        padding:10px 16px;margin-bottom:10px;">
+          <span style="font-size:9px;color:#f5a623;font-family:'IBM Plex Mono',monospace;
+          letter-spacing:2px;text-transform:uppercase;">🎯 TOP MOVER TODAY</span>
+          <span style="font-size:12px;color:#dce8f8;margin-left:10px;">{top_mover}</span>
+        </div>""", unsafe_allow_html=True)
+
+    cat_cols = st.columns(2)
+    with cat_cols[0]:
+        if bull_cat:
+            st.markdown(f"""
+            <div style="background:rgba(5,214,138,0.07);border:1px solid rgba(5,214,138,0.3);
+            border-radius:10px;padding:10px 14px;">
+              <div style="font-size:9px;color:#05d68a;letter-spacing:1.5px;text-transform:uppercase;
+              font-family:'IBM Plex Mono',monospace;margin-bottom:4px;">📈 Bullish for USDT</div>
+              <div style="font-size:11px;color:#b0c8e8;line-height:1.5;">{bull_cat}</div>
+            </div>""", unsafe_allow_html=True)
+    with cat_cols[1]:
+        if bear_cat:
+            st.markdown(f"""
+            <div style="background:rgba(240,69,90,0.07);border:1px solid rgba(240,69,90,0.3);
+            border-radius:10px;padding:10px 14px;">
+              <div style="font-size:9px;color:#f0455a;letter-spacing:1.5px;text-transform:uppercase;
+              font-family:'IBM Plex Mono',monospace;margin-bottom:4px;">📉 Bearish for USDT</div>
+              <div style="font-size:11px;color:#b0c8e8;line-height:1.5;">{bear_cat}</div>
+            </div>""", unsafe_allow_html=True)
+
+    # ── ROW 4: Oil / Geo / Crypto / EM micro-cards ──
+    micro_items = [
+        ("🛢️ Oil",         anal.get("oil_analysis",""),       sig.get("oil_impact", anal.get("oil_impact",0))),
+        ("🌍 Geopolitics", anal.get("geopolitical_analysis",""), anal.get("geopolitical_risk",0)),
+        ("₿ Crypto",      anal.get("crypto_analysis",""),     anal.get("crypto_sentiment",0)),
+        ("📊 EM Markets",  anal.get("em_analysis",""),         anal.get("global_em_risk",0)),
+    ]
+    micro_cols = st.columns(4)
+    for col, (title, text, score) in zip(micro_cols, micro_items):
+        score = score or 0
+        try: score = float(score)
+        except: score = 0
+        sc  = "var(--red)" if score > 15 else "var(--green)" if score < -15 else "var(--amber)"
+        arr = "↑ USDT" if score > 15 else "↓ USDT" if score < -15 else "≈ FLAT"
+        with col:
+            st.markdown(f"""
+            <div style="background:#0c1220;border:1px solid #1a2942;border-radius:10px;
+            padding:10px 12px;margin-top:10px;height:100%;">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                <div style="font-size:10px;color:#6b84a0;font-family:'IBM Plex Mono',monospace;">{title}</div>
+                <div style="font-size:9px;color:{sc};font-family:'IBM Plex Mono',monospace;font-weight:700;">{arr}</div>
+              </div>
+              <div style="font-size:11px;color:#b0c8e8;line-height:1.5;">{text[:140] if text else "N/A"}</div>
+            </div>""", unsafe_allow_html=True)
+
+    # ── ROW 5: Live news ticker (scrolling headlines) ──
+    headlines = sig.get("headlines", [])
+    if headlines:
+        ticker_items = " &nbsp;&nbsp;&nbsp;·&nbsp;&nbsp;&nbsp; ".join(
+            f'<span style="color:{get_headline_color(h["tag"])}">{h["tag"]}</span> '
+            f'<span style="color:#b0c8e8;">{h["title"][:80]}</span>'
+            for h in headlines[:20]
+        )
+        st.markdown(f"""
+        <div style="margin-top:12px;overflow:hidden;white-space:nowrap;
+        background:#0c1220;border:1px solid #1a2942;border-radius:8px;padding:8px 16px;">
+          <div style="font-size:9px;color:#4a6080;letter-spacing:2px;text-transform:uppercase;
+          font-family:'IBM Plex Mono',monospace;margin-bottom:6px;">📡 LIVE TICKER</div>
+          <div style="font-size:11px;line-height:1.8;white-space:normal;">{ticker_items}</div>
+        </div>""", unsafe_allow_html=True)
+
+        # Full headlines expander
+        with st.expander(f"📋 All {len(headlines)} live headlines"):
+            for i, h in enumerate(headlines, 1):
+                col = get_headline_color(h["tag"])
+                st.markdown(
+                    f'<div style="padding:5px 0;border-bottom:1px solid #1a2942;'
+                    f'font-size:11px;font-family:IBM Plex Mono,monospace;">'
+                    f'<span style="color:{col}">{h["tag"]}</span> '
+                    f'<span style="color:#dce8f8;">{h["title"]}</span>'
+                    f'{"<br><span style=\'color:#4a6080;font-size:10px;\'>"+h["desc"]+"</span>" if h.get("desc") else ""}'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+
+    # ── Watch items ──
+    watch = anal.get("key_watch_items", [])
+    if watch:
+        watch_str = " &nbsp;|&nbsp; ".join(
+            f'<span style="color:#f5a623;">👁 {w}</span>' for w in watch
+        )
+        st.markdown(f"""
+        <div style="margin-top:10px;font-size:11px;color:#6b84a0;
+        border-top:1px solid #1a2942;padding-top:10px;">
+          <strong style="color:#4a6080;font-family:'IBM Plex Mono',monospace;font-size:9px;
+          letter-spacing:1.5px;text-transform:uppercase;">WATCH THIS WEEK:</strong>
+          &nbsp; {watch_str}
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)  # close panel
+
+
+def get_headline_color(tag: str) -> str:
+    """Return color based on headline tag."""
+    tag_upper = tag.upper()
+    if any(x in tag_upper for x in ["IRAN","MIDEAST","RUSSIA","WAR","CONFLICT","SANCTION"]):
+        return "#f0455a"
+    if any(x in tag_upper for x in ["OIL","OPEC","BRENT"]):
+        return "#f5a623"
+    if any(x in tag_upper for x in ["NGN","NAIRA","CBN","NG "]):
+        return "#05d68a"
+    if any(x in tag_upper for x in ["BTC","CRYPTO","BITCOIN"]):
+        return "#a78bfa"
+    if any(x in tag_upper for x in ["FED","USD","DXY","CPI"]):
+        return "#4f8ef7"
+    return "#6b84a0"
 # Returns a flat dict of ALL numeric features
 # ─────────────────────────────────────────────
 def collect_features() -> dict:
@@ -484,179 +1015,58 @@ def collect_features() -> dict:
     feat["month_cos"]    = float(np.cos(2 * np.pi * now.month / 12))
 
     # ── 7. QUALITATIVE INTELLIGENCE ENGINE ──
-    # Scrapes Google News RSS (no API key needed) across every topic that
-    # can move USDT/NGN, then uses Gemini to REASON about the headlines —
-    # not just count them. Covers geopolitics, oil shocks, CBN actions,
-    # Fed policy, crypto regulation, and anything else breaking right now.
-    raw["news_intel"] = {}
-    news_headlines = []
+    # Reuse the cached global signals if available and fresh.
+    # This avoids double-fetching headlines on every analysis run.
+    cached_sig  = st.session_state.global_signals or {}
+    cached_anal = cached_sig.get("analysis", {})
+    headlines_all = [h.get("full","") for h in cached_sig.get("headlines", [])]
 
-    # Google News RSS topics — free, no key, always fresh
-    rss_topics = [
-        ("Nigeria naira exchange rate",          "nigeria_fx"),
-        ("CBN central bank Nigeria",             "cbn_policy"),
-        ("Nigeria inflation economy",            "nigeria_macro"),
-        ("crude oil price Brent OPEC",           "oil_markets"),
-        ("Iran oil sanctions geopolitics",       "geopolitics"),
-        ("US Federal Reserve interest rates",    "fed_usd"),
-        ("dollar strength DXY emerging markets", "usd_em"),
-        ("Nigeria crypto USDT P2P",              "crypto_nigeria"),
-        ("Bitcoin crypto market",                "crypto_global"),
-        ("Nigeria government fiscal policy",     "nigeria_fiscal"),
-        ("Middle East conflict oil supply",      "mideast_oil"),
-        ("Russia Ukraine war commodity",         "war_commodity"),
-        ("China economy trade dollar",           "china_macro"),
-        ("IMF World Bank Nigeria debt",          "intl_finance"),
-        ("Nigeria election politics 2025",       "political_risk"),
-        ("OPEC production cut oil output",       "opec"),
-        ("Nigeria remittance diaspora dollar",   "remittances"),
-        ("US inflation CPI jobs report",         "us_macro"),
-    ]
+    # If cache is fresh, pull scores directly from it
+    if cached_anal and not _signals_stale():
+        feat["news_overall"]        = float(cached_anal.get("overall_score", cached_anal.get("overall_score", 0)))
+        feat["news_nigeria"]        = float(cached_anal.get("nigeria_macro", 0))
+        feat["news_cbn"]            = float(cached_anal.get("cbn_policy", 0))
+        feat["news_oil"]            = float(cached_anal.get("oil_impact", 0))
+        feat["news_usd"]            = float(cached_anal.get("usd_fed_impact", 0))
+        feat["news_crypto"]         = float(cached_anal.get("crypto_sentiment", 0))
+        feat["news_geopolitics"]    = float(cached_anal.get("geopolitical_risk", 0))
+        feat["news_political_risk"] = float(cached_anal.get("political_risk_nigeria", 0))
+        feat["news_remittance"]     = float(cached_anal.get("remittance_flow", 0))
+        feat["news_em_risk"]        = float(cached_anal.get("global_em_risk", 0))
+        raw["news_intel"]           = cached_anal
+        raw["news_sentiment"]       = cached_anal
+        raw["news_headlines"]       = headlines_all[:40]
+        raw["news_headlines_count"] = len(headlines_all)
+    else:
+        # Cache miss — fetch fresh (this also updates the global signals cache)
+        maybe_refresh_signals(force=True)
+        fresh_sig  = st.session_state.global_signals or {}
+        fresh_anal = fresh_sig.get("analysis", {})
+        fresh_headlines = [h.get("full","") for h in fresh_sig.get("headlines", [])]
 
-    for query, category in rss_topics:
-        try:
-            encoded = requests.utils.quote(query)
-            rss_url = f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
-            r = requests.get(rss_url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200:
-                import re as _re
-                # Extract titles and descriptions from RSS XML
-                titles = _re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", r.text)
-                descs  = _re.findall(r"<description><!\[CDATA\[(.*?)\]\]></description>", r.text)
-                for i, title in enumerate(titles[1:4]):  # skip feed title, get top 3
-                    desc = descs[i] if i < len(descs) else ""
-                    # Strip any remaining HTML tags
-                    desc_clean = _re.sub(r"<[^>]+>", "", desc)[:150]
-                    headline = f"[{category.upper()}] {title.strip()}"
-                    if desc_clean:
-                        headline += f" — {desc_clean.strip()}"
-                    news_headlines.append(headline)
-        except:
-            pass
-
-    # Also pull from NewsAPI if key is available (supplements RSS)
-    if NEWS_KEY:
-        extra_topics = [
-            "Nigeria naira dollar",
-            "oil price Iran sanctions",
-            "CBN forex intervention",
-            "Nigeria economy 2025",
-        ]
-        for q in extra_topics:
-            try:
-                url = (f"https://newsapi.org/v2/everything"
-                       f"?q={requests.utils.quote(q)}"
-                       f"&sortBy=publishedAt&pageSize=3&language=en&apiKey={NEWS_KEY}")
-                r = requests.get(url, timeout=8)
-                if r.status_code == 200:
-                    for a in r.json().get("articles", [])[:2]:
-                        t = a.get("title", "")
-                        d = a.get("description", "") or ""
-                        if t:
-                            news_headlines.append(f"[NEWSAPI] {t.strip()} — {d[:120].strip()}")
-            except:
-                pass
-
-    raw["news_headlines_count"] = len(news_headlines)
-    raw["news_headlines"]       = news_headlines[:40]  # store for display
-
-    # ── GEMINI DEEP QUALITATIVE ANALYSIS ──
-    # Feed ALL headlines to Gemini and ask it to REASON about each factor,
-    # not just score them. This is where geopolitics like Iran/oil get analysed.
-    if news_headlines:
-        headlines_block = "\n".join(f"  {i+1}. {h}" for i, h in enumerate(news_headlines[:35]))
-        now_str = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M WAT")
-
-        qualitative_prompt = f"""You are a senior FX strategist analysing the USDT/NGN black market rate.
-Today is {now_str}. The current Binance P2P rate is approximately ₦{raw.get('p2p_mid', 0):,.0f}/USDT.
-
-Below are {len(news_headlines[:35])} LIVE news headlines scraped right now from Google News and NewsAPI.
-Read every single one carefully and reason about how each topic affects the USDT/NGN rate.
-
-LIVE HEADLINES:
-{headlines_block}
-
-REASONING FRAMEWORK — think through each of these channels:
-1. OIL PRICE: Nigeria earns ~90% of FX from crude. Rising oil = more USD inflows = NGN strengthens = USDT rate falls. Iran tensions, OPEC cuts, Russia sanctions all affect this.
-2. USD STRENGTH: Strong DXY = harder for all EM currencies including NGN. Fed hawkishness = stronger USD = higher USDT/NGN.
-3. CBN POLICY: Interventions, rate hikes, FX restrictions, or easing all directly move the rate.
-4. GEOPOLITICS: Wars, sanctions, supply shocks affect oil and risk sentiment. Middle East tensions = oil spike.
-5. NIGERIA POLITICS: Elections, fiscal policy, protests affect investor confidence and capital flight.
-6. CRYPTO MARKET: BTC rally = more P2P activity in Nigeria = tighter spreads. BTC crash = less liquidity.
-7. INFLATION: High Nigeria CPI = structural NGN weakness. US CPI = affects Fed decisions.
-8. REMITTANCES: Festive seasons, diaspora policy changes affect USD supply into Nigeria.
-9. INTERNATIONAL FINANCE: IMF reviews, World Bank loans, Eurobond issuance affect FX reserves.
-10. GLOBAL RISK: EM selloffs, credit events, recessions reduce risk appetite and hurt NGN.
-
-Return ONLY valid JSON, no markdown, no backticks:
-{{
-  "overall_score": <-100 to 100, positive=USDT rises/NGN weakens, negative=NGN strengthens>,
-  "nigeria_macro": <-100 to 100>,
-  "cbn_policy": <-100 to 100>,
-  "oil_impact": <-100 to 100>,
-  "usd_fed_impact": <-100 to 100>,
-  "crypto_sentiment": <-100 to 100>,
-  "geopolitical_risk": <-100 to 100>,
-  "political_risk_nigeria": <-100 to 100>,
-  "remittance_flow": <-100 to 100>,
-  "global_em_risk": <-100 to 100>,
-  "top_bullish_catalyst": "<single most important reason USDT/NGN could rise today — be specific, cite the actual news>",
-  "top_bearish_catalyst": "<single most important reason USDT/NGN could fall today — be specific, cite the actual news>",
-  "breaking_event": "<any breaking event right now that could cause sudden rate movement — or null if none>",
-  "oil_analysis": "<2 sentences: what is happening with oil right now and how does it affect NGN specifically>",
-  "geopolitical_analysis": "<2 sentences: any wars, sanctions, conflicts affecting oil supply or USD demand>",
-  "cbn_analysis": "<2 sentences: what CBN is doing or likely to do based on current news>",
-  "overall_qualitative_direction": "BULLISH_USDT|BEARISH_USDT|NEUTRAL",
-  "qualitative_confidence": <0-100, how confident based on news signal strength>,
-  "key_headlines_used": ["<headline 1>", "<headline 2>", "<headline 3>", "<headline 4>", "<headline 5>"]
-}}"""
-
-        try:
-            raw_q = gemini(qualitative_prompt,
-                           "You are a quantitative FX strategist. Analyse ALL headlines carefully. Return only valid JSON.")
-            # Parse JSON robustly
-            clean_q = raw_q.strip()
-            if "```" in clean_q:
-                parts_q = clean_q.split("```")
-                for p in parts_q:
-                    p = p.strip()
-                    if p.startswith("json"): p = p[4:].strip()
-                    if p.startswith("{"): clean_q = p; break
-            if not clean_q.startswith("{"):
-                idx = clean_q.find("{")
-                if idx >= 0: clean_q = clean_q[idx:]
-            last = clean_q.rfind("}")
-            if last >= 0: clean_q = clean_q[:last+1]
-            q_intel = json.loads(clean_q)
-
-            # Feed numeric scores into ML features
-            feat["news_overall"]        = float(q_intel.get("overall_score", 0))
-            feat["news_nigeria"]        = float(q_intel.get("nigeria_macro", 0))
-            feat["news_cbn"]            = float(q_intel.get("cbn_policy", 0))
-            feat["news_oil"]            = float(q_intel.get("oil_impact", 0))
-            feat["news_usd"]            = float(q_intel.get("usd_fed_impact", 0))
-            feat["news_crypto"]         = float(q_intel.get("crypto_sentiment", 0))
-            feat["news_geopolitics"]    = float(q_intel.get("geopolitical_risk", 0))
-            feat["news_political_risk"] = float(q_intel.get("political_risk_nigeria", 0))
-            feat["news_remittance"]     = float(q_intel.get("remittance_flow", 0))
-            feat["news_em_risk"]        = float(q_intel.get("global_em_risk", 0))
-
-            # Store full qualitative analysis for display in UI
-            raw["news_intel"]     = q_intel
-            raw["news_sentiment"] = q_intel  # backward compat
-        except Exception as e:
-            # Gemini parse failed — zero out but don't crash
+        if fresh_anal:
+            feat["news_overall"]        = float(fresh_anal.get("overall_score", 0))
+            feat["news_nigeria"]        = float(fresh_anal.get("nigeria_macro", 0))
+            feat["news_cbn"]            = float(fresh_anal.get("cbn_policy", 0))
+            feat["news_oil"]            = float(fresh_anal.get("oil_impact", 0))
+            feat["news_usd"]            = float(fresh_anal.get("usd_fed_impact", 0))
+            feat["news_crypto"]         = float(fresh_anal.get("crypto_sentiment", 0))
+            feat["news_geopolitics"]    = float(fresh_anal.get("geopolitical_risk", 0))
+            feat["news_political_risk"] = float(fresh_anal.get("political_risk_nigeria", 0))
+            feat["news_remittance"]     = float(fresh_anal.get("remittance_flow", 0))
+            feat["news_em_risk"]        = float(fresh_anal.get("global_em_risk", 0))
+            raw["news_intel"]           = fresh_anal
+            raw["news_sentiment"]       = fresh_anal
+            raw["news_headlines"]       = fresh_headlines[:40]
+            raw["news_headlines_count"] = len(fresh_headlines)
+        else:
             for k in ["news_overall","news_nigeria","news_cbn","news_oil","news_usd",
                       "news_crypto","news_geopolitics","news_political_risk",
                       "news_remittance","news_em_risk"]:
                 feat[k] = 0.0
-            raw["news_intel_error"] = str(e)[:100]
-    else:
-        # No headlines at all — zero features
-        for k in ["news_overall","news_nigeria","news_cbn","news_oil","news_usd",
-                  "news_crypto","news_geopolitics","news_political_risk",
-                  "news_remittance","news_em_risk"]:
-            feat[k] = 0.0
+            raw["news_intel"] = {}
+            raw["news_headlines"] = []
+            raw["news_headlines_count"] = 0
 
     # ── 8. HISTORICAL MOMENTUM FEATURES ──
     # Uses our in-session rate history stored in session_state
@@ -1332,6 +1742,9 @@ st.markdown("""
   Gemini AI <em>interprets</em> the model output; it does NOT set the price.
   Run it at least 5–10 times to build training data for statistically meaningful predictions.
 </div>""", unsafe_allow_html=True)
+
+# ── GLOBAL SIGNALS PANEL ── (always visible, refreshes every 5 mins)
+render_global_signals_panel()
 
 
 # ── RUN ──

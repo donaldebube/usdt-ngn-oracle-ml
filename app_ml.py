@@ -1299,13 +1299,66 @@ if auto_ref and st.session_state.last_time and GEMINI_KEY:
 
 
 # ── MAIN DISPLAY ──
+# ── MAIN DISPLAY ──
 if not st.session_state.result:
-    # Empty state
+    # ... (Keep your existing "Empty State" code here) ...
     pts = len(st.session_state.rate_history)
     needed = max(0, 5 - pts)
-# INSERT THIS RIGHT BEFORE the st.tabs([...]) line:
+    st.markdown(f"""
+    <div style="text-align:center;padding:60px 20px 40px;">
+      <div style="font-size:48px;margin-bottom:16px;">🤖</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:28px;font-weight:700;
+      background:linear-gradient(135deg,#dce8f8,#a78bfa);-webkit-background-clip:text;
+      -webkit-text-fill-color:transparent;margin-bottom:12px;">ML Oracle — Ready</div>
+      <p style="color:var(--muted2);max-width:500px;margin:0 auto 16px;line-height:1.8;font-size:14px;">
+        This engine uses <strong style="color:var(--amber);">Ridge + Random Forest + Gradient Boosting</strong>
+        trained on your live session data.
+      </p>
+      <div style="background:var(--card);border:1px solid var(--border2);border-radius:12px;
+      padding:18px 24px;max-width:420px;margin:0 auto;">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:8px;font-family:'IBM Plex Mono',monospace;letter-spacing:1px;text-transform:uppercase;">Training Data Progress</div>
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:22px;color:var(--amber);">{pts}/5 runs</div>
+      </div>
+    </div>""", unsafe_allow_html=True)
 
-    st.markdown("""<div style="margin-top:20px; margin-bottom:10px;">
+else:
+    # 1. UNPACK ALL VARIABLES FIRST (This prevents the NameError)
+    r = st.session_state.result
+    ml = r.get("ml", {})
+    raw = r.get("raw", {})
+    feat = r.get("features", {})
+    interp = r.get("interp", {})  # <--- THIS DEFINES THE VARIABLE
+    metrics = st.session_state.ml_metrics
+
+    p2p_mid = raw.get("p2p_mid", 0)
+    official = raw.get("official", 0)
+    ensemble = ml.get("ensemble", 0)
+    direction = ml.get("direction", "NEUTRAL")
+    conf = ml.get("confidence", 0)
+    pred_low = ml.get("pred_low", 0)
+    pred_high = ml.get("pred_high", 0)
+    n_pts = ml.get("n_training_points", 0)
+    cold = ml.get("cold_start", True)
+
+    # 2. RENDER THE TOP METRIC CARDS
+    dc = "var(--green)" if direction == "BULLISH" else "var(--red)" if direction == "BEARISH" else "var(--amber)"
+    da = "▲" if direction == "BULLISH" else "▼" if direction == "BEARISH" else "◆"
+    cc = "var(--green)" if conf >= 65 else "var(--amber)" if conf >= 45 else "var(--red)"
+    
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.markdown(f'<div class="mcard mcard-green"><div class="mcard-label">Live Rate</div><div class="mcard-value">₦{p2p_mid:,.0f}</div></div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown(f'<div class="mcard mcard-purple"><div class="mcard-label">ML Target</div><div class="mcard-value">₦{ensemble:,.0f}</div></div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown(f'<div class="mcard mcard-blue"><div class="mcard-label">Direction</div><div class="mcard-value" style="color:{dc};">{da} {direction}</div></div>', unsafe_allow_html=True)
+    with c4:
+        st.markdown(f'<div class="mcard mcard-purple"><div class="mcard-label">Confidence</div><div class="mcard-value" style="color:{cc};">{conf}%</div></div>', unsafe_allow_html=True)
+    with c5:
+        st.markdown(f'<div class="mcard mcard-blue"><div class="mcard-label">Data Points</div><div class="mcard-value">{n_pts}</div></div>', unsafe_allow_html=True)
+
+    # 3. 💎 THE NEW STAKEHOLDER INTELLIGENCE BRIEF (Now interp is defined!)
+    st.markdown("""<div style="margin-top:25px; margin-bottom:15px;">
         <h3 style="font-family:'IBM Plex Mono'; color:var(--purple); font-size:18px; letter-spacing:2px;">💎 STAKEHOLDER INTELLIGENCE BRIEF</h3>
     </div>""", unsafe_allow_html=True)
     
@@ -1319,8 +1372,8 @@ if not st.session_state.result:
                 {interp.get('executive_summary', 'Analysing current trends...')}
             </p>
             <div style="background:var(--bg2); padding:15px; border-radius:10px; margin-top:15px;">
-                <div class="mcard-label" style="color:var(--amber);">Strategic Recommendation</div>
-                <p style="font-size:14px; color:var(--text); margin:0;">{interp.get('stakeholder_insight', 'N/A')}</p>
+                <div class="mcard-label" style="color:var(--amber);">Strategic Advice</div>
+                <p style="font-size:14px; color:var(--text); margin:0;">{interp.get('stakeholder_insight', 'Observe market liquidity before large entries.')}</p>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -1333,18 +1386,25 @@ if not st.session_state.result:
         <div class="ocard" style="text-align:center; height: 100%;">
             <div class="ocard-title">Volatility Risk Rating</div>
             <div style="font-size:38px; font-weight:800; color:{r_color}; margin:15px 0;">{risk}</div>
-            <p style="font-size:12px; color:var(--muted2);">{interp.get('global_context', 'No global context available.')}</p>
+            <p style="font-size:12px; color:var(--muted2);">{interp.get('global_context', 'Monitoring global FX flows...')}</p>
         </div>
         """, unsafe_allow_html=True)
 
     st.markdown(f"""
-    <div class="ocard" style="background: linear-gradient(90deg, var(--card), var(--bg2)); border-top: 1px solid var(--purple);">
+    <div class="ocard" style="background: linear-gradient(90deg, var(--card), var(--bg2)); border-top: 1px solid var(--purple); margin-top:15px;">
         <div class="ocard-title">🗞️ Why is the price moving? (News Correlation)</div>
-        <p style="font-size:14px; color:var(--blue); line-height:1.6;">{interp.get('price_movement_drivers', 'Correlating headlines...')}</p>
+        <p style="font-size:14px; color:var(--blue); line-height:1.6;">{interp.get('price_movement_drivers', 'Identifying correlation between recent headlines and predicted price shifts...')}</p>
     </div>
     """, unsafe_allow_html=True)
-    
+
     st.markdown("<br>", unsafe_allow_html=True)
+
+    # 4. ORIGINAL TABS START HERE
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "🤖 ML Results", "📐 Model Metrics", "📊 History & Chart", "🌍 Features", "💬 Chat", "🔔 Alerts"
+    ])
+    
+    # ... (The rest of your code inside tab1, tab2, etc. follows here) ...
     
 
     # ── TABS ──

@@ -1498,9 +1498,9 @@ SAMPLE LIVE HEADLINES USED:
 {headlines_sample}
 
 LIVE MARKET DATA:
-- BTC 24h: {feat.get("btc_24h_change", "N/A"):+.2f}% | EUR/USD: {feat.get("eurusd", "N/A"):.4f}
-- P2P Spread: ₦{feat.get("p2p_spread_abs", 0):.0f} | B.M. Premium: {feat.get("premium_pct", 0):+.2f}%
-- Trend slope: {feat.get("trend_slope", 0):+.2f}/interval | Volatility: ₦{feat.get("volatility", 0):.2f}
+- BTC 24h: {float(feat.get("btc_24h_change") or 0):+.2f}% | EUR/USD: {float(feat.get("eurusd") or 0):.4f}
+- P2P Spread: ₦{float(feat.get("p2p_spread_abs") or 0):.0f} | B.M. Premium: {float(feat.get("premium_pct") or 0):+.2f}%
+- Trend slope: {float(feat.get("trend_slope") or 0):+.2f}/interval | Volatility: ₦{float(feat.get("volatility") or 0):.2f}
 
 Return ONLY this JSON (no markdown):
 {{

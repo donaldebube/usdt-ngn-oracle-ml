@@ -687,6 +687,9 @@ def fetch_global_signals() -> dict:
     except: pass
 
     # 5. GLOBAL NEWS (18 RSS feeds)
+    # Note: Google News RSS works 24/7 including weekends.
+    # If scores show 0, it means the RSS returned results but Gemini analysis
+    # failed to parse JSON, OR the RSS format changed (CDATA vs plain tags).
     rss_topics = [
         ("Nigeria naira exchange rate",        "🇳🇬 NGN"),
         ("CBN central bank Nigeria forex",     "🏦 CBN"),
@@ -707,20 +710,68 @@ def fetch_global_signals() -> dict:
         ("Nigeria remittance diaspora",        "💸 Remittance"),
         ("gold price safe haven",              "🥇 Gold"),
     ]
+
+    def _parse_rss_titles(xml_text):
+        """Multi-pattern RSS parser. Google News changed from CDATA to plain tags."""
+        # Pattern 1: CDATA (old format)
+        titles = re.findall(r"<title><![CDATA[(.*?)]]></title>", xml_text, re.DOTALL)
+        if titles:
+            return [t.strip() for t in titles[1:] if t.strip()]
+        # Pattern 2: Plain tags (current format)
+        titles = re.findall(r"<title>(.*?)</title>", xml_text, re.DOTALL)
+        cleaned = []
+        for t in titles[1:]:
+            t = re.sub(r"<[^>]+>", "", t).strip()
+            t = (t.replace("&amp;","&").replace("&lt;","<").replace("&gt;",">")
+                  .replace("&#39;","'").replace("&quot;",'"').replace("&nbsp;"," "))
+            if t and len(t) > 8:
+                cleaned.append(t)
+        return cleaned
+
+    def _parse_rss_descs(xml_text):
+        descs = re.findall(r"<description><![CDATA[(.*?)]]></description>", xml_text, re.DOTALL)
+        if not descs:
+            descs = re.findall(r"<description>(.*?)</description>", xml_text, re.DOTALL)
+        return [re.sub(r"<[^>]+>", "", d).strip()[:150] for d in descs]
+
     headlines_raw = []
+    rss_errors    = []
+    rss_ok_count  = 0
     for query, tag in rss_topics:
         try:
             encoded = requests.utils.quote(query)
             url = f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
-            r = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+            r = requests.get(url, timeout=8, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/rss+xml, application/xml, text/xml, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+            })
             if r.status_code == 200:
-                titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", r.text)
-                descs  = re.findall(r"<description><!\[CDATA\[(.*?)\]\]></description>", r.text)
-                for i, title in enumerate(titles[1:3]):
-                    desc = re.sub(r"<[^>]+>", "", descs[i] if i < len(descs) else "")[:120]
-                    headlines_raw.append({"tag": tag, "title": title.strip(), "desc": desc.strip(),
-                                          "full": f"{tag} | {title.strip()}"})
-        except: pass
+                titles = _parse_rss_titles(r.text)
+                descs  = _parse_rss_descs(r.text)
+                added  = 0
+                for i, title in enumerate(titles[:3]):
+                    desc = descs[i] if i < len(descs) else ""
+                    headlines_raw.append({
+                        "tag":   tag,
+                        "title": title,
+                        "desc":  desc,
+                        "full":  f"{tag} | {title}",
+                    })
+                    added += 1
+                    if added >= 2:
+                        break
+                if added > 0:
+                    rss_ok_count += 1
+                else:
+                    rss_errors.append(f"{tag}: got 200 but 0 titles parsed (may be empty/redirect)")
+            else:
+                rss_errors.append(f"{tag}: HTTP {r.status_code}")
+        except Exception as e:
+            rss_errors.append(f"{tag}: {str(e)[:60]}")
+
+    sig["rss_ok_count"] = rss_ok_count
+    sig["rss_errors"]   = rss_errors
 
     if NEWS_KEY:
         for q in ["Nigeria naira USDT", "oil price Iran", "CBN forex", "Nigeria economy"]:
@@ -742,67 +793,85 @@ def fetch_global_signals() -> dict:
     sig["headlines"]      = headlines_raw
     sig["headline_count"] = len(headlines_raw)
     if headlines_raw:
-        sig["sources"].append(f"Google News RSS ({len(headlines_raw)} headlines)")
+        sig["sources"].append(f"Google News RSS ({len(headlines_raw)} headlines, {rss_ok_count}/{len(rss_topics)} feeds ok)")
 
     # 6. GEMINI DEEP ANALYSIS
-    if headlines_raw:
-        now_str  = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M WAT")
-        btc_str  = f"${sig.get('btc_usd',0):,.0f} ({sig.get('btc_24h',0):+.1f}%)" if sig.get("btc_usd") else "N/A"
-        fng_str  = f"{sig.get('fear_greed_value','?')} — {sig.get('fear_greed_label','N/A')}"
-        headlines_block = "\n".join(f"  {i+1}. {h['full']}" for i, h in enumerate(headlines_raw[:40]))
+    # IMPORTANT: Always runs even without headlines — uses live market data as minimum input.
+    # Scores of 0 indicate either: (a) Gemini returned bad JSON, (b) RSS fetch blocked,
+    # (c) truly neutral market (rare). Check sig["errors"] and sig["gemini_raw_error"] for details.
+    now_str  = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M WAT")
+    btc_str  = f"${sig.get('btc_usd',0):,.0f} ({sig.get('btc_24h',0):+.1f}%)" if sig.get("btc_usd") else "N/A"
+    fng_str  = f"{sig.get('fear_greed_value','?')} — {sig.get('fear_greed_label','N/A')}"
+    headlines_block = "\n".join(f"  {i+1}. {h['full']}" for i, h in enumerate(headlines_raw[:40]))
+    if not headlines_block:
+        headlines_block = "(No RSS headlines retrieved — scoring from market data only)"
 
-        q_prompt = f"""Senior FX strategist — Today: {now_str}
+    q_prompt = f"""You are a senior FX strategist. Today: {now_str}
 
-LIVE SNAPSHOT:
+LIVE MARKET DATA (always available):
 - BTC: {btc_str} | ETH: ${sig.get('eth_usd',0):,.0f} ({sig.get('eth_24h',0):+.1f}%)
-- Fear & Greed: {fng_str}
+- Fear & Greed Index: {fng_str}
 - EUR/USD: {sig.get('eurusd','N/A')} | DXY proxy: {sig.get('dxy_proxy','N/A')}
 - USD/ZAR: {sig.get('usd_zar','N/A')} | USD/KES: {sig.get('usd_kes','N/A')} | USD/GHS: {sig.get('usd_ghs','N/A')}
 - Oil headline: {sig.get('oil_headline','N/A')}
+- Official USD/NGN: {sig.get('usd_ngn_official','N/A')}
 
-LIVE HEADLINES:
+NEWS HEADLINES ({len(headlines_raw)} retrieved):
 {headlines_block}
 
-Return ONLY valid JSON (no markdown):
+TASK: Score each dimension for its impact on USDT/NGN P2P rate.
+Positive = USDT rises (NGN weakens). Negative = NGN strengthens (USDT falls).
+Use your knowledge of current market conditions if headlines are unavailable.
+IMPORTANT: Always return real non-zero scores. 0 means truly neutral. Do NOT default to 0.
+
+Return ONLY valid JSON (no markdown, no backticks, no extra text):
 {{
-  "overall_score": <-100 to +100, positive=USDT rises/NGN weakens>,
-  "nigeria_macro": <-100 to 100>,
-  "cbn_policy": <-100 to 100>,
-  "oil_impact": <-100 to 100>,
-  "usd_fed_impact": <-100 to 100>,
-  "crypto_sentiment": <-100 to 100>,
-  "geopolitical_risk": <-100 to 100>,
-  "political_risk_nigeria": <-100 to 100>,
-  "remittance_flow": <-100 to 100>,
-  "global_em_risk": <-100 to 100>,
-  "market_mood": "RISK_ON|RISK_OFF|NEUTRAL",
-  "top_mover_today": "<specific event moving market right now>",
-  "breaking_event": "<breaking news or null>",
-  "oil_analysis": "<2 sentences: oil situation and NGN impact>",
-  "geopolitical_analysis": "<2 sentences: active geopolitical risks affecting rate>",
-  "cbn_analysis": "<2 sentences: CBN stance and likely near-term action>",
-  "crypto_analysis": "<1 sentence: crypto sentiment and P2P Nigeria impact>",
-  "em_analysis": "<1 sentence: broader EM currency pressure>",
-  "top_bullish_catalyst": "<most important reason USDT/NGN could RISE — cite actual news>",
-  "top_bearish_catalyst": "<most important reason USDT/NGN could FALL — cite actual news>",
-  "overall_qualitative_direction": "BULLISH_USDT|BEARISH_USDT|NEUTRAL",
-  "qualitative_confidence": <0-100>,
-  "30min_bias": "BUY|SELL|HOLD",
-  "key_watch_items": ["<watch item 1>", "<watch item 2>", "<watch item 3>"],
-  "medium_term_outlook": "<3-sentence outlook for next 30-90 days based on fundamentals>",
-  "long_term_outlook": "<2-sentence 6-12 month outlook for USDT/NGN>",
-  "structural_ngn_risks": ["<structural risk 1>", "<structural risk 2>", "<structural risk 3>"]
+  "overall_score": <integer -100 to +100>,
+  "nigeria_macro": <integer -100 to 100>,
+  "cbn_policy": <integer -100 to 100>,
+  "oil_impact": <integer -100 to 100>,
+  "usd_fed_impact": <integer -100 to 100>,
+  "crypto_sentiment": <integer -100 to 100>,
+  "geopolitical_risk": <integer -100 to 100>,
+  "political_risk_nigeria": <integer -100 to 100>,
+  "remittance_flow": <integer -100 to 100>,
+  "global_em_risk": <integer -100 to 100>,
+  "market_mood": "RISK_ON",
+  "top_mover_today": "Most important market-moving factor right now",
+  "breaking_event": null,
+  "oil_analysis": "Current oil situation and how it feeds into NGN earnings and FX supply.",
+  "geopolitical_analysis": "Active geopolitical risks affecting oil supply or USD strength today.",
+  "cbn_analysis": "CBN current FX stance and likely near-term policy direction.",
+  "crypto_analysis": "Crypto market sentiment and direct P2P Nigeria market impact.",
+  "em_analysis": "Broader emerging market FX pressure on NGN today.",
+  "top_bullish_catalyst": "Most important reason USDT/NGN could rise today",
+  "top_bearish_catalyst": "Most important reason USDT/NGN could fall today",
+  "overall_qualitative_direction": "NEUTRAL",
+  "qualitative_confidence": 60,
+  "30min_bias": "HOLD",
+  "key_watch_items": ["Item 1", "Item 2", "Item 3"],
+  "medium_term_outlook": "30-90 day fundamental outlook for USDT/NGN based on CBN policy, oil, and EM conditions.",
+  "long_term_outlook": "6-12 month structural trajectory of NGN based on Nigeria reform path.",
+  "structural_ngn_risks": ["Risk 1", "Risk 2", "Risk 3"]
 }}"""
 
-        try:
-            raw_q = gemini(q_prompt, "You are a quantitative FX strategist. Return only valid JSON. No markdown.")
-            sig["analysis"] = _parse_json(raw_q)
-            sig["sources"].append("Gemini deep analysis")
-        except Exception as e:
-            sig["analysis"] = {}
-            sig["errors"].append(f"Gemini analysis: {str(e)[:80]}")
+    try:
+        raw_q = gemini(q_prompt, "You are a quantitative FX strategist. Return ONLY valid compact JSON. No markdown. No backticks. Start with {.")
+        sig["gemini_raw_response"] = raw_q[:500]   # store for diagnostics
+        parsed = _parse_json(raw_q)
+        sig["analysis"] = parsed
+        sig["sources"].append("Gemini AI analysis")
+        # Validate we got real scores
+        score_keys = ["overall_score","nigeria_macro","cbn_policy","oil_impact","usd_fed_impact",
+                      "crypto_sentiment","geopolitical_risk"]
+        all_zero = all(parsed.get(k, 0) == 0 for k in score_keys)
+        if all_zero:
+            sig["errors"].append("⚠️ Gemini returned all-zero scores — may be a parsing issue")
+    except Exception as e:
+        sig["analysis"] = {}
+        sig["gemini_raw_error"] = str(e)[:200]
+        sig["errors"].append(f"Gemini JSON parse error: {str(e)[:100]}")
 
-    return sig
 
 def maybe_refresh_signals(force: bool = False):
     if force or _signals_stale():
@@ -1848,7 +1917,7 @@ else:
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ══════ TABS ══════
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "📊 Analysis",
         "📈 Forecasts",
         "🌍 Global Signals",
@@ -1857,6 +1926,7 @@ else:
         "💬 Chat",
         "🔔 Alerts",
         "🔬 ML Metrics",
+        "🩺 Diagnostics",
     ])
 
 
@@ -2704,6 +2774,126 @@ else:
               = 45% × model agreement + 40% × MAE-based accuracy + 15% × sample size bonus. Capped at 92%.</div>
             </div>
             </div>""", unsafe_allow_html=True)
+
+
+    # ══════ TAB 9: DIAGNOSTICS ══════
+    with tab9:
+        st.markdown('''<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;
+        text-transform:uppercase;color:var(--cyan);margin-bottom:16px;">
+        🩺 LIVE SYSTEM DIAGNOSTICS — why qualitative scores are 0 and what each pipeline stage returned
+        </div>''', unsafe_allow_html=True)
+
+        sig_diag = st.session_state.global_signals or {}
+
+        # ── FORCE REFRESH BUTTON ──
+        if st.button("🔄 Force Refresh All Signals Now", key="diag_refresh"):
+            maybe_refresh_signals(force=True)
+            st.rerun()
+
+        # ── PIPELINE STATUS ──
+        st.markdown('''<div class="sec-header" style="margin-top:12px;">⚙️ PIPELINE STATUS</div>''', unsafe_allow_html=True)
+        pipe_items = [
+            ("CoinGecko (BTC/ETH prices)",  bool(sig_diag.get("btc_usd")),         f"BTC=${sig_diag.get('btc_usd','missing')}"),
+            ("ExchangeRate-API (FX rates)", bool(sig_diag.get("usd_ngn_official")), f"USD/NGN={sig_diag.get('usd_ngn_official','missing')}"),
+            ("Fear & Greed Index",          bool(sig_diag.get("fear_greed_value")), f"{sig_diag.get('fear_greed_value','missing')} — {sig_diag.get('fear_greed_label','')}"),
+            ("Google News RSS",             sig_diag.get("rss_ok_count",0) > 0,     f"{sig_diag.get('rss_ok_count',0)}/{18} feeds returned headlines"),
+            ("Headlines parsed",            sig_diag.get("headline_count",0) > 0,   f"{sig_diag.get('headline_count',0)} total headlines"),
+            ("Gemini AI analysis",          bool(sig_diag.get("analysis")),          "JSON parsed OK" if sig_diag.get("analysis") else "FAILED or empty"),
+        ]
+        for label, ok, detail in pipe_items:
+            icon  = "✅" if ok else "❌"
+            color = "var(--green)" if ok else "var(--red)"
+            st.markdown(
+                f'''<div style="display:flex;justify-content:space-between;padding:8px 12px;
+                border:1px solid var(--border);border-radius:6px;margin-bottom:6px;background:rgba(255,255,255,0.02);">
+                <span style="font-size:12px;color:var(--text2);">{icon} {label}</span>
+                <span style="font-family:var(--font-mono);font-size:11px;color:{color};">{detail}</span>
+                </div>''', unsafe_allow_html=True)
+
+        # ── QUALITATIVE SCORES ──
+        st.markdown('''<div class="sec-header" style="margin-top:16px;">📊 QUALITATIVE SCORES (what the model received)</div>''', unsafe_allow_html=True)
+        analysis_diag = sig_diag.get("analysis", {})
+        score_fields = [
+            ("overall_score",           "Overall Signal"),
+            ("nigeria_macro",           "Nigeria Macro"),
+            ("cbn_policy",              "CBN Policy"),
+            ("oil_impact",              "Oil Impact"),
+            ("usd_fed_impact",          "USD / Fed"),
+            ("crypto_sentiment",        "Crypto Sentiment"),
+            ("geopolitical_risk",       "Geopolitical Risk"),
+            ("political_risk_nigeria",  "Nigeria Political"),
+            ("remittance_flow",         "Remittance Flow"),
+            ("global_em_risk",          "Global EM Risk"),
+        ]
+        if analysis_diag:
+            for key, label in score_fields:
+                val = analysis_diag.get(key, "MISSING")
+                color = "var(--green)" if isinstance(val,int) and val>5 else "var(--red)" if isinstance(val,int) and val<-5 else "var(--amber)"
+                zero_warn = " ⚠️ zero!" if val == 0 else ""
+                st.markdown(
+                    f'<span style="font-size:11px;color:var(--text2);font-family:var(--font-mono);">{label}: '
+                    f'<strong style="color:{color};">{val}{zero_warn}</strong></span><br>',
+                    unsafe_allow_html=True)
+        else:
+            st.markdown('''<div class="alert-box alert-warn">⚠️ No analysis object found.
+            Gemini either failed to respond or returned non-JSON text. See errors below.</div>''', unsafe_allow_html=True)
+
+        # ── GEMINI RAW RESPONSE ──
+        if sig_diag.get("gemini_raw_response"):
+            st.markdown('''<div class="sec-header" style="margin-top:16px;">🤖 GEMINI RAW RESPONSE (first 500 chars)</div>''', unsafe_allow_html=True)
+            st.code(sig_diag["gemini_raw_response"], language="json")
+
+        # ── RSS ERRORS ──
+        rss_errs = sig_diag.get("rss_errors", [])
+        if rss_errs:
+            st.markdown('''<div class="sec-header" style="margin-top:16px;">📡 RSS FEED ERRORS</div>''', unsafe_allow_html=True)
+            for e in rss_errs:
+                st.markdown(f'<div style="font-size:11px;font-family:var(--font-mono);color:var(--red);padding:2px 0;">❌ {e}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="font-size:11px;color:var(--green);margin-top:10px;">✅ No RSS errors logged</div>', unsafe_allow_html=True)
+
+        # ── GENERAL ERRORS ──
+        gen_errs = sig_diag.get("errors", [])
+        if gen_errs:
+            st.markdown('''<div class="sec-header" style="margin-top:16px;">🚨 ALL PIPELINE ERRORS</div>''', unsafe_allow_html=True)
+            for e in gen_errs:
+                st.markdown(f'<div style="font-size:11px;font-family:var(--font-mono);color:var(--amber);padding:2px 0;">⚠️ {e}</div>', unsafe_allow_html=True)
+
+        # ── SAMPLE HEADLINES ──
+        headlines_diag = sig_diag.get("headlines", [])
+        st.markdown(f'''<div class="sec-header" style="margin-top:16px;">📰 SAMPLE HEADLINES FETCHED ({len(headlines_diag)} total)</div>''', unsafe_allow_html=True)
+        if headlines_diag:
+            for h in headlines_diag[:12]:
+                st.markdown(
+                    f'<div style="font-size:11px;color:var(--text2);padding:4px 0;border-bottom:1px solid var(--border);">'
+                    f'<span style="color:var(--cyan);font-family:var(--font-mono);font-size:9px;">{h.get("tag","")}</span> '
+                    f'{h.get("title","")}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('''<div class="alert-box alert-warn">
+            ⚠️ <strong>Zero headlines fetched.</strong> This is why qualitative scores are all 0.<br><br>
+            <strong>Possible causes:</strong><br>
+            • Google News RSS is returning empty XML or a CAPTCHA/redirect (common on new deployments)<br>
+            • Network/firewall blocking outbound RSS requests from the server<br>
+            • The RSS CDATA format changed — try clicking Force Refresh above<br>
+            • Weekend/after-hours: news still flows 24/7, this should not cause 0 headlines<br><br>
+            <strong>Fix:</strong> Add a NewsAPI key to secrets.toml as NEWS_KEY — it is a more reliable fallback.
+            </div>''', unsafe_allow_html=True)
+
+        # ── DATA SOURCES ──
+        sources = sig_diag.get("sources", [])
+        st.markdown(f'''<div class="sec-header" style="margin-top:16px;">✅ ACTIVE DATA SOURCES ({len(sources)})</div>''', unsafe_allow_html=True)
+        for s in sources:
+            st.markdown(f'<div style="font-size:11px;color:var(--green);font-family:var(--font-mono);padding:2px 0;">✓ {s}</div>', unsafe_allow_html=True)
+
+        # ── SIGNALS TTL ──
+        sig_time = st.session_state.global_signals_time
+        if sig_time:
+            age_s = (datetime.datetime.now() - sig_time).total_seconds()
+            st.markdown(
+                f'''<div style="font-size:11px;font-family:var(--font-mono);color:var(--muted);margin-top:14px;">
+                🕐 Signals last fetched: {int(age_s//60)}m {int(age_s%60)}s ago
+                (TTL={SIGNALS_TTL}s — refreshes every {SIGNALS_TTL//60}min)
+                </div>''', unsafe_allow_html=True)
 
     # ── DISCLAIMER ──
     st.markdown("""

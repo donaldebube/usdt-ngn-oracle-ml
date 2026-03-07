@@ -596,19 +596,37 @@ def gemini(prompt: str, system: str = "", temperature: float = 0.2, max_tokens: 
     return f"❌ All Gemini models failed: {' | '.join(errors)}"
 
 def _parse_json(raw: str) -> dict:
-    """Robust JSON parser that handles Gemini's markdown wrapping."""
+    """Robust JSON parser that handles Gemini markdown wrapping. Returns {} on failure."""
+    if not raw or raw.startswith("❌"):
+        return {}
     clean = raw.strip()
+    # Strip markdown code fences
     if "```" in clean:
         for p in clean.split("```"):
             p = p.strip()
             if p.startswith("json"): p = p[4:].strip()
             if p.startswith("{"): clean = p; break
+    # Find JSON object start
     if not clean.startswith("{"):
         idx = clean.find("{")
         if idx >= 0: clean = clean[idx:]
+        else: return {}
+    # Find JSON object end
     last = clean.rfind("}")
     if last >= 0: clean = clean[:last+1]
-    return json.loads(clean)
+    else: return {}
+    # Try direct parse
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        pass
+    # Try fixing common Gemini JSON mistakes: trailing commas, single quotes
+    try:
+        fixed = re.sub(r",\s*([}\]])", r"", clean)   # remove trailing commas
+        fixed = re.sub(r":\s*<[^>]+>", ': null', fixed) # replace <placeholder> with null
+        return json.loads(fixed)
+    except Exception:
+        return {}
 
 
 # ══════════════════════════════════════════════════════
@@ -640,38 +658,55 @@ def fetch_global_signals() -> dict:
     # RSS/GNews headlines are injected later as a supplement if available.
     try:
         now_str_early = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M WAT")
-        early_prompt = f"""You are a senior FX strategist. Today is {now_str_early}.
-Score current market conditions for the USDT/NGN P2P exchange rate.
-Positive score = USDT rises / NGN weakens. Negative = NGN strengthens.
-
-Use your knowledge of: CBN policy, Nigeria oil earnings, USD/Fed stance,
-crypto market conditions, geopolitical risks, EM currency pressure, remittances.
-
-Return ONLY valid compact JSON — no markdown, no backticks, start immediately with {{:
-{{"overall_score":<int -100 to 100>,"nigeria_macro":<int>,"cbn_policy":<int>,"oil_impact":<int>,
-"usd_fed_impact":<int>,"crypto_sentiment":<int>,"geopolitical_risk":<int>,
-"political_risk_nigeria":<int>,"remittance_flow":<int>,"global_em_risk":<int>,
-"market_mood":"RISK_ON|RISK_OFF|NEUTRAL",
-"top_mover_today":"<key factor>","breaking_event":null,
-"oil_analysis":"<2 sentences>","geopolitical_analysis":"<2 sentences>",
-"cbn_analysis":"<2 sentences>","crypto_analysis":"<1 sentence>","em_analysis":"<1 sentence>",
-"top_bullish_catalyst":"<reason USDT/NGN rises>","top_bearish_catalyst":"<reason NGN strengthens>",
-"overall_qualitative_direction":"BULLISH_USDT|BEARISH_USDT|NEUTRAL",
-"qualitative_confidence":<0-100>,"30min_bias":"BUY|SELL|HOLD",
-"key_watch_items":["<item1>","<item2>","<item3>"],
-"medium_term_outlook":"<3 sentences 30-90 day>","long_term_outlook":"<2 sentences 6-12 month>",
-"structural_ngn_risks":["<risk1>","<risk2>","<risk3>"]}}"""
+        early_prompt = (
+            f"You are a senior FX strategist specialising in Nigeria/NGN. Today is {now_str_early}.\n"
+            "Score CURRENT market conditions for USDT/NGN P2P rate prediction.\n"
+            "Positive score = USDT rises / NGN weakens. Negative = NGN strengthens.\n\n"
+            "Use your knowledge of CBN policy, Nigeria oil, USD/Fed, crypto, geopolitics, EM FX, remittances.\n"
+            "NEVER return 0 unless genuinely neutral. Return honest non-zero scores.\n\n"
+            "Return ONLY valid JSON. No markdown. No backticks. No preamble. Start with {\n"
+            '{"overall_score":15,"nigeria_macro":20,"cbn_policy":-10,"oil_impact":5,'
+            '"usd_fed_impact":10,"crypto_sentiment":8,"geopolitical_risk":12,'
+            '"political_risk_nigeria":15,"remittance_flow":-5,"global_em_risk":10,'
+            '"market_mood":"RISK_ON",'
+            '"top_mover_today":"USD strength and CBN policy stance",'
+            '"breaking_event":null,'
+            '"oil_analysis":"Oil prices remain rangebound affecting Nigeria FX earnings. OPEC cuts provide floor.",'
+            '"geopolitical_analysis":"Middle East tensions sustain risk premium on oil. USD safe-haven demand elevated.",'
+            '"cbn_analysis":"CBN maintaining managed float with periodic interventions. Reserves stable.",'
+            '"crypto_analysis":"Crypto risk-on sentiment supports USDT premium in P2P markets.",'
+            '"em_analysis":"EM currencies under pressure from strong USD and Fed hold signals.",'
+            '"top_bullish_catalyst":"USD strength and Nigeria FX demand outpacing supply",'
+            '"top_bearish_catalyst":"CBN intervention or oil price surge boosting NGN",'
+            '"overall_qualitative_direction":"BULLISH_USDT",'
+            '"qualitative_confidence":65,'
+            '"30min_bias":"HOLD",'
+            '"key_watch_items":["CBN intervention frequency","Brent crude price","US jobs data"],'
+            '"medium_term_outlook":"NGN faces structural depreciation pressure over 30-90 days.",'
+            '"long_term_outlook":"Long-term NGN trajectory depends on Nigeria reform path.",'
+            '"structural_ngn_risks":["Oil dependence","CBN reserve adequacy","political risk"]}\n\n'
+            "ABOVE WAS AN EXAMPLE FORMAT ONLY. Now return YOUR OWN real scored JSON for today's actual conditions. "
+            "Start with { immediately:"
+        )
         raw_early = gemini(early_prompt,
             "You are a quantitative FX strategist. Return ONLY valid JSON. No markdown. Start with {.",
             temperature=0.3, max_tokens=1500)
         sig["gemini_raw_response"] = raw_early[:600]
-        parsed_early = _parse_json(raw_early)
-        if parsed_early and any(parsed_early.get(k,0) != 0
-                                for k in ["overall_score","nigeria_macro","oil_impact"]):
-            sig["analysis"] = parsed_early
-            sig["sources"].append("Gemini AI (knowledge-based, no headlines needed)")
+        # Detect if Gemini returned an error string instead of JSON
+        if raw_early.startswith("❌"):
+            sig["errors"].append(f"Gemini early pass: API error: {raw_early[:200]}")
+            sig["gemini_raw_error"] = raw_early[:300]
         else:
-            sig["errors"].append(f"Gemini early pass: parsed but all-zero. Raw: {raw_early[:150]}")
+            parsed_early = _parse_json(raw_early)
+            if parsed_early and "overall_score" in parsed_early:
+                # Accept even if some scores are zero — partial data is better than nothing
+                sig["analysis"] = parsed_early
+                sig["sources"].append("Gemini AI (knowledge-based)")
+                # Log if all zeros for debugging
+                if all(parsed_early.get(k,0) == 0 for k in ["overall_score","nigeria_macro","oil_impact"]):
+                    sig["errors"].append("⚠️ Gemini returned all-zero scores — may reflect genuinely neutral market or prompt issue")
+            else:
+                sig["errors"].append(f"Gemini early pass: JSON parse failed or missing fields. Raw[:200]: {raw_early[:200]}")
     except Exception as e:
         sig["errors"].append(f"Gemini early pass FAILED: {type(e).__name__}: {str(e)[:200]}")
         sig["gemini_raw_error"] = f"{type(e).__name__}: {str(e)}"
@@ -915,12 +950,19 @@ Return ONLY valid compact JSON — no markdown, no backticks, start immediately 
                     sig["errors"].append("GNews: rate limit hit (100 req/day free tier)")
                     break
                 elif r.status_code == 403:
-                    sig["errors"].append(f"GNews: invalid API key or quota exceeded")
+                    sig["errors"].append(f"GNews 403: invalid key or quota exceeded. Response: {r.text[:100]}")
                     break
+                elif r.status_code == 401:
+                    sig["errors"].append(f"GNews 401: unauthorized. Check GNEWS_KEY in secrets.toml")
+                    break
+                else:
+                    sig["errors"].append(f"GNews HTTP {r.status_code}: {r.text[:100]}")
             except Exception as e:
                 sig["errors"].append(f"GNews '{q[:20]}': {type(e).__name__}: {str(e)[:120]}")
         if gnews_count > 0:
             sig["sources"].append(f"GNews API ({gnews_count} headlines)")
+        else:
+            sig["errors"].append(f"GNews: 0 headlines returned across all queries. Key={GNEWS_KEY[:8]}...")
     sig["gnews_count"] = gnews_count
 
     # NewsAPI — optional secondary supplement
@@ -972,38 +1014,43 @@ LIVE MARKET DATA:
 HEADLINES ({len(headlines_raw)}):
 {headlines_block if has_headlines else "(none — use your knowledge)"}
 
-Return ONLY valid JSON starting with {{. No markdown. No preamble:
-{{"overall_score":<-100 to 100>,"nigeria_macro":<int>,"cbn_policy":<int>,"oil_impact":<int>,
-"usd_fed_impact":<int>,"crypto_sentiment":<int>,"geopolitical_risk":<int>,
-"political_risk_nigeria":<int>,"remittance_flow":<int>,"global_em_risk":<int>,
-"market_mood":"RISK_ON|RISK_OFF|NEUTRAL","top_mover_today":"<factor>","breaking_event":null,
-"oil_analysis":"<2 sentences>","geopolitical_analysis":"<2 sentences>",
-"cbn_analysis":"<2 sentences>","crypto_analysis":"<1 sentence>","em_analysis":"<1 sentence>",
-"top_bullish_catalyst":"<reason>","top_bearish_catalyst":"<reason>",
-"overall_qualitative_direction":"BULLISH_USDT|BEARISH_USDT|NEUTRAL",
-"qualitative_confidence":<0-100>,"30min_bias":"BUY|SELL|HOLD",
-"key_watch_items":["<i1>","<i2>","<i3>"],
-"medium_term_outlook":"<3 sentences>","long_term_outlook":"<2 sentences>",
-"structural_ngn_risks":["<r1>","<r2>","<r3>"]}}"""
+Return ONLY valid JSON. No markdown. No backticks. Start immediately with {{"overall_score":
+The JSON must have ALL these fields with REAL non-zero integer scores:
+overall_score, nigeria_macro, cbn_policy, oil_impact, usd_fed_impact, crypto_sentiment,
+geopolitical_risk, political_risk_nigeria, remittance_flow, global_em_risk (all integers -100 to 100),
+market_mood (RISK_ON/RISK_OFF/NEUTRAL), top_mover_today (string), breaking_event (string or null),
+oil_analysis (2 sentences), geopolitical_analysis (2 sentences), cbn_analysis (2 sentences),
+crypto_analysis (1 sentence), em_analysis (1 sentence),
+top_bullish_catalyst (string), top_bearish_catalyst (string),
+overall_qualitative_direction (BULLISH_USDT/BEARISH_USDT/NEUTRAL),
+qualitative_confidence (0-100 integer), 30min_bias (BUY/SELL/HOLD),
+key_watch_items (array of 3 strings), medium_term_outlook (3 sentences), 
+long_term_outlook (2 sentences), structural_ngn_risks (array of 3 strings).
+START NOW with {{"""
 
         try:
             raw_q = gemini(enhanced_prompt,
                 "Quantitative FX strategist. Return ONLY valid JSON. Start with {.",
                 temperature=0.3, max_tokens=1800)
             sig["gemini_raw_response"] = raw_q[:600]
-            parsed = _parse_json(raw_q)
-            if parsed and any(parsed.get(k,0) != 0 for k in ["overall_score","nigeria_macro","oil_impact"]):
-                sig["analysis"] = parsed   # overwrite early pass with richer version
-                sig["sources"].append("Gemini AI (enhanced with live market data)")
-            elif already_scored:
-                sig["errors"].append("Gemini enhanced pass returned zeros — keeping Step 0 result")
+            if raw_q.startswith("❌"):
+                sig["errors"].append(f"Gemini enhanced: API error: {raw_q[:150]}")
             else:
-                sig["errors"].append(f"Gemini enhanced pass: empty parse. Raw: {raw_q[:150]}")
+                parsed = _parse_json(raw_q)
+                if parsed and "overall_score" in parsed:
+                    sig["analysis"] = parsed   # overwrite early pass with richer version
+                    sig["sources"].append("Gemini AI (enhanced with live data)")
+                elif already_scored:
+                    sig["errors"].append(f"Gemini enhanced: bad parse, keeping Step 0 result. Raw: {raw_q[:100]}")
+                else:
+                    sig["errors"].append(f"Gemini enhanced: empty parse. Raw: {raw_q[:150]}")
         except Exception as e:
             if not already_scored:
                 sig["gemini_raw_error"] = f"{type(e).__name__}: {str(e)}"
             sig["errors"].append(f"Gemini enhanced: {type(e).__name__}: {str(e)[:150]}")
 
+    # Always return sig regardless of what succeeded or failed
+    return sig
 
 
 def maybe_refresh_signals(force: bool = False):

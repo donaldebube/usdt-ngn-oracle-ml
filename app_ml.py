@@ -1940,7 +1940,7 @@ if auto_ref and st.session_state.last_time and GEMINI_KEY:
             unsafe_allow_html=True)
         # Force Streamlit to re-execute the script every second so the
         # elapsed-time check above can actually fire without user interaction.
-        time.sleep(60)
+        time.sleep(10)
         st.rerun()
 
 

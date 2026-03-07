@@ -1938,10 +1938,9 @@ if auto_ref and st.session_state.last_time and GEMINI_KEY:
             f'<p style="font-size:10px;color:var(--green);text-align:right;margin-bottom:0;">'
             f'🔄 Auto-refresh in {rem_min}m {rem_s}s</p>',
             unsafe_allow_html=True)
-        # Force Streamlit to re-execute the script every second so the
-        # elapsed-time check above can actually fire without user interaction.
-        time.sleep(10)
-        st.rerun()
+        # Use JS-based refresh — no dim flash, no sleep() blocking the thread
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=10_000, limit=None, key="oracle_autorefresh")
 
 
 # ══════════════════════════════════════════════════════

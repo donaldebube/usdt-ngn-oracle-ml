@@ -658,7 +658,8 @@ def fetch_global_signals() -> dict:
             sig["sources"].append("CoinGecko")
             crypto_ok = True
         else:
-            sig["errors"].append(f"CoinGecko HTTP {r.status_code}: {r.text[:80]}")
+            sig["errors"].append(f"CoinGecko HTTP {r.status_code}: {r.text[:120]}")
+            sig["coingecko_raw"] = f"HTTP {r.status_code} | {r.text[:300]}"
     except Exception as e:
         sig["errors"].append(f"CoinGecko: {type(e).__name__}: {str(e)[:120]}")
 
@@ -788,6 +789,7 @@ def fetch_global_signals() -> dict:
     headlines_raw = []
     rss_errors    = []
     rss_ok_count  = 0
+    rss_first_response_snippet = None   # stored for diagnostics
     for query, tag in rss_topics:
         try:
             encoded = requests.utils.quote(query)
@@ -797,6 +799,9 @@ def fetch_global_signals() -> dict:
                 "Accept": "application/rss+xml, application/xml, text/xml, */*",
                 "Accept-Language": "en-US,en;q=0.9",
             })
+            # Store first raw response for diagnostics (detects CAPTCHA/redirect pages)
+            if rss_first_response_snippet is None:
+                rss_first_response_snippet = f"HTTP {r.status_code} | Content-Type: {r.headers.get('Content-Type','?')} | Body[0:200]: {r.text[:200]}"
             if r.status_code == 200:
                 titles = _parse_rss_titles(r.text)
                 descs  = _parse_rss_descs(r.text)
@@ -815,7 +820,7 @@ def fetch_global_signals() -> dict:
                 if added > 0:
                     rss_ok_count += 1
                 else:
-                    rss_errors.append(f"{tag}: got 200 but 0 titles parsed (may be empty/redirect)")
+                    rss_errors.append(f"{tag}: got 200 but 0 titles parsed (may be Cloudflare CAPTCHA page)")
             else:
                 rss_errors.append(f"{tag}: HTTP {r.status_code}")
         except Exception as e:
@@ -823,6 +828,7 @@ def fetch_global_signals() -> dict:
 
     sig["rss_ok_count"] = rss_ok_count
     sig["rss_errors"]   = rss_errors
+    sig["rss_first_response"] = rss_first_response_snippet
 
     # GNews API — primary paid supplement (always active when key is present)
     gnews_count = 0
@@ -900,37 +906,46 @@ def fetch_global_signals() -> dict:
         sig["sources"].append(rss_src)
 
     # 6. GEMINI DEEP ANALYSIS
-    # IMPORTANT: Always runs even without headlines — uses live market data as minimum input.
-    # Scores of 0 indicate either: (a) Gemini returned bad JSON, (b) RSS fetch blocked,
-    # (c) truly neutral market (rare). Check sig["errors"] and sig["gemini_raw_error"] for details.
+    # KEY DESIGN: Gemini is asked to USE ITS OWN KNOWLEDGE of current events + any
+    # headlines we did manage to fetch. This means even if ALL external APIs are blocked
+    # (Streamlit Cloud firewall), Gemini still produces real non-zero scores from its
+    # training data and knowledge cutoff. RSS/GNews headlines are a bonus, not required.
     now_str  = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M WAT")
     btc_str  = f"${sig.get('btc_usd',0):,.0f} ({sig.get('btc_24h',0):+.1f}%)" if sig.get("btc_usd") else "N/A"
     fng_str  = f"{sig.get('fear_greed_value','?')} — {sig.get('fear_greed_label','N/A')}"
     headlines_block = "\n".join(f"  {i+1}. {h['full']}" for i, h in enumerate(headlines_raw[:40]))
-    if not headlines_block:
-        headlines_block = "(No RSS headlines retrieved — scoring from market data only)"
+    has_headlines = bool(headlines_raw)
 
-    q_prompt = f"""You are a senior FX strategist. Today: {now_str}
+    q_prompt = f"""You are a senior FX strategist and Nigeria macroeconomic specialist. Today: {now_str}
 
-LIVE MARKET DATA (always available):
+CONTEXT: You are scoring market conditions for USDT/NGN P2P exchange rate prediction.
+Positive score = USDT rises / NGN weakens. Negative = NGN strengthens.
+
+LIVE MARKET DATA (fetched this session — use if available, ignore if "N/A"):
 - BTC: {btc_str} | ETH: ${sig.get('eth_usd',0):,.0f} ({sig.get('eth_24h',0):+.1f}%)
 - Fear & Greed Index: {fng_str}
 - EUR/USD: {sig.get('eurusd','N/A')} | DXY proxy: {sig.get('dxy_proxy','N/A')}
 - USD/ZAR: {sig.get('usd_zar','N/A')} | USD/KES: {sig.get('usd_kes','N/A')} | USD/GHS: {sig.get('usd_ghs','N/A')}
-- Oil headline: {sig.get('oil_headline','N/A')}
 - Official USD/NGN: {sig.get('usd_ngn_official','N/A')}
 
-NEWS HEADLINES ({len(headlines_raw)} retrieved):
-{headlines_block}
+LIVE HEADLINES ({len(headlines_raw)} fetched — use if present):
+{headlines_block if has_headlines else "(None fetched from RSS/API — use your own knowledge of current events)"}
 
-TASK: Score each dimension for its impact on USDT/NGN P2P rate.
-Positive = USDT rises (NGN weakens). Negative = NGN strengthens (USDT falls).
-Use your knowledge of current market conditions if headlines are unavailable.
-IMPORTANT: Always return real non-zero scores. 0 means truly neutral. Do NOT default to 0.
+CRITICAL INSTRUCTION: You MUST provide real, non-zero scores based on your knowledge of:
+- Current CBN monetary policy and FX intervention stance
+- Recent Nigeria economic developments (oil production, inflation, forex reserves)
+- Current global oil prices and OPEC situation
+- Current USD/Fed interest rate environment
+- Current crypto market conditions
+- Any recent geopolitical events affecting oil or EM currencies
+- Nigeria P2P crypto market dynamics
 
-Return ONLY valid JSON (no markdown, no backticks, no extra text):
+Do NOT return 0 for any score unless the factor is genuinely perfectly neutral today.
+Use your training knowledge to estimate current conditions — this is better than all zeros.
+
+Return ONLY valid compact JSON. No markdown. No backticks. No explanation. Start immediately with {{:
 {{
-  "overall_score": <integer -100 to +100>,
+  "overall_score": <integer -100 to +100, positive=USDT rises>,
   "nigeria_macro": <integer -100 to 100>,
   "cbn_policy": <integer -100 to 100>,
   "oil_impact": <integer -100 to 100>,
@@ -940,41 +955,49 @@ Return ONLY valid JSON (no markdown, no backticks, no extra text):
   "political_risk_nigeria": <integer -100 to 100>,
   "remittance_flow": <integer -100 to 100>,
   "global_em_risk": <integer -100 to 100>,
-  "market_mood": "RISK_ON",
-  "top_mover_today": "Most important market-moving factor right now",
-  "breaking_event": null,
-  "oil_analysis": "Current oil situation and how it feeds into NGN earnings and FX supply.",
-  "geopolitical_analysis": "Active geopolitical risks affecting oil supply or USD strength today.",
-  "cbn_analysis": "CBN current FX stance and likely near-term policy direction.",
-  "crypto_analysis": "Crypto market sentiment and direct P2P Nigeria market impact.",
-  "em_analysis": "Broader emerging market FX pressure on NGN today.",
-  "top_bullish_catalyst": "Most important reason USDT/NGN could rise today",
-  "top_bearish_catalyst": "Most important reason USDT/NGN could fall today",
-  "overall_qualitative_direction": "NEUTRAL",
-  "qualitative_confidence": 60,
-  "30min_bias": "HOLD",
-  "key_watch_items": ["Item 1", "Item 2", "Item 3"],
-  "medium_term_outlook": "30-90 day fundamental outlook for USDT/NGN based on CBN policy, oil, and EM conditions.",
-  "long_term_outlook": "6-12 month structural trajectory of NGN based on Nigeria reform path.",
-  "structural_ngn_risks": ["Risk 1", "Risk 2", "Risk 3"]
+  "market_mood": "RISK_ON|RISK_OFF|NEUTRAL",
+  "top_mover_today": "<single most important factor moving USDT/NGN right now>",
+  "breaking_event": "<breaking news or null>",
+  "oil_analysis": "<2 sentences on oil situation and NGN FX impact>",
+  "geopolitical_analysis": "<2 sentences on active geopolitical risks>",
+  "cbn_analysis": "<2 sentences on CBN stance and likely action>",
+  "crypto_analysis": "<1 sentence on crypto sentiment and P2P Nigeria impact>",
+  "em_analysis": "<1 sentence on EM currency pressure>",
+  "top_bullish_catalyst": "<most important reason USDT/NGN could rise>",
+  "top_bearish_catalyst": "<most important reason USDT/NGN could fall>",
+  "overall_qualitative_direction": "BULLISH_USDT|BEARISH_USDT|NEUTRAL",
+  "qualitative_confidence": <0-100>,
+  "30min_bias": "BUY|SELL|HOLD",
+  "key_watch_items": ["<item 1>", "<item 2>", "<item 3>"],
+  "medium_term_outlook": "<3 sentences: 30-90 day USDT/NGN outlook>",
+  "long_term_outlook": "<2 sentences: 6-12 month NGN structural trajectory>",
+  "structural_ngn_risks": ["<risk 1>", "<risk 2>", "<risk 3>"]
 }}"""
 
     try:
-        raw_q = gemini(q_prompt, "You are a quantitative FX strategist. Return ONLY valid compact JSON. No markdown. No backticks. Start with {.")
-        sig["gemini_raw_response"] = raw_q[:500]   # store for diagnostics
+        raw_q = gemini(q_prompt,
+            "You are a quantitative FX strategist specialising in Nigeria/NGN. "
+            "Return ONLY valid compact JSON. No markdown. No backticks. No preamble. Start with {.",
+            temperature=0.3, max_tokens=2048)
+        sig["gemini_raw_response"] = raw_q[:600]   # stored for diagnostics
         parsed = _parse_json(raw_q)
+        if not parsed:
+            raise ValueError(f"JSON parse returned empty. Raw: {raw_q[:200]}")
         sig["analysis"] = parsed
-        sig["sources"].append("Gemini AI analysis")
-        # Validate we got real scores
+        sig["sources"].append("Gemini AI analysis (knowledge-based)")
+        # Validate non-zero scores
         score_keys = ["overall_score","nigeria_macro","cbn_policy","oil_impact","usd_fed_impact",
                       "crypto_sentiment","geopolitical_risk"]
         all_zero = all(parsed.get(k, 0) == 0 for k in score_keys)
         if all_zero:
-            sig["errors"].append("⚠️ Gemini returned all-zero scores — may be a parsing issue")
+            sig["errors"].append("⚠️ Gemini returned all-zero scores — JSON may have parsed incorrectly")
+        else:
+            sig["sources"].append(f"Qualitative scores: overall={parsed.get('overall_score',0)}, "
+                                   f"NGN={parsed.get('nigeria_macro',0)}, oil={parsed.get('oil_impact',0)}")
     except Exception as e:
         sig["analysis"] = {}
         sig["gemini_raw_error"] = f"{type(e).__name__}: {str(e)}"
-        sig["errors"].append(f"Gemini: {type(e).__name__}: {str(e)[:150]}")
+        sig["errors"].append(f"Gemini: {type(e).__name__}: {str(e)[:200]}")
 
 
 def maybe_refresh_signals(force: bool = False):
@@ -2980,6 +3003,22 @@ else:
             st.markdown('''<div class="sec-header" style="margin-top:16px;">🤖 GEMINI RAW RESPONSE (first 500 chars)</div>''', unsafe_allow_html=True)
             st.code(sig_diag["gemini_raw_response"], language="json")
 
+        # ── RSS FIRST RESPONSE (key diagnostic — confirms if Cloudflare is intercepting) ──
+        rss_first = sig_diag.get("rss_first_response")
+        if rss_first:
+            st.markdown('''<div class="sec-header" style="margin-top:16px;">📡 RSS FIRST RAW RESPONSE (confirms if Cloudflare is blocking)</div>''', unsafe_allow_html=True)
+            st.code(rss_first, language=None)
+            if "DOCTYPE html" in rss_first or "cloudflare" in rss_first.lower() or "captcha" in rss_first.lower() or "Just a moment" in rss_first:
+                st.markdown('''<div class="alert-box alert-warn">
+                ⛔ <strong>Confirmed: Cloudflare is intercepting RSS requests.</strong>
+                Google News RSS is returning an HTML CAPTCHA page instead of XML.
+                This is a known Streamlit Cloud issue. The fix is to use GNews API only (already enabled)
+                or add a proxy. Check if GNews errors below show why it also failed.
+                </div>''', unsafe_allow_html=True)
+        if sig_diag.get("coingecko_raw"):
+            st.markdown('''<div class="sec-header" style="margin-top:10px;">🪙 COINGECKO RAW RESPONSE</div>''', unsafe_allow_html=True)
+            st.code(sig_diag["coingecko_raw"], language=None)
+
         # ── RSS ERRORS ──
         rss_errs = sig_diag.get("rss_errors", [])
         if rss_errs:
@@ -2987,7 +3026,7 @@ else:
             for e in rss_errs:
                 st.markdown(f'<div style="font-size:11px;font-family:var(--font-mono);color:var(--red);padding:2px 0;">❌ {e}</div>', unsafe_allow_html=True)
         else:
-            st.markdown('<div style="font-size:11px;color:var(--green);margin-top:10px;">✅ No RSS errors logged</div>', unsafe_allow_html=True)
+            st.markdown('<div style="font-size:11px;color:var(--amber);margin-top:10px;">⚠️ No RSS errors logged — but 0 headlines means requests returned 200 with non-RSS content (CAPTCHA/redirect)</div>', unsafe_allow_html=True)
 
         # ── GEMINI RAW ERROR ──
         if sig_diag.get("gemini_raw_error"):

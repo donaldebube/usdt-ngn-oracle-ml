@@ -1,28 +1,30 @@
 """
-USDT/NGN Oracle — Unified Prediction Engine v3.0
+USD/NGN Oracle — Unified Prediction Engine v4.0
 ═════════════════════════════════════════════════
-Combines ML + AI prediction with full multi-timeframe forecasts:
-  24h · 7d · 30d · 3m · 6m · 12m · 2yr
+CHANGES FROM v3:
+  ✅ Uses CBN OFFICIAL USD/NGN rate as primary (not P2P / parallel market)
+  ✅ Walk-forward backtesting: every prediction is stored then resolved
+     against the next real CBN rate, producing genuine out-of-sample MAE
+  ✅ Confidence % is ONLY shown once walk-forward data exists (≥2 pairs)
+  ✅ P2P rate retained as a secondary spread-signal feature only
+  ✅ Auto-refresh uses st_autorefresh (no screen dim/flash)
 
 ML Engine:
-  • Ridge Regression (trend baseline)
-  • Random Forest (non-linear regime detection)
-  • Gradient Boosting (sequential error correction)
-  • Weighted Ensemble (Ridge×0.25 + RF×0.35 + GB×0.40)
+  • Ridge Regression (trend baseline)           weight 0.25
+  • Random Forest (non-linear regime detection) weight 0.35
+  • Gradient Boosting (sequential correction)   weight 0.40
 
 Qualitative Engine:
   • 18 RSS feeds → 40+ live headlines
   • 10-dimension Gemini AI scoring
-  • Oil / CBN / Geopolitics / Fed / EM Risk / Remittances
 
 Multi-Timeframe Forecasting:
-  • Decay-adjusted ML projections per timeframe
-  • Qualitative scenario modifiers (bull / base / bear)
-  • Confidence degrades correctly over time
+  • 24H · 7D · 30D · 3M · 6M · 12M · 2YR
+  • Confidence derived from real walk-forward error only
   • Gemini AI narrative for each horizon
 
 Run:
-  pip install streamlit scikit-learn numpy pandas requests
+  pip install streamlit scikit-learn numpy pandas requests streamlit-autorefresh
   streamlit run app_oracle.py
 """
 
@@ -31,7 +33,6 @@ import requests
 import json
 import os
 import datetime
-import time
 import re
 import numpy as np
 import pandas as pd
@@ -41,436 +42,166 @@ warnings.filterwarnings("ignore")
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.metrics import r2_score
 from sklearn.model_selection import cross_val_score
 
 # ══════════════════════════════════════════════════════
 # PAGE CONFIG
 # ══════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="USDT/NGN Oracle · Unified",
+    page_title="USD/NGN Oracle · CBN Official",
     page_icon="₦",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
 # ══════════════════════════════════════════════════════
-# DESIGN SYSTEM — Dark Terminal × Bloomberg Aesthetic
+# DESIGN SYSTEM
 # ══════════════════════════════════════════════════════
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600;700&family=Playfair+Display:wght@400;700&display=swap');
-
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');
 :root {
-  --bg:       #060912;
-  --bg2:      #0a1020;
-  --bg3:      #0d1628;
-  --card:     #0f1d30;
-  --card2:    #132236;
-  --border:   #172440;
-  --border2:  #1e3054;
-  --border3:  #274070;
-
-  --green:    #00e5a0;
-  --green2:   rgba(0,229,160,0.10);
-  --green3:   rgba(0,229,160,0.04);
-  --red:      #ff4466;
-  --red2:     rgba(255,68,102,0.10);
-  --amber:    #ffb020;
-  --amber2:   rgba(255,176,32,0.10);
-  --blue:     #4488ff;
-  --blue2:    rgba(68,136,255,0.10);
-  --purple:   #b060ff;
-  --purple2:  rgba(176,96,255,0.10);
-  --cyan:     #00d4ff;
-  --cyan2:    rgba(0,212,255,0.10);
-  --gold:     #ffd700;
-  --gold2:    rgba(255,215,0,0.08);
-
-  --text:     #cfe0f5;
-  --text2:    #9ab0cc;
-  --muted:    #4a6080;
-  --muted2:   #3a4e66;
-
-  --font-mono: 'JetBrains Mono', monospace;
-  --font-body: 'Space Grotesk', sans-serif;
-  --font-display: 'Playfair Display', serif;
-
-  --r-sm: 8px;
-  --r-md: 12px;
-  --r-lg: 16px;
-  --r-xl: 20px;
+  --bg:#060912;--bg2:#0a1020;--bg3:#0d1628;
+  --card:#0f1d30;--card2:#132236;
+  --border:#172440;--border2:#1e3054;--border3:#274070;
+  --green:#00e5a0;--green2:rgba(0,229,160,0.10);--green3:rgba(0,229,160,0.04);
+  --red:#ff4466;--red2:rgba(255,68,102,0.10);
+  --amber:#ffb020;--amber2:rgba(255,176,32,0.10);
+  --blue:#4488ff;--blue2:rgba(68,136,255,0.10);
+  --purple:#b060ff;--purple2:rgba(176,96,255,0.10);
+  --cyan:#00d4ff;--gold:#ffd700;
+  --text:#cfe0f5;--text2:#9ab0cc;--muted:#4a6080;--muted2:#3a4e66;
+  --font-mono:'JetBrains Mono',monospace;
+  --font-body:'Space Grotesk',sans-serif;
+  --r-sm:8px;--r-md:12px;--r-lg:16px;
 }
-
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-html, body, [class*="css"] {
-  font-family: var(--font-body) !important;
-  background: var(--bg) !important;
-  color: var(--text) !important;
-}
-
-.stApp { background: var(--bg) !important; }
-.block-container { padding: 1rem 1.8rem 2rem !important; max-width: 1500px !important; }
-section[data-testid="stSidebar"] { display: none !important; }
-#MainMenu, footer, header { visibility: hidden; }
-h1,h2,h3,h4 { font-family: var(--font-mono) !important; }
-
-/* ── SCROLLBAR ── */
-::-webkit-scrollbar { width: 4px; height: 4px; }
-::-webkit-scrollbar-track { background: var(--bg2); }
-::-webkit-scrollbar-thumb { background: var(--border3); border-radius: 4px; }
-
-/* ── INPUT OVERRIDES ── */
-.stTextInput>div>div>input,
-.stTextArea textarea,
-.stNumberInput>div>div>input,
-.stSelectbox>div>div>div {
-  background: var(--card) !important;
-  border: 1px solid var(--border2) !important;
-  color: var(--text) !important;
-  border-radius: var(--r-sm) !important;
-  font-family: var(--font-body) !important;
-}
-.stButton>button {
-  background: linear-gradient(135deg, #1a3060, #2a50a0) !important;
-  color: #fff !important;
-  border: 1px solid var(--border3) !important;
-  border-radius: var(--r-sm) !important;
-  font-family: var(--font-body) !important;
-  font-weight: 600 !important;
-  letter-spacing: 0.3px !important;
-  transition: all 0.2s ease !important;
-}
-.stButton>button:hover {
-  background: linear-gradient(135deg, #204080, #3060c0) !important;
-  border-color: var(--blue) !important;
-  transform: translateY(-1px) !important;
-  box-shadow: 0 4px 16px rgba(68,136,255,0.25) !important;
-}
-.stTabs [data-baseweb="tab-list"] {
-  background: var(--bg2) !important;
-  border-radius: var(--r-md) !important;
-  border: 1px solid var(--border) !important;
-  padding: 4px !important;
-  gap: 2px !important;
-}
-.stTabs [data-baseweb="tab"] {
-  background: transparent !important;
-  color: var(--muted) !important;
-  border-radius: var(--r-sm) !important;
-  font-family: var(--font-mono) !important;
-  font-size: 11px !important;
-  letter-spacing: 0.5px !important;
-  padding: 8px 14px !important;
-  transition: all 0.2s !important;
-}
-.stTabs [aria-selected="true"] {
-  background: var(--card2) !important;
-  color: var(--text) !important;
-  border: 1px solid var(--border2) !important;
-}
-.stTabs [data-baseweb="tab-panel"] { padding-top: 20px !important; }
-.stExpander { border: 1px solid var(--border) !important; border-radius: var(--r-md) !important; }
-.stExpander details summary { font-family: var(--font-mono) !important; font-size: 12px !important; }
-
-/* ── ANIMATIONS ── */
-@keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
-@keyframes ticker { 0%{transform:translateX(0)} 100%{transform:translateX(-50%)} }
-@keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
-@keyframes glow { 0%,100%{box-shadow:0 0 8px rgba(0,229,160,0.2)} 50%{box-shadow:0 0 20px rgba(0,229,160,0.5)} }
-@keyframes scanline { 0%{transform:translateY(-100%)} 100%{transform:translateY(100vh)} }
-@keyframes shimmer { 0%{background-position:-200% 0} 100%{background-position:200% 0} }
-
-/* ── LIVE DOT ── */
-.live-dot {
-  display: inline-block;
-  width: 6px; height: 6px;
-  border-radius: 50%;
-  background: var(--green);
-  animation: pulse 2s ease-in-out infinite;
-  margin-right: 5px;
-  vertical-align: middle;
-}
-.live-dot-amber { background: var(--amber); }
-.live-dot-red   { background: var(--red); }
-
-/* ── CARD BASE ── */
-.card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--r-lg);
-  padding: 20px 22px;
-  position: relative;
-  overflow: hidden;
-  animation: fadeIn 0.3s ease;
-}
-.card::before {
-  content: '';
-  position: absolute;
-  top: 0; left: 0; right: 0;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, var(--border3), transparent);
-}
-.card-green  { border-top: 2px solid var(--green);  }
-.card-red    { border-top: 2px solid var(--red);    }
-.card-amber  { border-top: 2px solid var(--amber);  }
-.card-blue   { border-top: 2px solid var(--blue);   }
-.card-purple { border-top: 2px solid var(--purple); }
-.card-cyan   { border-top: 2px solid var(--cyan);   }
-.card-gold   { border-top: 2px solid var(--gold);   }
-
-.card-label {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  letter-spacing: 2.5px;
-  text-transform: uppercase;
-  color: var(--muted);
-  margin-bottom: 8px;
-}
-.card-value {
-  font-family: var(--font-mono);
-  font-size: 24px;
-  font-weight: 700;
-  line-height: 1.1;
-  margin-bottom: 4px;
-}
-.card-sub { font-size: 11px; color: var(--text2); margin-top: 5px; }
-
-/* ── SECTION HEADER ── */
-.sec-header {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  letter-spacing: 3px;
-  text-transform: uppercase;
-  color: var(--muted);
-  padding-bottom: 10px;
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 16px;
-}
-
-/* ── BADGE ── */
-.badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 10px;
-  border-radius: 100px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.8px;
-  text-transform: uppercase;
-}
-.badge-bull { background: var(--green2); color: var(--green); border: 1px solid rgba(0,229,160,0.3); }
-.badge-bear { background: var(--red2);   color: var(--red);   border: 1px solid rgba(255,68,102,0.3); }
-.badge-neu  { background: var(--amber2); color: var(--amber); border: 1px solid rgba(255,176,32,0.3); }
-
-/* ── TIMEFRAME PREDICTION CARD ── */
-.tf-card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--r-lg);
-  padding: 16px 18px;
-  position: relative;
-  overflow: hidden;
-  transition: all 0.2s ease;
-  cursor: default;
-}
-.tf-card:hover {
-  border-color: var(--border3);
-  transform: translateY(-2px);
-  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-}
-.tf-card-accent {
-  position: absolute;
-  top: 0; left: 0; right: 0;
-  height: 2px;
-}
-.tf-label {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  letter-spacing: 2px;
-  text-transform: uppercase;
-  color: var(--muted);
-  margin-bottom: 8px;
-}
-.tf-value {
-  font-family: var(--font-mono);
-  font-size: 20px;
-  font-weight: 700;
-  line-height: 1.2;
-}
-.tf-range {
-  font-size: 10px;
-  color: var(--text2);
-  margin-top: 4px;
-  font-family: var(--font-mono);
-}
-.tf-change {
-  font-size: 11px;
-  font-weight: 600;
-  font-family: var(--font-mono);
-  margin-top: 6px;
-}
-.tf-conf {
-  font-size: 9px;
-  color: var(--muted);
-  margin-top: 4px;
-  font-family: var(--font-mono);
-}
-
-/* ── PROGRESS BAR ── */
-.prog-wrap { margin-bottom: 12px; }
-.prog-label { display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 4px; }
-.prog-track { background: var(--border); border-radius: 3px; height: 5px; overflow: hidden; }
-.prog-fill  { height: 100%; border-radius: 3px; transition: width 0.5s ease; }
-
-/* ── ALERT BOX ── */
-.alert-box {
-  border-radius: var(--r-md);
-  padding: 12px 16px;
-  font-size: 13px;
-  margin-bottom: 10px;
-  border-left: 3px solid;
-  line-height: 1.5;
-}
-.alert-bull { background: var(--green2); border-color: var(--green); color: #a0ead4; }
-.alert-bear { background: var(--red2);   border-color: var(--red);   color: #ffaabb; }
-.alert-info { background: var(--blue2);  border-color: var(--blue);  color: #99bbff; }
-.alert-warn { background: var(--amber2); border-color: var(--amber); color: #ffd580; }
-
-/* ── MODEL BADGES ── */
-.model-badge {
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 3px 10px; border-radius: 100px;
-  font-family: var(--font-mono); font-size: 10px; font-weight: 700;
-}
-.badge-ridge  { background: rgba(68,136,255,0.15);  color: #4488ff; border: 1px solid rgba(68,136,255,0.3); }
-.badge-rf     { background: rgba(0,229,160,0.10);   color: #00e5a0; border: 1px solid rgba(0,229,160,0.3); }
-.badge-gb     { background: rgba(176,96,255,0.12);  color: #b060ff; border: 1px solid rgba(176,96,255,0.3); }
-.badge-ens    { background: rgba(255,176,32,0.15);  color: #ffb020; border: 1px solid rgba(255,176,32,0.3); }
-
-/* ── TICKER ── */
-.ticker-wrap {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  overflow: hidden;
-  padding: 8px 0;
-  margin-bottom: 16px;
-  white-space: nowrap;
-}
-.ticker-inner {
-  display: inline-flex;
-  gap: 40px;
-  animation: ticker 35s linear infinite;
-  padding: 0 20px;
-}
-.ticker-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--muted);
-}
-.ticker-item .val { color: var(--text); font-weight: 600; }
-.ticker-item .up  { color: var(--green); }
-.ticker-item .dn  { color: var(--red); }
-.ticker-sep { color: var(--border3); }
-
-/* ── SPREAD TABLE ── */
-.spread-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-.spread-table th {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  letter-spacing: 1.5px;
-  text-transform: uppercase;
-  color: var(--muted);
-  padding: 8px 12px;
-  text-align: left;
-  border-bottom: 1px solid var(--border);
-}
-.spread-table td {
-  padding: 9px 12px;
-  border-bottom: 1px solid var(--border);
-  color: var(--text);
-}
-.spread-table tr:last-child td { border-bottom: none; }
-.spread-table tr:hover td { background: rgba(255,255,255,0.02); }
-
-/* ── CHAT ── */
-.chat-u {
-  background: var(--blue2);
-  border: 1px solid rgba(68,136,255,0.2);
-  border-radius: 14px 14px 3px 14px;
-  padding: 12px 16px;
-  margin: 8px 0;
-  margin-left: 15%;
-  font-size: 13px;
-  line-height: 1.6;
-}
-.chat-a {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 14px 14px 14px 3px;
-  padding: 12px 16px;
-  margin: 8px 0;
-  margin-right: 15%;
-  font-size: 13px;
-  line-height: 1.6;
-}
-.chat-badge {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  letter-spacing: 1.5px;
-  text-transform: uppercase;
-  color: var(--green);
-  margin-bottom: 5px;
-}
-
-/* ── HEADLINE ROW ── */
-.hl-row {
-  padding: 7px 0;
-  border-bottom: 1px solid var(--border);
-  font-size: 11px;
-  line-height: 1.5;
-}
-.hl-row:last-child { border-bottom: none; }
-
-/* ── SCENARIO CARD ── */
-.scenario-card {
-  border-radius: var(--r-md);
-  padding: 14px 16px;
-  border: 1px solid;
-  margin-bottom: 10px;
-}
-.scenario-bull { background: var(--green3); border-color: rgba(0,229,160,0.3); }
-.scenario-base { background: rgba(68,136,255,0.05); border-color: rgba(68,136,255,0.2); }
-.scenario-bear { background: rgba(255,68,102,0.05); border-color: rgba(255,68,102,0.25); }
-
-/* ── DIVIDER ── */
-.hdivider {
-  height: 1px;
-  background: linear-gradient(90deg, transparent, var(--border3), transparent);
-  margin: 18px 0;
-}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+html,body,[class*="css"]{font-family:var(--font-body)!important;background:var(--bg)!important;color:var(--text)!important;}
+.stApp{background:var(--bg)!important;}
+.block-container{padding:1rem 1.8rem 2rem!important;max-width:1500px!important;}
+section[data-testid="stSidebar"]{display:none!important;}
+#MainMenu,footer,header{visibility:hidden;}
+h1,h2,h3,h4{font-family:var(--font-mono)!important;}
+::-webkit-scrollbar{width:4px;height:4px;}
+::-webkit-scrollbar-track{background:var(--bg2);}
+::-webkit-scrollbar-thumb{background:var(--border3);border-radius:4px;}
+.stTextInput>div>div>input,.stTextArea textarea,.stNumberInput>div>div>input,.stSelectbox>div>div>div{
+  background:var(--card)!important;border:1px solid var(--border2)!important;
+  color:var(--text)!important;border-radius:var(--r-sm)!important;}
+.stButton>button{
+  background:linear-gradient(135deg,#1a3060,#2a50a0)!important;color:#fff!important;
+  border:1px solid var(--border3)!important;border-radius:var(--r-sm)!important;
+  font-family:var(--font-body)!important;font-weight:600!important;transition:all 0.2s ease!important;}
+.stButton>button:hover{background:linear-gradient(135deg,#204080,#3060c0)!important;
+  border-color:var(--blue)!important;transform:translateY(-1px)!important;}
+.stTabs [data-baseweb="tab-list"]{background:var(--bg2)!important;border-radius:var(--r-md)!important;
+  border:1px solid var(--border)!important;padding:4px!important;gap:2px!important;}
+.stTabs [data-baseweb="tab"]{background:transparent!important;color:var(--muted)!important;
+  border-radius:var(--r-sm)!important;font-family:var(--font-mono)!important;
+  font-size:11px!important;letter-spacing:0.5px!important;padding:8px 14px!important;}
+.stTabs [aria-selected="true"]{background:var(--card2)!important;color:var(--text)!important;
+  border:1px solid var(--border2)!important;}
+.stTabs [data-baseweb="tab-panel"]{padding-top:20px!important;}
+.stExpander{border:1px solid var(--border)!important;border-radius:var(--r-md)!important;}
+@keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.3;}}
+@keyframes ticker{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.live-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);
+  animation:pulse 2s ease-in-out infinite;margin-right:5px;vertical-align:middle;}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--r-lg);
+  padding:20px 22px;position:relative;overflow:hidden;animation:fadeIn 0.3s ease;}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,var(--border3),transparent);}
+.card-green{border-top:2px solid var(--green);}
+.card-red{border-top:2px solid var(--red);}
+.card-amber{border-top:2px solid var(--amber);}
+.card-blue{border-top:2px solid var(--blue);}
+.card-purple{border-top:2px solid var(--purple);}
+.card-cyan{border-top:2px solid var(--cyan);}
+.card-gold{border-top:2px solid var(--gold);}
+.card-label{font-family:var(--font-mono);font-size:9px;letter-spacing:2.5px;
+  text-transform:uppercase;color:var(--muted);margin-bottom:8px;}
+.card-value{font-family:var(--font-mono);font-size:24px;font-weight:700;line-height:1.1;margin-bottom:4px;}
+.card-sub{font-size:11px;color:var(--text2);margin-top:5px;}
+.sec-header{font-family:var(--font-mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;
+  color:var(--muted);padding-bottom:10px;border-bottom:1px solid var(--border);margin-bottom:16px;}
+.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:100px;
+  font-family:var(--font-mono);font-size:10px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;}
+.badge-bull{background:var(--green2);color:var(--green);border:1px solid rgba(0,229,160,0.3);}
+.badge-bear{background:var(--red2);color:var(--red);border:1px solid rgba(255,68,102,0.3);}
+.badge-neu{background:var(--amber2);color:var(--amber);border:1px solid rgba(255,176,32,0.3);}
+.tf-card{background:var(--card);border:1px solid var(--border);border-radius:var(--r-lg);
+  padding:16px 18px;position:relative;overflow:hidden;transition:all 0.2s ease;}
+.tf-card:hover{border-color:var(--border3);transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,0.4);}
+.tf-card-accent{position:absolute;top:0;left:0;right:0;height:2px;}
+.tf-label{font-family:var(--font-mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;
+  color:var(--muted);margin-bottom:8px;}
+.tf-value{font-family:var(--font-mono);font-size:20px;font-weight:700;line-height:1.2;}
+.tf-range{font-size:10px;color:var(--text2);margin-top:4px;font-family:var(--font-mono);}
+.tf-change{font-size:11px;font-weight:600;font-family:var(--font-mono);margin-top:6px;}
+.tf-conf{font-size:9px;color:var(--muted);margin-top:4px;font-family:var(--font-mono);}
+.prog-wrap{margin-bottom:12px;}
+.prog-label{display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px;}
+.prog-track{background:var(--border);border-radius:3px;height:5px;overflow:hidden;}
+.prog-fill{height:100%;border-radius:3px;transition:width 0.5s ease;}
+.alert-box{border-radius:var(--r-md);padding:12px 16px;font-size:13px;
+  margin-bottom:10px;border-left:3px solid;line-height:1.5;}
+.alert-bull{background:var(--green2);border-color:var(--green);color:#a0ead4;}
+.alert-bear{background:var(--red2);border-color:var(--red);color:#ffaabb;}
+.alert-info{background:var(--blue2);border-color:var(--blue);color:#99bbff;}
+.alert-warn{background:var(--amber2);border-color:var(--amber);color:#ffd580;}
+.model-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:100px;
+  font-family:var(--font-mono);font-size:10px;font-weight:700;}
+.badge-ridge{background:rgba(68,136,255,0.15);color:#4488ff;border:1px solid rgba(68,136,255,0.3);}
+.badge-rf{background:rgba(0,229,160,0.10);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);}
+.badge-gb{background:rgba(176,96,255,0.12);color:#b060ff;border:1px solid rgba(176,96,255,0.3);}
+.badge-ens{background:rgba(255,176,32,0.15);color:#ffb020;border:1px solid rgba(255,176,32,0.3);}
+.ticker-wrap{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-sm);
+  overflow:hidden;padding:8px 0;margin-bottom:16px;white-space:nowrap;}
+.ticker-inner{display:inline-flex;gap:40px;animation:ticker 35s linear infinite;padding:0 20px;}
+.ticker-item{display:inline-flex;align-items:center;gap:6px;font-family:var(--font-mono);font-size:11px;color:var(--muted);}
+.ticker-item .val{color:var(--text);font-weight:600;}
+.ticker-item .up{color:var(--green);}
+.ticker-item .dn{color:var(--red);}
+.ticker-sep{color:var(--border3);}
+.spread-table{width:100%;border-collapse:collapse;font-size:12px;}
+.spread-table th{font-family:var(--font-mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;
+  color:var(--muted);padding:8px 12px;text-align:left;border-bottom:1px solid var(--border);}
+.spread-table td{padding:9px 12px;border-bottom:1px solid var(--border);color:var(--text);}
+.spread-table tr:last-child td{border-bottom:none;}
+.spread-table tr:hover td{background:rgba(255,255,255,0.02);}
+.chat-u{background:var(--blue2);border:1px solid rgba(68,136,255,0.2);
+  border-radius:14px 14px 3px 14px;padding:12px 16px;margin:8px 0;margin-left:15%;font-size:13px;line-height:1.6;}
+.chat-a{background:var(--card);border:1px solid var(--border);
+  border-radius:14px 14px 14px 3px;padding:12px 16px;margin:8px 0;margin-right:15%;font-size:13px;line-height:1.6;}
+.chat-badge{font-family:var(--font-mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--green);margin-bottom:5px;}
+.hl-row{padding:7px 0;border-bottom:1px solid var(--border);font-size:11px;line-height:1.5;}
+.hl-row:last-child{border-bottom:none;}
+.scenario-card{border-radius:var(--r-md);padding:14px 16px;border:1px solid;margin-bottom:10px;}
+.scenario-bull{background:var(--green3);border-color:rgba(0,229,160,0.3);}
+.scenario-bear{background:rgba(255,68,102,0.05);border-color:rgba(255,68,102,0.25);}
+.hdivider{height:1px;background:linear-gradient(90deg,transparent,var(--border3),transparent);margin:18px 0;}
+.wf-table{width:100%;border-collapse:collapse;font-size:11px;}
+.wf-table th{font-family:var(--font-mono);font-size:9px;letter-spacing:1.2px;text-transform:uppercase;
+  color:var(--muted);padding:7px 10px;text-align:left;border-bottom:1px solid var(--border);}
+.wf-table td{padding:7px 10px;border-bottom:1px solid var(--border);font-family:var(--font-mono);}
+.wf-table tr:last-child td{border-bottom:none;}
+.wf-table tr:hover td{background:rgba(255,255,255,0.02);}
 </style>
 """, unsafe_allow_html=True)
-
 
 # ══════════════════════════════════════════════════════
 # SESSION STATE + PERSISTENCE
 # ══════════════════════════════════════════════════════
-HISTORY_FILE = "oracle_rate_history.json"
-MAX_HISTORY  = 2000
+HISTORY_FILE  = "oracle_rate_history.json"
+BACKTEST_FILE = "oracle_backtest.json"
+MAX_HISTORY   = 2000
 
 def _save_history():
     try:
-        data = st.session_state.rate_history[-MAX_HISTORY:]
         with open(HISTORY_FILE, "w") as f:
-            json.dump(data, f, default=str)
+            json.dump(st.session_state.rate_history[-MAX_HISTORY:], f, default=str)
     except Exception:
         pass
 
@@ -478,10 +209,34 @@ def _load_history() -> list:
     if not os.path.exists(HISTORY_FILE):
         return []
     try:
-        with open(HISTORY_FILE, "r") as f:
+        with open(HISTORY_FILE) as f:
             data = json.load(f)
-        valid = [d for d in data if isinstance(d, dict) and d.get("p2p_mid") and d.get("timestamp")]
+        # Accept both old (p2p_mid) and new (cbn_rate) keys
+        valid = []
+        for d in data:
+            if not isinstance(d, dict): continue
+            if not d.get("timestamp"): continue
+            if d.get("cbn_rate") or d.get("p2p_mid"):
+                if not d.get("cbn_rate") and d.get("p2p_mid"):
+                    d["cbn_rate"] = d["p2p_mid"]   # migrate old records
+                valid.append(d)
         return valid[-MAX_HISTORY:]
+    except Exception:
+        return []
+
+def _save_backtest():
+    try:
+        with open(BACKTEST_FILE, "w") as f:
+            json.dump(st.session_state.backtest_log[-500:], f, default=str)
+    except Exception:
+        pass
+
+def _load_backtest() -> list:
+    if not os.path.exists(BACKTEST_FILE):
+        return []
+    try:
+        with open(BACKTEST_FILE) as f:
+            return json.load(f)[-500:]
     except Exception:
         return []
 
@@ -491,12 +246,13 @@ def init():
         "result": None,
         "last_time": None,
         "rate_history": [],
+        "backtest_log": [],        # [{timestamp, predicted, actual, error_abs, error_pct, direction_correct}]
+        "pending_pred": None,      # {ensemble, timestamp, prev_rate} — resolved on next run
         "ml_metrics": {},
         "alerts": [],
         "alert_triggered": [],
         "auto_refresh": False,
         "refresh_interval": 60,
-        "prev_rate": None,
         "user_email": "",
         "global_signals": None,
         "global_signals_time": None,
@@ -508,9 +264,12 @@ def init():
     if not st.session_state.history_loaded:
         saved = _load_history()
         if saved:
-            existing_times = {d.get("timestamp") for d in st.session_state.rate_history}
-            new_pts = [d for d in saved if d.get("timestamp") not in existing_times]
+            existing = {d.get("timestamp") for d in st.session_state.rate_history}
+            new_pts  = [d for d in saved if d.get("timestamp") not in existing]
             st.session_state.rate_history = new_pts + st.session_state.rate_history
+        bt = _load_backtest()
+        if bt:
+            st.session_state.backtest_log = bt
         st.session_state.history_loaded = True
 
 init()
@@ -522,18 +281,17 @@ init()
 try:
     GEMINI_KEY = st.secrets["GEMINI_KEY"]
     NEWS_KEY   = st.secrets.get("NEWS_KEY", "")
-    GNEWS_KEY  = st.secrets.get("GNEWS_KEY", "99cd5e7bef4bad5dbf125c9220282247")
+    GNEWS_KEY  = st.secrets.get("GNEWS_KEY", "")
     RESEND_KEY = st.secrets.get("RESEND_API_KEY", "")
 except Exception:
     GEMINI_KEY = ""
     NEWS_KEY   = ""
-    GNEWS_KEY  = "99cd5e7bef4bad5dbf125c9220282247"
+    GNEWS_KEY  = ""
     RESEND_KEY = ""
 
 if not GEMINI_KEY:
-    st.error("⚠️ **GEMINI_KEY not configured.** Add it to `.streamlit/secrets.toml` to run the Oracle.")
+    st.error("⚠️ **GEMINI_KEY not configured.** Add it to `.streamlit/secrets.toml`.")
     st.stop()
-
 
 # ══════════════════════════════════════════════════════
 # GEMINI ENGINE
@@ -543,7 +301,6 @@ GEMINI_MODELS = [
     "gemini-2.0-flash",
     "gemini-2.0-flash-001",
     "gemini-2.0-flash-lite",
-    "gemini-2.5-flash-lite",
     "gemini-flash-latest",
 ]
 
@@ -552,19 +309,16 @@ def check_gemini_key(key: str) -> tuple:
     for model in GEMINI_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         try:
-            r = requests.post(url, json={
-                "contents": [{"parts": [{"text": "Reply: OK"}]}],
-                "generationConfig": {"maxOutputTokens": 5}
-            }, timeout=12)
+            r = requests.post(url, json={"contents":[{"parts":[{"text":"Reply: OK"}]}],
+                              "generationConfig":{"maxOutputTokens":5}}, timeout=12)
             if r.status_code == 200: return True, model, ""
-            if r.status_code == 403: return False, "", "API key invalid or not authorised"
-            if r.status_code == 429: return True, model, "Rate limited"
+            if r.status_code == 403: return False, "", "API key invalid"
         except: continue
     return False, "", "No working Gemini model found"
 
 _key_ok, _working_model, _key_err = check_gemini_key(GEMINI_KEY)
 if not _key_ok:
-    st.error(f"❌ Gemini key error: {_key_err}. Check aistudio.google.com")
+    st.error(f"❌ Gemini key error: {_key_err}")
     st.stop()
 
 def gemini(prompt: str, system: str = "", temperature: float = 0.2, max_tokens: int = 4096) -> str:
@@ -572,10 +326,8 @@ def gemini(prompt: str, system: str = "", temperature: float = 0.2, max_tokens: 
     if system:
         parts.append({"text": f"SYSTEM:\n{system}\n\n---\n\n"})
     parts.append({"text": prompt})
-    payload = {
-        "contents": [{"parts": parts}],
-        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens}
-    }
+    payload = {"contents":[{"parts":parts}],
+                "generationConfig":{"temperature":temperature,"maxOutputTokens":max_tokens}}
     errors = []
     for model in GEMINI_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
@@ -584,53 +336,44 @@ def gemini(prompt: str, system: str = "", temperature: float = 0.2, max_tokens: 
             if r.status_code == 200:
                 return r.json()["candidates"][0]["content"]["parts"][0]["text"]
             elif r.status_code == 429:
-                return "❌ Rate limit hit. Wait 60s and try again."
+                return "❌ Rate limit. Wait 60s."
             elif r.status_code == 403:
                 return "❌ API key invalid."
             else:
                 errors.append(f"{model}: HTTP {r.status_code}")
-                continue
         except Exception as e:
             errors.append(f"{model}: {str(e)[:50]}")
-            continue
     return f"❌ All Gemini models failed: {' | '.join(errors)}"
 
 def _parse_json(raw: str) -> dict:
-    """Robust JSON parser that handles Gemini markdown wrapping. Returns {} on failure."""
     if not raw or raw.startswith("❌"):
         return {}
     clean = raw.strip()
-    # Strip markdown code fences
     if "```" in clean:
         for p in clean.split("```"):
             p = p.strip()
             if p.startswith("json"): p = p[4:].strip()
             if p.startswith("{"): clean = p; break
-    # Find JSON object start
     if not clean.startswith("{"):
         idx = clean.find("{")
         if idx >= 0: clean = clean[idx:]
         else: return {}
-    # Find JSON object end
     last = clean.rfind("}")
     if last >= 0: clean = clean[:last+1]
-    else: return {}
-    # Try direct parse
     try:
         return json.loads(clean)
-    except json.JSONDecodeError:
+    except:
         pass
-    # Try fixing common Gemini JSON mistakes: trailing commas, single quotes
     try:
-        fixed = re.sub(r",\s*([}\]])", r"", clean)   # remove trailing commas
-        fixed = re.sub(r":\s*<[^>]+>", ': null', fixed) # replace <placeholder> with null
+        fixed = re.sub(r",\s*([}\]])", r"", clean)
+        fixed = re.sub(r":\s*<[^>]+>", ': null', fixed)
         return json.loads(fixed)
-    except Exception:
+    except:
         return {}
 
 
 # ══════════════════════════════════════════════════════
-# GLOBAL SIGNALS ENGINE
+# GLOBAL SIGNALS ENGINE  (unchanged from v3)
 # ══════════════════════════════════════════════════════
 SIGNALS_TTL = 300
 
@@ -639,417 +382,279 @@ def _signals_stale() -> bool:
     if t is None: return True
     return (datetime.datetime.now() - t).total_seconds() > SIGNALS_TTL
 
+_BH = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/html, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
+
 def fetch_global_signals() -> dict:
-    # Standard browser headers — required for Streamlit Cloud which often gets blocked
-    # when using bare Python requests without proper User-Agent / Accept headers
-    _BROWSER_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/html, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Cache-Control": "no-cache",
-    }
     sig = {"fetched_at": datetime.datetime.now().isoformat(), "sources": [], "errors": []}
 
-    # ══ STEP 0: GEMINI KNOWLEDGE-BASED SCORING (runs FIRST, no network needed) ══
-    # This runs before any HTTP calls so Streamlit Cloud firewall cannot block it.
-    # Gemini uses its own training knowledge of current macro conditions.
-    # RSS/GNews headlines are injected later as a supplement if available.
+    # Step 0: Gemini knowledge-based scoring (no network needed)
     try:
-        now_str_early = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M WAT")
+        now_str = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M WAT")
         early_prompt = (
-            f"You are a senior FX strategist specialising in Nigeria/NGN. Today is {now_str_early}.\n"
-            "Score CURRENT market conditions for USDT/NGN P2P rate prediction.\n"
-            "Positive score = USDT rises / NGN weakens. Negative = NGN strengthens.\n\n"
-            "Use your knowledge of CBN policy, Nigeria oil, USD/Fed, crypto, geopolitics, EM FX, remittances.\n"
+            f"You are a senior FX strategist for Nigeria/NGN. Today is {now_str}.\n"
+            "Score CURRENT market conditions for USD/NGN OFFICIAL CBN rate prediction.\n"
+            "Positive score = NGN weakens (USD rises). Negative = NGN strengthens.\n\n"
+            "Use your knowledge of CBN policy, oil, USD/Fed, crypto, geopolitics, EM FX, remittances.\n"
             "NEVER return 0 unless genuinely neutral. Return honest non-zero scores.\n\n"
-            "Return ONLY valid JSON. No markdown. No backticks. No preamble. Start with {\n"
+            "Return ONLY valid JSON. No markdown. No backticks. Start with {\n"
             '{"overall_score":15,"nigeria_macro":20,"cbn_policy":-10,"oil_impact":5,'
             '"usd_fed_impact":10,"crypto_sentiment":8,"geopolitical_risk":12,'
             '"political_risk_nigeria":15,"remittance_flow":-5,"global_em_risk":10,'
-            '"market_mood":"RISK_ON",'
-            '"top_mover_today":"USD strength and CBN policy stance",'
-            '"breaking_event":null,'
-            '"oil_analysis":"Oil prices remain rangebound affecting Nigeria FX earnings. OPEC cuts provide floor.",'
-            '"geopolitical_analysis":"Middle East tensions sustain risk premium on oil. USD safe-haven demand elevated.",'
-            '"cbn_analysis":"CBN maintaining managed float with periodic interventions. Reserves stable.",'
-            '"crypto_analysis":"Crypto risk-on sentiment supports USDT premium in P2P markets.",'
-            '"em_analysis":"EM currencies under pressure from strong USD and Fed hold signals.",'
-            '"top_bullish_catalyst":"USD strength and Nigeria FX demand outpacing supply",'
-            '"top_bearish_catalyst":"CBN intervention or oil price surge boosting NGN",'
-            '"overall_qualitative_direction":"BULLISH_USDT",'
-            '"qualitative_confidence":65,'
-            '"30min_bias":"HOLD",'
-            '"key_watch_items":["CBN intervention frequency","Brent crude price","US jobs data"],'
-            '"medium_term_outlook":"NGN faces structural depreciation pressure over 30-90 days.",'
-            '"long_term_outlook":"Long-term NGN trajectory depends on Nigeria reform path.",'
-            '"structural_ngn_risks":["Oil dependence","CBN reserve adequacy","political risk"]}\n\n'
-            "ABOVE WAS AN EXAMPLE FORMAT ONLY. Now return YOUR OWN real scored JSON for today's actual conditions. "
-            "Start with { immediately:"
+            '"market_mood":"RISK_ON","top_mover_today":"USD strength","breaking_event":null,'
+            '"oil_analysis":"Oil rangebound.","geopolitical_analysis":"Tensions elevated.",'
+            '"cbn_analysis":"CBN maintaining managed float.","crypto_analysis":"Risk-on.",'
+            '"em_analysis":"EM under pressure.","top_bullish_catalyst":"USD strength",'
+            '"top_bearish_catalyst":"CBN intervention","overall_qualitative_direction":"BULLISH_USD",'
+            '"qualitative_confidence":65,"30min_bias":"HOLD",'
+            '"key_watch_items":["CBN policy","Brent crude","US jobs data"],'
+            '"medium_term_outlook":"NGN faces structural pressure.",'
+            '"long_term_outlook":"Reform path key.",'
+            '"structural_ngn_risks":["Oil dependence","CBN reserves","political risk"]}\n\n'
+            "ABOVE IS EXAMPLE FORMAT ONLY. Return YOUR real scored JSON for today. Start with { immediately:"
         )
         raw_early = gemini(early_prompt,
-            "You are a quantitative FX strategist. Return ONLY valid JSON. No markdown. Start with {.",
+            "Quantitative FX strategist. Return ONLY valid JSON. Start with {.",
             temperature=0.3, max_tokens=1500)
         sig["gemini_raw_response"] = raw_early[:600]
-        # Detect if Gemini returned an error string instead of JSON
         if raw_early.startswith("❌"):
-            sig["errors"].append(f"Gemini early pass: API error: {raw_early[:200]}")
-            sig["gemini_raw_error"] = raw_early[:300]
+            sig["errors"].append(f"Gemini early: {raw_early[:200]}")
         else:
             parsed_early = _parse_json(raw_early)
             if parsed_early and "overall_score" in parsed_early:
-                # Accept even if some scores are zero — partial data is better than nothing
                 sig["analysis"] = parsed_early
                 sig["sources"].append("Gemini AI (knowledge-based)")
-                # Log if all zeros for debugging
-                if all(parsed_early.get(k,0) == 0 for k in ["overall_score","nigeria_macro","oil_impact"]):
-                    sig["errors"].append("⚠️ Gemini returned all-zero scores — may reflect genuinely neutral market or prompt issue")
             else:
-                sig["errors"].append(f"Gemini early pass: JSON parse failed or missing fields. Raw[:200]: {raw_early[:200]}")
+                sig["errors"].append(f"Gemini early parse failed. Raw: {raw_early[:200]}")
     except Exception as e:
-        sig["errors"].append(f"Gemini early pass FAILED: {type(e).__name__}: {str(e)[:200]}")
-        sig["gemini_raw_error"] = f"{type(e).__name__}: {str(e)}"
+        sig["errors"].append(f"Gemini early FAILED: {str(e)[:200]}")
 
-    # 1. CRYPTO PRICES
-    # Primary: CoinGecko v3 — fallback: Binance public ticker (no auth needed, very reliable on Streamlit Cloud)
+    # 1. Crypto prices
     crypto_ok = False
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price"
-            "?ids=bitcoin,ethereum,tether,binancecoin,solana,ripple"
-            "&vs_currencies=usd,ngn&include_24hr_change=true&include_market_cap=true",
-            timeout=12, headers=_BROWSER_HEADERS
-        )
+            "?ids=bitcoin,ethereum,tether&vs_currencies=usd&include_24hr_change=true",
+            timeout=12, headers=_BH)
         if r.status_code == 200:
             d = r.json()
-            sig["btc_usd"]     = d.get("bitcoin",{}).get("usd")
-            sig["btc_24h"]     = d.get("bitcoin",{}).get("usd_24h_change")
-            sig["btc_mcap"]    = d.get("bitcoin",{}).get("usd_market_cap")
-            sig["eth_usd"]     = d.get("ethereum",{}).get("usd")
-            sig["eth_24h"]     = d.get("ethereum",{}).get("usd_24h_change")
-            sig["bnb_usd"]     = d.get("binancecoin",{}).get("usd")
-            sig["sol_usd"]     = d.get("solana",{}).get("usd")
-            sig["xrp_usd"]     = d.get("ripple",{}).get("usd")
-            sig["usdt_ngn_cg"] = d.get("tether",{}).get("ngn")
+            sig["btc_usd"] = d.get("bitcoin",{}).get("usd")
+            sig["btc_24h"] = d.get("bitcoin",{}).get("usd_24h_change")
+            sig["eth_usd"] = d.get("ethereum",{}).get("usd")
+            sig["eth_24h"] = d.get("ethereum",{}).get("usd_24h_change")
             sig["sources"].append("CoinGecko")
             crypto_ok = True
         else:
-            sig["errors"].append(f"CoinGecko HTTP {r.status_code}: {r.text[:120]}")
-            sig["coingecko_raw"] = f"HTTP {r.status_code} | {r.text[:300]}"
+            sig["errors"].append(f"CoinGecko HTTP {r.status_code}")
     except Exception as e:
-        sig["errors"].append(f"CoinGecko: {type(e).__name__}: {str(e)[:120]}")
-
-    # Fallback: Binance public API (no CORS issues, reliable from cloud servers)
+        sig["errors"].append(f"CoinGecko: {str(e)[:100]}")
     if not crypto_ok:
         try:
-            btc_r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT", timeout=8, headers=_BROWSER_HEADERS)
-            eth_r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDT", timeout=8, headers=_BROWSER_HEADERS)
-            if btc_r.status_code == 200:
-                bd = btc_r.json()
-                sig["btc_usd"] = float(bd.get("lastPrice", 0))
-                sig["btc_24h"] = float(bd.get("priceChangePercent", 0))
-            if eth_r.status_code == 200:
-                ed = eth_r.json()
-                sig["eth_usd"] = float(ed.get("lastPrice", 0))
-                sig["eth_24h"] = float(ed.get("priceChangePercent", 0))
-            if btc_r.status_code == 200 or eth_r.status_code == 200:
-                sig["sources"].append("Binance ticker (CoinGecko fallback)")
-                crypto_ok = True
-        except Exception as e:
-            sig["errors"].append(f"Binance fallback: {type(e).__name__}: {str(e)[:100]}")
+            br = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT",
+                              timeout=8, headers=_BH)
+            if br.status_code == 200:
+                bd = br.json()
+                sig["btc_usd"] = float(bd.get("lastPrice",0))
+                sig["btc_24h"] = float(bd.get("priceChangePercent",0))
+                sig["sources"].append("Binance BTC fallback")
+        except: pass
 
-    # 2. FX RATES — primary: open.er-api.com, fallback: frankfurter.app (ECB data, no auth, cloud-friendly)
-    fx_ok = False
-    def _apply_fx_rates(rates, sig):
+    # 2. FX rates
+    def _apply_fx(rates, sig):
         sig["usd_ngn_official"] = rates.get("NGN")
         sig["usd_eur"]  = rates.get("EUR")
         sig["usd_gbp"]  = rates.get("GBP")
         sig["usd_zar"]  = rates.get("ZAR")
-        sig["usd_kes"]  = rates.get("KES")
         sig["usd_ghs"]  = rates.get("GHS")
-        sig["usd_jpy"]  = rates.get("JPY")
-        sig["usd_cny"]  = rates.get("CNY")
-        sig["eurusd"]   = round(1 / rates["EUR"], 5) if rates.get("EUR") else None
-        sig["dxy_proxy"]= round(rates["EUR"] * 100, 3) if rates.get("EUR") else None
-    try:
-        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=8, headers=_BROWSER_HEADERS)
-        if r.status_code == 200:
-            _apply_fx_rates(r.json().get("rates", {}), sig)
-            sig["sources"].append("ExchangeRate-API")
-            fx_ok = True
-        else:
-            sig["errors"].append(f"ExchangeRate-API HTTP {r.status_code}")
-    except Exception as e:
-        sig["errors"].append(f"FX API: {type(e).__name__}: {str(e)[:120]}")
-    if not fx_ok:
+        sig["eurusd"]   = round(1/rates["EUR"],5) if rates.get("EUR") else None
+        sig["dxy_proxy"]= round(rates["EUR"]*100,3) if rates.get("EUR") else None
+
+    fx_ok = False
+    for fx_url in ["https://open.er-api.com/v6/latest/USD",
+                   "https://api.frankfurter.app/latest?from=USD"]:
         try:
-            # frankfurter.app — ECB-sourced, open, no API key, very reliable
-            r2 = requests.get("https://api.frankfurter.app/latest?from=USD", timeout=8, headers=_BROWSER_HEADERS)
-            if r2.status_code == 200:
-                _apply_fx_rates(r2.json().get("rates", {}), sig)
-                sig["sources"].append("Frankfurter FX (ECB fallback)")
+            r = requests.get(fx_url, timeout=8, headers=_BH)
+            if r.status_code == 200:
+                _apply_fx(r.json().get("rates",{}), sig)
+                sig["sources"].append("ExchangeRate-API")
                 fx_ok = True
-        except Exception as e2:
-            sig["errors"].append(f"Frankfurter FX fallback: {type(e2).__name__}: {str(e2)[:100]}")
+                break
+        except Exception as e:
+            sig["errors"].append(f"FX ({fx_url[:30]}): {str(e)[:80]}")
 
-    # 3. FEAR & GREED
+    # 3. Fear & Greed
     try:
-        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8, headers=_BROWSER_HEADERS)
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8, headers=_BH)
         if r.status_code == 200:
-            fng = r.json().get("data", [{}])[0]
-            sig["fear_greed_value"] = int(fng.get("value", 50))
-            sig["fear_greed_label"] = fng.get("value_classification", "N/A")
+            fng = r.json().get("data",[{}])[0]
+            sig["fear_greed_value"] = int(fng.get("value",50))
+            sig["fear_greed_label"] = fng.get("value_classification","N/A")
             sig["sources"].append("Fear&Greed Index")
-    except Exception as e:
-        sig["errors"].append(f"Fear&Greed: {type(e).__name__}: {str(e)[:120]}")
-
-    # 4. OIL HEADLINE
-    try:
-        r = requests.get(
-            "https://news.google.com/rss/search?q=Brent+crude+oil+price+today&hl=en-US&gl=US&ceid=US:en",
-            timeout=7, headers={"User-Agent": "Mozilla/5.0"}
-        )
-        if r.status_code == 200:
-            titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", r.text)
-            sig["oil_headline"] = titles[1] if len(titles) > 1 else None
     except: pass
 
-    # 5. GLOBAL NEWS (18 RSS feeds)
-    # Note: Google News RSS works 24/7 including weekends.
-    # If scores show 0, it means the RSS returned results but Gemini analysis
-    # failed to parse JSON, OR the RSS format changed (CDATA vs plain tags).
+    # 4. News headlines (18 RSS topics)
     rss_topics = [
-        ("Nigeria naira exchange rate",        "🇳🇬 NGN"),
-        ("CBN central bank Nigeria forex",     "🏦 CBN"),
-        ("crude oil price Brent OPEC today",   "🛢️ Oil"),
-        ("Iran oil sanctions",                 "⚠️ Iran"),
-        ("US Federal Reserve interest rates",  "🇺🇸 Fed"),
-        ("Bitcoin crypto market today",        "₿ BTC"),
-        ("Nigeria economy inflation 2025",     "📉 NG Macro"),
-        ("Middle East conflict oil supply",    "🌍 MidEast"),
-        ("dollar index DXY strength",          "💵 DXY"),
-        ("OPEC production output cut",         "🛢️ OPEC"),
-        ("Russia Ukraine war commodity",       "⚡ Russia"),
-        ("Nigeria crypto P2P USDT",            "💱 NG Crypto"),
-        ("emerging markets currency selloff",  "📊 EM FX"),
-        ("US inflation CPI report",            "📈 US CPI"),
-        ("IMF World Bank Nigeria",             "🏛️ IMF/WB"),
-        ("China economy trade slowdown",       "🇨🇳 China"),
-        ("Nigeria remittance diaspora",        "💸 Remittance"),
-        ("gold price safe haven",              "🥇 Gold"),
+        ("Nigeria naira exchange rate CBN","🇳🇬 NGN"),
+        ("CBN central bank Nigeria forex","🏦 CBN"),
+        ("crude oil price Brent OPEC today","🛢️ Oil"),
+        ("Iran oil sanctions","⚠️ Iran"),
+        ("US Federal Reserve interest rates","🇺🇸 Fed"),
+        ("Bitcoin crypto market today","₿ BTC"),
+        ("Nigeria economy inflation 2025","📉 NG Macro"),
+        ("Middle East conflict oil supply","🌍 MidEast"),
+        ("dollar index DXY strength","💵 DXY"),
+        ("OPEC production output cut","🛢️ OPEC"),
+        ("Russia Ukraine war commodity","⚡ Russia"),
+        ("Nigeria crypto USDT","💱 NG Crypto"),
+        ("emerging markets currency selloff","📊 EM FX"),
+        ("US inflation CPI report","📈 US CPI"),
+        ("IMF World Bank Nigeria","🏛️ IMF/WB"),
+        ("China economy trade slowdown","🇨🇳 China"),
+        ("Nigeria remittance diaspora","💸 Remittance"),
+        ("gold price safe haven","🥇 Gold"),
     ]
 
     def _parse_rss_titles(xml_text):
-        """Multi-pattern RSS parser. Google News changed from CDATA to plain tags."""
-        # Pattern 1: CDATA (old format)
-        titles = re.findall(r"<title><![CDATA[(.*?)]]></title>", xml_text, re.DOTALL)
+        titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", xml_text, re.DOTALL)
         if titles:
             return [t.strip() for t in titles[1:] if t.strip()]
-        # Pattern 2: Plain tags (current format)
         titles = re.findall(r"<title>(.*?)</title>", xml_text, re.DOTALL)
         cleaned = []
         for t in titles[1:]:
-            t = re.sub(r"<[^>]+>", "", t).strip()
+            t = re.sub(r"<[^>]+>","",t).strip()
             t = (t.replace("&amp;","&").replace("&lt;","<").replace("&gt;",">")
-                  .replace("&#39;","'").replace("&quot;",'"').replace("&nbsp;"," "))
+                  .replace("&#39;","'").replace("&quot;",'"'))
             if t and len(t) > 8:
                 cleaned.append(t)
         return cleaned
 
-    def _parse_rss_descs(xml_text):
-        descs = re.findall(r"<description><![CDATA[(.*?)]]></description>", xml_text, re.DOTALL)
-        if not descs:
-            descs = re.findall(r"<description>(.*?)</description>", xml_text, re.DOTALL)
-        return [re.sub(r"<[^>]+>", "", d).strip()[:150] for d in descs]
-
     headlines_raw = []
     rss_errors    = []
     rss_ok_count  = 0
-    rss_first_response_snippet = None   # stored for diagnostics
+    rss_first_snippet = None
+
     for query, tag in rss_topics:
         try:
             encoded = requests.utils.quote(query)
             url = f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
             r = requests.get(url, timeout=8, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "application/rss+xml, application/xml, text/xml, */*",
-                "Accept-Language": "en-US,en;q=0.9",
-            })
-            # Store first raw response for diagnostics (detects CAPTCHA/redirect pages)
-            if rss_first_response_snippet is None:
-                rss_first_response_snippet = f"HTTP {r.status_code} | Content-Type: {r.headers.get('Content-Type','?')} | Body[0:200]: {r.text[:200]}"
+                "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept":"application/rss+xml, application/xml, text/xml, */*"})
+            if rss_first_snippet is None:
+                rss_first_snippet = f"HTTP {r.status_code} | {r.headers.get('Content-Type','?')} | {r.text[:200]}"
             if r.status_code == 200:
                 titles = _parse_rss_titles(r.text)
-                descs  = _parse_rss_descs(r.text)
-                added  = 0
-                for i, title in enumerate(titles[:3]):
-                    desc = descs[i] if i < len(descs) else ""
-                    headlines_raw.append({
-                        "tag":   tag,
-                        "title": title,
-                        "desc":  desc,
-                        "full":  f"{tag} | {title}",
-                    })
+                added = 0
+                for title in titles[:2]:
+                    headlines_raw.append({"tag":tag,"title":title,"full":f"{tag} | {title}"})
                     added += 1
-                    if added >= 2:
-                        break
-                if added > 0:
-                    rss_ok_count += 1
-                else:
-                    rss_errors.append(f"{tag}: got 200 but 0 titles parsed (may be Cloudflare CAPTCHA page)")
+                if added > 0: rss_ok_count += 1
+                else: rss_errors.append(f"{tag}: 200 but 0 titles parsed")
             else:
                 rss_errors.append(f"{tag}: HTTP {r.status_code}")
         except Exception as e:
-            rss_errors.append(f"{tag}: {type(e).__name__}: {str(e)[:120]}")
+            rss_errors.append(f"{tag}: {str(e)[:80]}")
 
-    sig["rss_ok_count"] = rss_ok_count
-    sig["rss_errors"]   = rss_errors
-    sig["rss_first_response"] = rss_first_response_snippet
+    sig["rss_ok_count"]      = rss_ok_count
+    sig["rss_errors"]        = rss_errors
+    sig["rss_first_response"]= rss_first_snippet
 
-    # GNews API — primary paid supplement (always active when key is present)
-    gnews_count = 0
     if GNEWS_KEY:
         gnews_queries = [
-            ("Nigeria naira exchange rate",     "🇳🇬 GNews"),
-            ("CBN central bank forex Nigeria",  "🏦 GNews"),
-            ("Nigeria economy inflation",        "📉 GNews"),
-            ("crude oil price OPEC Brent",      "🛢️ GNews"),
-            ("Bitcoin crypto market",           "₿ GNews"),
-            ("US Federal Reserve dollar",       "🇺🇸 GNews"),
-            ("Nigeria USDT P2P crypto",         "💱 GNews"),
-            ("emerging markets currency",       "📊 GNews"),
+            ("Nigeria naira CBN exchange rate","🇳🇬 GNews"),
+            ("Nigeria economy CBN policy","🏦 GNews"),
+            ("crude oil price OPEC Brent","🛢️ GNews"),
+            ("US Federal Reserve dollar","🇺🇸 GNews"),
+            ("emerging markets currency","📊 GNews"),
         ]
+        gnews_count = 0
         for q, tag in gnews_queries:
             try:
-                r = requests.get(
-                    "https://gnews.io/api/v4/search",
-                    params={
-                        "q":        q,
-                        "lang":     "en",
-                        "max":      3,
-                        "sortby":   "publishedAt",
-                        "apikey":   GNEWS_KEY,
-                    },
-                    timeout=8,
-                    headers={"User-Agent": "Mozilla/5.0"}
-                )
+                r = requests.get("https://gnews.io/api/v4/search",
+                    params={"q":q,"lang":"en","max":3,"sortby":"publishedAt","apikey":GNEWS_KEY},
+                    timeout=8, headers={"User-Agent":"Mozilla/5.0"})
                 if r.status_code == 200:
-                    for a in r.json().get("articles", [])[:2]:
+                    for a in r.json().get("articles",[])[:2]:
                         t = (a.get("title") or "").strip()
-                        d = (a.get("description") or "")[:150].strip()
-                        if t and len(t) > 8:
-                            headlines_raw.append({
-                                "tag":  tag,
-                                "title": t,
-                                "desc":  d,
-                                "full":  f"{tag} | {t}",
-                            })
+                        if t and len(t)>8:
+                            headlines_raw.append({"tag":tag,"title":t,"full":f"{tag} | {t}"})
                             gnews_count += 1
-                elif r.status_code == 429:
-                    sig["errors"].append("GNews: rate limit hit (100 req/day free tier)")
+                elif r.status_code in (429,403,401):
+                    sig["errors"].append(f"GNews {r.status_code}")
                     break
-                elif r.status_code == 403:
-                    sig["errors"].append(f"GNews 403: invalid key or quota exceeded. Response: {r.text[:100]}")
-                    break
-                elif r.status_code == 401:
-                    sig["errors"].append(f"GNews 401: unauthorized. Check GNEWS_KEY in secrets.toml")
-                    break
-                else:
-                    sig["errors"].append(f"GNews HTTP {r.status_code}: {r.text[:100]}")
-            except Exception as e:
-                sig["errors"].append(f"GNews '{q[:20]}': {type(e).__name__}: {str(e)[:120]}")
+            except: pass
         if gnews_count > 0:
-            sig["sources"].append(f"GNews API ({gnews_count} headlines)")
-        else:
-            sig["errors"].append(f"GNews: 0 headlines returned across all queries. Key={GNEWS_KEY[:8]}...")
-    sig["gnews_count"] = gnews_count
+            sig["sources"].append(f"GNews ({gnews_count} headlines)")
+        sig["gnews_count"] = gnews_count
 
-    # NewsAPI — optional secondary supplement
     if NEWS_KEY:
-        for q in ["Nigeria naira USDT", "oil price Iran", "CBN forex", "Nigeria economy"]:
+        for q in ["Nigeria naira CBN","oil price Iran","Nigeria economy"]:
             try:
                 r = requests.get(
                     f"https://newsapi.org/v2/everything?q={requests.utils.quote(q)}"
-                    f"&sortBy=publishedAt&pageSize=3&language=en&apiKey={NEWS_KEY}",
-                    timeout=7
-                )
+                    f"&sortBy=publishedAt&pageSize=3&language=en&apiKey={NEWS_KEY}", timeout=7)
                 if r.status_code == 200:
-                    for a in r.json().get("articles", [])[:2]:
-                        t = a.get("title", "")
-                        d = (a.get("description") or "")[:120]
-                        if t:
-                            headlines_raw.append({"tag": "📰 NewsAPI", "title": t, "desc": d,
-                                                  "full": f"📰 NewsAPI | {t}"})
+                    for a in r.json().get("articles",[])[:2]:
+                        t = a.get("title","")
+                        if t: headlines_raw.append({"tag":"📰 NewsAPI","title":t,"full":f"📰 NewsAPI | {t}"})
             except: pass
 
     sig["headlines"]      = headlines_raw
     sig["headline_count"] = len(headlines_raw)
-    rss_src = f"Google News RSS ({rss_ok_count}/{len(rss_topics)} feeds)"
     if headlines_raw:
-        sig["sources"].append(rss_src)
+        sig["sources"].append(f"Google News RSS ({rss_ok_count}/{len(rss_topics)} feeds)")
 
-    # 6. GEMINI ENHANCED PASS (only if live market data was fetched)
-    # If the early Gemini pass (Step 0) already succeeded AND we have live market data,
-    # run a richer pass that incorporates BTC prices, FX rates, and any headlines.
-    # If no market data was fetched, skip — Step 0 result is already in sig["analysis"].
-    has_market_data = bool(sig.get("btc_usd") or sig.get("usd_ngn_official"))
-    has_headlines   = bool(headlines_raw)
-    already_scored  = bool(sig.get("analysis"))
+    # Step 6: Gemini enhanced pass with live market data + headlines
+    has_market = bool(sig.get("btc_usd") or sig.get("usd_ngn_official"))
+    has_hl     = bool(headlines_raw)
+    already    = bool(sig.get("analysis"))
 
-    if has_market_data or has_headlines:
-        now_str  = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M WAT")
-        btc_str  = f"${sig.get('btc_usd',0):,.0f} ({sig.get('btc_24h',0):+.1f}%)" if sig.get("btc_usd") else "N/A"
-        fng_str  = f"{sig.get('fear_greed_value','?')} — {sig.get('fear_greed_label','N/A')}"
-        headlines_block = "\n".join(f"  {i+1}. {h['full']}" for i, h in enumerate(headlines_raw[:40]))
+    if has_market or has_hl:
+        now_str2  = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M WAT")
+        btc_str   = f"${sig.get('btc_usd',0):,.0f} ({sig.get('btc_24h',0):+.1f}%)" if sig.get("btc_usd") else "N/A"
+        fng_str   = f"{sig.get('fear_greed_value','?')} — {sig.get('fear_greed_label','N/A')}"
+        hl_block  = "\n".join(f"  {i+1}. {h['full']}" for i,h in enumerate(headlines_raw[:35]))
+        enhanced  = f"""You are a senior FX strategist. Today: {now_str2}
+Score USD/NGN OFFICIAL CBN rate. Positive = NGN weakens.
 
-        enhanced_prompt = f"""You are a senior FX strategist. Today: {now_str}
-Score USDT/NGN P2P market. Positive = USDT rises / NGN weakens.
-
-LIVE MARKET DATA:
-- BTC: {btc_str} | ETH: ${sig.get('eth_usd',0):,.0f} ({sig.get('eth_24h',0):+.1f}%)
-- Fear & Greed: {fng_str} | EUR/USD: {sig.get('eurusd','N/A')} | DXY: {sig.get('dxy_proxy','N/A')}
-- USD/NGN Official: {sig.get('usd_ngn_official','N/A')} | USD/ZAR: {sig.get('usd_zar','N/A')}
+LIVE DATA:
+- BTC: {btc_str} | F&G: {fng_str}
+- EUR/USD: {sig.get('eurusd','N/A')} | USD/NGN Official: {sig.get('usd_ngn_official','N/A')}
 
 HEADLINES ({len(headlines_raw)}):
-{headlines_block if has_headlines else "(none — use your knowledge)"}
+{hl_block if has_hl else "(none)"}
 
-Return ONLY valid JSON. No markdown. No backticks. Start immediately with {{"overall_score":
-The JSON must have ALL these fields with REAL non-zero integer scores:
-overall_score, nigeria_macro, cbn_policy, oil_impact, usd_fed_impact, crypto_sentiment,
-geopolitical_risk, political_risk_nigeria, remittance_flow, global_em_risk (all integers -100 to 100),
-market_mood (RISK_ON/RISK_OFF/NEUTRAL), top_mover_today (string), breaking_event (string or null),
-oil_analysis (2 sentences), geopolitical_analysis (2 sentences), cbn_analysis (2 sentences),
-crypto_analysis (1 sentence), em_analysis (1 sentence),
-top_bullish_catalyst (string), top_bearish_catalyst (string),
-overall_qualitative_direction (BULLISH_USDT/BEARISH_USDT/NEUTRAL),
-qualitative_confidence (0-100 integer), 30min_bias (BUY/SELL/HOLD),
-key_watch_items (array of 3 strings), medium_term_outlook (3 sentences), 
-long_term_outlook (2 sentences), structural_ngn_risks (array of 3 strings).
+Return ONLY valid JSON. Start with {{"overall_score":
+ALL fields required: overall_score, nigeria_macro, cbn_policy, oil_impact, usd_fed_impact,
+crypto_sentiment, geopolitical_risk, political_risk_nigeria, remittance_flow, global_em_risk
+(integers -100 to 100), market_mood, top_mover_today, breaking_event,
+oil_analysis, geopolitical_analysis, cbn_analysis, crypto_analysis, em_analysis,
+top_bullish_catalyst, top_bearish_catalyst, overall_qualitative_direction,
+qualitative_confidence, 30min_bias, key_watch_items (array 3),
+medium_term_outlook, long_term_outlook, structural_ngn_risks (array 3).
 START NOW with {{"""
-
         try:
-            raw_q = gemini(enhanced_prompt,
-                "Quantitative FX strategist. Return ONLY valid JSON. Start with {.",
-                temperature=0.3, max_tokens=1800)
+            raw_q = gemini(enhanced,
+                "FX strategist. Return ONLY valid JSON. Start with {.", temperature=0.3, max_tokens=1800)
             sig["gemini_raw_response"] = raw_q[:600]
-            if raw_q.startswith("❌"):
-                sig["errors"].append(f"Gemini enhanced: API error: {raw_q[:150]}")
-            else:
+            if not raw_q.startswith("❌"):
                 parsed = _parse_json(raw_q)
                 if parsed and "overall_score" in parsed:
-                    sig["analysis"] = parsed   # overwrite early pass with richer version
+                    sig["analysis"] = parsed
                     sig["sources"].append("Gemini AI (enhanced with live data)")
-                elif already_scored:
-                    sig["errors"].append(f"Gemini enhanced: bad parse, keeping Step 0 result. Raw: {raw_q[:100]}")
+                elif already:
+                    sig["errors"].append("Gemini enhanced: bad parse, keeping Step 0 result.")
                 else:
                     sig["errors"].append(f"Gemini enhanced: empty parse. Raw: {raw_q[:150]}")
+            else:
+                sig["errors"].append(f"Gemini enhanced error: {raw_q[:100]}")
         except Exception as e:
-            if not already_scored:
-                sig["gemini_raw_error"] = f"{type(e).__name__}: {str(e)}"
-            sig["errors"].append(f"Gemini enhanced: {type(e).__name__}: {str(e)[:150]}")
+            sig["errors"].append(f"Gemini enhanced: {str(e)[:150]}")
 
-    # Always return sig regardless of what succeeded or failed
     return sig
 
 
@@ -1060,34 +665,214 @@ def maybe_refresh_signals(force: bool = False):
             st.session_state.global_signals      = sig
             st.session_state.global_signals_time = datetime.datetime.now()
         except Exception as e:
-            # Store the crash so diagnostics can show it
-            crash_sig = st.session_state.global_signals or {}
-            if isinstance(crash_sig, dict):
-                crash_sig["errors"] = crash_sig.get("errors", []) + [
-                    f"fetch_global_signals CRASHED: {type(e).__name__}: {str(e)[:200]}"
-                ]
-                st.session_state.global_signals = crash_sig
-            else:
-                st.session_state.global_signals = {
-                    "errors": [f"fetch_global_signals CRASHED: {type(e).__name__}: {str(e)[:200]}"],
-                    "sources": [], "analysis": {}
-                }
+            crash = st.session_state.global_signals or {}
+            if isinstance(crash, dict):
+                crash["errors"] = crash.get("errors",[]) + [f"CRASHED: {str(e)[:200]}"]
+                st.session_state.global_signals = crash
 
 
 # ══════════════════════════════════════════════════════
-# FEATURE ENGINEERING
+# CBN OFFICIAL RATE FETCHER
+# ══════════════════════════════════════════════════════
+def fetch_cbn_rate() -> dict:
+    """
+    Fetch the CBN official USD/NGN exchange rate.
+    Primary sources: open.er-api.com, frankfurter.app, exchangerate-api.com
+    These pull from IMF/central bank data and update once per business day.
+    P2P rate is also fetched as a supplementary signal/feature — never as primary.
+    Returns: {cbn_rate, source, status, eur, gbp, zar, ghs, eurusd, dxy_proxy,
+              p2p_mid (optional), btc_24h (optional), eth_24h (optional)}
+    """
+    result = {
+        "cbn_rate": None, "source": "unknown", "status": "fetching",
+        "eur": None, "gbp": None, "zar": None, "ghs": None,
+        "eurusd": None, "dxy_proxy": None, "p2p_mid": None,
+        "btc_24h": None, "eth_24h": None,
+    }
+
+    # Primary: free FX APIs that source from CBN/IMF
+    for url in [
+        "https://open.er-api.com/v6/latest/USD",
+        "https://api.frankfurter.app/latest?from=USD",
+        "https://api.exchangerate-api.com/v4/latest/USD",
+    ]:
+        try:
+            r = requests.get(url, timeout=10, headers=_BH)
+            if r.status_code == 200:
+                rates = r.json().get("rates", {})
+                ngn   = rates.get("NGN")
+                if ngn and float(ngn) > 100:
+                    result["cbn_rate"]  = float(ngn)
+                    result["source"]    = f"ExchangeRate-API ({url.split('/')[2]})"
+                    result["status"]    = "live"
+                    result["eur"]       = rates.get("EUR")
+                    result["gbp"]       = rates.get("GBP")
+                    result["zar"]       = rates.get("ZAR")
+                    result["ghs"]       = rates.get("GHS")
+                    if rates.get("EUR"):
+                        result["eurusd"]    = round(1/rates["EUR"], 5)
+                        result["dxy_proxy"] = round(rates["EUR"]*100, 3)
+                    break
+        except: continue
+
+    # Fallback: CoinGecko USDT/NGN — rough proxy (parallel rate, warn user)
+    if result["cbn_rate"] is None:
+        try:
+            r = requests.get(
+                "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=ngn",
+                timeout=10, headers=_BH)
+            if r.status_code == 200:
+                ngn_val = r.json().get("tether",{}).get("ngn")
+                if ngn_val and float(ngn_val) > 100:
+                    result["cbn_rate"] = float(ngn_val)
+                    result["source"]   = "CoinGecko USDT/NGN ⚠️ proxy (not official CBN)"
+                    result["status"]   = "proxy"
+        except: pass
+
+    # Hard fallback
+    if result["cbn_rate"] is None:
+        result["cbn_rate"] = 1580.0
+        result["source"]   = "⚠️ Fallback estimate (all APIs failed)"
+        result["status"]   = "estimated"
+
+    # Crypto 24h changes (used as ML features)
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price"
+            "?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true",
+            timeout=10, headers=_BH)
+        if r.status_code == 200:
+            d = r.json()
+            result["btc_24h"] = d.get("bitcoin",{}).get("usd_24h_change")
+            result["eth_24h"] = d.get("ethereum",{}).get("usd_24h_change")
+    except: pass
+
+    # P2P rate as secondary signal feature (Binance P2P)
+    try:
+        r = requests.post(
+            "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+            json={"asset":"USDT","fiat":"NGN","merchantCheck":False,"page":1,
+                  "payTypes":[],"publisherType":None,"rows":10,"tradeType":"BUY"},
+            headers={"Content-Type":"application/json","User-Agent":"Mozilla/5.0"},
+            timeout=15)
+        if r.status_code == 200:
+            prices = [float(item["adv"]["price"])
+                      for item in r.json().get("data",[])
+                      if float(item.get("adv",{}).get("price",0)) > 100]
+            if prices:
+                result["p2p_mid"] = round(sum(prices)/len(prices), 2)
+    except: pass
+
+    return result
+
+
+# ══════════════════════════════════════════════════════
+# WALK-FORWARD BACKTEST ENGINE
+# ══════════════════════════════════════════════════════
+def resolve_pending_prediction(actual_cbn_rate: float):
+    """
+    Called at the START of every analysis run.
+    Compares the prediction stored last run against today's real CBN rate.
+    Appends a validated row to backtest_log and clears pending_pred.
+    This is the ONLY source of confidence numbers shown to users.
+    """
+    pending = st.session_state.pending_pred
+    if pending is None:
+        return
+    pred      = pending.get("ensemble")
+    prev_rate = pending.get("prev_rate")
+    ts        = pending.get("timestamp")
+    if pred is None:
+        st.session_state.pending_pred = None
+        return
+
+    error_abs = abs(actual_cbn_rate - pred)
+    error_pct = error_abs / max(actual_cbn_rate, 1) * 100
+
+    direction_correct = None
+    if prev_rate:
+        actual_moved_up = actual_cbn_rate > prev_rate
+        pred_moved_up   = pred > prev_rate
+        direction_correct = (actual_moved_up == pred_moved_up)
+
+    st.session_state.backtest_log.append({
+        "timestamp":         ts,
+        "predicted":         round(pred, 2),
+        "actual":            round(actual_cbn_rate, 2),
+        "error_abs":         round(error_abs, 2),
+        "error_pct":         round(error_pct, 4),
+        "direction_correct": direction_correct,
+    })
+    _save_backtest()
+    st.session_state.pending_pred = None
+
+
+def compute_backtest_stats() -> dict:
+    """
+    Compute genuine out-of-sample accuracy from the walk-forward log.
+    Returns ready=False until we have at least 2 validated pairs.
+    Confidence is derived from real MAPE — NOT from in-sample cross-validation.
+    """
+    log = st.session_state.backtest_log
+    n   = len(log)
+
+    if n < 2:
+        return {
+            "n": n, "mae": None, "mape": None, "dir_accuracy": None,
+            "conf_from_bt": None, "ready": False,
+            "message": (
+                f"Need at least 2 resolved predictions ({n} so far). "
+                "Run the analysis on two separate occasions to build real backtest data."
+            ),
+        }
+
+    errors_abs = [r["error_abs"] for r in log]
+    errors_pct = [r["error_pct"] for r in log]
+    dir_log    = [r for r in log if r.get("direction_correct") is not None]
+
+    mae  = round(float(np.mean(errors_abs)), 2)
+    mape = round(float(np.mean(errors_pct)), 4)
+    dir_acc = (
+        round(sum(1 for r in dir_log if r["direction_correct"]) / len(dir_log) * 100, 1)
+        if dir_log else None
+    )
+
+    # Derive confidence from real MAPE:
+    # MAPE ≤ 0.1%  → 85%  confidence (tight)
+    # MAPE ≥ 2.0%  → 25%  confidence (loose)
+    # Linear interpolation in between
+    if mape <= 0.10:
+        conf = 85
+    elif mape >= 2.0:
+        conf = 25
+    else:
+        conf = int(85 - (mape - 0.10) / (2.0 - 0.10) * 60)
+
+    return {
+        "n": n, "mae": mae, "mape": mape,
+        "dir_accuracy": dir_acc, "conf_from_bt": conf, "ready": True,
+        "message": f"Based on {n} real walk-forward observations.",
+    }
+
+
+# ══════════════════════════════════════════════════════
+# FEATURE ENGINEERING  (CBN rate as primary signal)
 # ══════════════════════════════════════════════════════
 FEATURE_COLS = [
-    "p2p_spread_abs", "p2p_spread_pct", "p2p_buy_std", "p2p_sell_std",
-    "premium_pct", "premium_abs", "official_rate",
-    "btc_24h_change", "eth_24h_change", "usdt_ngn_cg",
-    "chainlink_change", "uniswap_change",
-    "eurusd", "dxy_proxy", "usd_zar", "usd_kes", "usd_ghs",
+    # P2P premium as a spread / black-market pressure signal
+    "p2p_premium_pct",
+    # Crypto
+    "btc_24h_change", "eth_24h_change",
+    # FX
+    "eurusd", "dxy_proxy", "usd_zar", "usd_ghs",
+    # Temporal
     "hour_sin", "hour_cos", "dow_sin", "dow_cos", "month_sin", "month_cos",
     "is_weekend", "is_business",
+    # Qualitative Gemini scores (10 dimensions)
     "news_overall", "news_nigeria", "news_cbn", "news_oil", "news_usd",
     "news_crypto", "news_geopolitics", "news_political_risk",
     "news_remittance", "news_em_risk",
+    # Historical momentum (computed on CBN rate history)
     "momentum_1", "momentum_avg", "volatility", "trend_slope", "trend_accel",
     "rate_ma5_dev",
 ]
@@ -1095,153 +880,42 @@ FEATURE_COLS = [
 def features_to_vector(feat: dict) -> np.ndarray:
     return np.array([float(feat.get(c, 0.0)) for c in FEATURE_COLS], dtype=float)
 
+
 def collect_features() -> tuple:
+    """
+    Fetch the CBN official rate (primary) + all auxiliary features.
+    Returns (raw_dict, features_dict).
+    """
     feat = {}
     raw  = {}
-    raw["rate_source"] = "unknown"
-    raw["rate_status"] = "fetching"
 
-    # P2P RATES
-    try:
-        headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "Accept": "application/json, */*", "Accept-Language": "en-US,en;q=0.9"}
-        for side, key in [("BUY", "p2p_buy"), ("SELL", "p2p_sell")]:
-            payload = {"asset": "USDT", "fiat": "NGN", "merchantCheck": False,
-                       "page": 1, "payTypes": [], "publisherType": None, "rows": 10, "tradeType": side}
-            r = requests.post("https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
-                              json=payload, headers=headers, timeout=15)
-            if r.status_code == 200:
-                prices = [float(item["adv"]["price"]) for item in r.json().get("data", [])
-                          if float(item.get("adv", {}).get("price", 0)) > 100]
-                if prices:
-                    raw[key] = round(sum(prices) / len(prices), 2)
-                    if side == "BUY":
-                        feat["p2p_buy_min"] = min(prices)
-                        feat["p2p_buy_max"] = max(prices)
-                        feat["p2p_buy_std"] = float(np.std(prices))
-                    else:
-                        feat["p2p_sell_min"] = min(prices)
-                        feat["p2p_sell_max"] = max(prices)
-                        feat["p2p_sell_std"] = float(np.std(prices))
-        if raw.get("p2p_buy") or raw.get("p2p_sell"):
-            raw["rate_source"] = "Binance P2P"
-            raw["rate_status"] = "live"
-    except Exception as e:
-        raw["binance_error"] = str(e)[:100]
+    # ── CBN Official Rate ──
+    rate_data = fetch_cbn_rate()
+    cbn_rate  = rate_data["cbn_rate"]
+    raw.update(rate_data)
+    raw["cbn_rate"] = cbn_rate
 
-    if not (raw.get("p2p_buy") and raw.get("p2p_sell")):
-        try:
-            r = requests.get(
-                "https://api2.bybit.com/fiat/otc/item/list?userId=&tokenId=USDT&currencyId=NGN"
-                "&payment=&side=1&size=10&page=1&amount=&authMaker=false&canTrade=false",
-headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "Accept": "application/json, */*", "Accept-Language": "en-US,en;q=0.9"}, timeout=12
-            )
-            if r.status_code == 200:
-                prices = [float(i.get("price", 0)) for i in r.json().get("result", {}).get("items", [])
-                          if float(i.get("price", 0)) > 100]
-                if prices:
-                    avg = round(sum(prices) / len(prices), 2)
-                    if not raw.get("p2p_buy"):  raw["p2p_buy"]  = avg
-                    if not raw.get("p2p_sell"): raw["p2p_sell"] = round(avg * 0.998, 2)
-                    feat["p2p_buy_std"]  = float(np.std(prices)) if len(prices) > 1 else 0.0
-                    feat["p2p_sell_std"] = 0.0
-                    raw["rate_source"] = "Bybit P2P"
-                    raw["rate_status"] = "live"
-        except: pass
-
-    if not raw.get("p2p_buy"):
-        try:
-            r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=ngn",
-                             timeout=10, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "Accept": "application/json, */*", "Accept-Language": "en-US,en;q=0.9"})
-            if r.status_code == 200:
-                ngn_val = r.json().get("tether", {}).get("ngn")
-                if ngn_val and float(ngn_val) > 100:
-                    raw["p2p_buy"]  = float(ngn_val)
-                    raw["p2p_sell"] = round(float(ngn_val) * 0.997, 2)
-                    feat["p2p_buy_std"] = feat["p2p_sell_std"] = 0.0
-                    raw["rate_source"] = "CoinGecko"
-                    raw["rate_status"] = "live"
-        except: pass
-
-    if not raw.get("p2p_buy"):
-        raw["p2p_buy"]   = 1620.0
-        raw["p2p_sell"]  = 1615.0
-        raw["rate_source"] = "⚠️ Fallback estimate"
-        raw["rate_status"] = "estimated"
-        feat["p2p_buy_std"] = feat["p2p_sell_std"] = 0.0
-
-    if raw.get("p2p_buy") and raw.get("p2p_sell"):
-        raw["p2p_mid"]    = round((raw["p2p_buy"] + raw["p2p_sell"]) / 2, 2)
-        raw["p2p_spread"] = round(raw["p2p_buy"] - raw["p2p_sell"], 2)
-        feat["p2p_spread_abs"] = raw["p2p_spread"]
-        feat["p2p_spread_pct"] = round(raw["p2p_spread"] / max(raw["p2p_sell"], 1) * 100, 4)
+    # P2P premium as a spread-pressure feature (positive = parallel > official)
+    if raw.get("p2p_mid") and cbn_rate:
+        feat["p2p_premium_pct"] = round((raw["p2p_mid"] - cbn_rate) / cbn_rate * 100, 4)
     else:
-        raw["p2p_mid"] = raw.get("p2p_buy", 1620.0)
-        raw["p2p_spread"] = 0.0
-        feat["p2p_spread_abs"] = feat["p2p_spread_pct"] = 0.0
+        feat["p2p_premium_pct"] = 0.0
 
-    # OFFICIAL RATE
-    official = None
-    for url in ["https://open.er-api.com/v6/latest/USD", "https://api.exchangerate-api.com/v4/latest/USD"]:
-        try:
-            r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"})
-            if r.status_code == 200:
-                rates_obj = r.json().get("rates", {})
-                ngn = rates_obj.get("NGN")
-                if ngn:
-                    official = float(ngn)
-                    for ccy in ["EUR", "GBP", "ZAR", "KES", "GHS", "EGP", "XOF"]:
-                        v = rates_obj.get(ccy)
-                        if v: feat[f"usd_{ccy.lower()}"] = float(v)
-                    break
-        except: pass
-    raw["official"] = official
-    if official and raw.get("p2p_mid"):
-        raw["premium_pct"] = round((raw["p2p_mid"] - official) / official * 100, 4)
-        feat["official_rate"] = official
-        feat["premium_pct"]   = raw["premium_pct"]
-        feat["premium_abs"]   = round(raw["p2p_mid"] - official, 2)
+    # ── FX Features ──
+    if raw.get("eur"):
+        feat["eurusd"]    = round(1 / raw["eur"], 6)
+        feat["dxy_proxy"] = round(raw["eur"] * 100, 4)
+    if raw.get("zar"):  feat["usd_zar"] = float(raw["zar"])
+    if raw.get("ghs"):  feat["usd_ghs"] = float(raw["ghs"])
 
-    # CRYPTO FEATURES
-    try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price"
-            "?ids=bitcoin,ethereum,tether&vs_currencies=usd,ngn&include_24hr_change=true",
-            timeout=12, headers={"User-Agent": "Mozilla/5.0"}
-        )
-        if r.status_code == 200:
-            d = r.json()
-            feat["btc_24h_change"] = d.get("bitcoin", {}).get("usd_24h_change", np.nan)
-            feat["eth_24h_change"] = d.get("ethereum", {}).get("usd_24h_change", np.nan)
-            feat["usdt_ngn_cg"]    = d.get("tether", {}).get("ngn", np.nan)
-            raw["btc_change"]      = feat["btc_24h_change"]
-    except: pass
+    # ── Crypto Features ──
+    feat["btc_24h_change"] = raw.get("btc_24h") or 0.0
+    feat["eth_24h_change"] = raw.get("eth_24h") or 0.0
 
-    try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price"
-            "?ids=chainlink,uniswap&vs_currencies=usd&include_24hr_change=true",
-            timeout=10, headers={"User-Agent": "Mozilla/5.0"}
-        )
-        if r.status_code == 200:
-            d = r.json()
-            feat["chainlink_change"] = d.get("chainlink", {}).get("usd_24h_change", np.nan)
-            feat["uniswap_change"]   = d.get("uniswap", {}).get("usd_24h_change", np.nan)
-    except: pass
-
-    # USD STRENGTH
-    eur = feat.get("usd_eur")
-    if eur:
-        feat["eurusd"]     = round(1 / eur, 6)
-        feat["dxy_proxy"]  = round(eur * 100, 4)
-        feat["usd_strong"] = 1 if feat["eurusd"] < 1.05 else 0
-
-    # TEMPORAL FEATURES
+    # ── Temporal Features ──
     now = datetime.datetime.now()
-    feat["hour"]        = now.hour
-    feat["dow"]         = now.weekday()
     feat["is_weekend"]  = int(now.weekday() >= 5)
     feat["is_business"] = int(8 <= now.hour <= 17 and now.weekday() < 5)
-    feat["month"]       = now.month
     feat["hour_sin"]    = float(np.sin(2 * np.pi * now.hour / 24))
     feat["hour_cos"]    = float(np.cos(2 * np.pi * now.hour / 24))
     feat["dow_sin"]     = float(np.sin(2 * np.pi * now.weekday() / 7))
@@ -1249,73 +923,59 @@ headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/53
     feat["month_sin"]   = float(np.sin(2 * np.pi * now.month / 12))
     feat["month_cos"]   = float(np.cos(2 * np.pi * now.month / 12))
 
-    # QUALITATIVE INTELLIGENCE
+    # ── Qualitative Intelligence ──
     cached_sig  = st.session_state.global_signals or {}
     cached_anal = cached_sig.get("analysis", {})
-    headlines_all = [h.get("full", "") for h in cached_sig.get("headlines", [])]
 
     if cached_anal and not _signals_stale():
-        feat["news_overall"]        = float(cached_anal.get("overall_score", 0))
-        feat["news_nigeria"]        = float(cached_anal.get("nigeria_macro", 0))
-        feat["news_cbn"]            = float(cached_anal.get("cbn_policy", 0))
-        feat["news_oil"]            = float(cached_anal.get("oil_impact", 0))
-        feat["news_usd"]            = float(cached_anal.get("usd_fed_impact", 0))
-        feat["news_crypto"]         = float(cached_anal.get("crypto_sentiment", 0))
-        feat["news_geopolitics"]    = float(cached_anal.get("geopolitical_risk", 0))
-        feat["news_political_risk"] = float(cached_anal.get("political_risk_nigeria", 0))
-        feat["news_remittance"]     = float(cached_anal.get("remittance_flow", 0))
-        feat["news_em_risk"]        = float(cached_anal.get("global_em_risk", 0))
-        raw["news_intel"]           = cached_anal
-        raw["news_headlines"]       = headlines_all[:40]
-        raw["news_headlines_count"] = len(headlines_all)
+        anal = cached_anal
     else:
         maybe_refresh_signals(force=True)
-        fresh_sig  = st.session_state.global_signals or {}
-        fresh_anal = fresh_sig.get("analysis", {})
-        fresh_hl   = [h.get("full", "") for h in fresh_sig.get("headlines", [])]
-        if fresh_anal:
-            feat["news_overall"]        = float(fresh_anal.get("overall_score", 0))
-            feat["news_nigeria"]        = float(fresh_anal.get("nigeria_macro", 0))
-            feat["news_cbn"]            = float(fresh_anal.get("cbn_policy", 0))
-            feat["news_oil"]            = float(fresh_anal.get("oil_impact", 0))
-            feat["news_usd"]            = float(fresh_anal.get("usd_fed_impact", 0))
-            feat["news_crypto"]         = float(fresh_anal.get("crypto_sentiment", 0))
-            feat["news_geopolitics"]    = float(fresh_anal.get("geopolitical_risk", 0))
-            feat["news_political_risk"] = float(fresh_anal.get("political_risk_nigeria", 0))
-            feat["news_remittance"]     = float(fresh_anal.get("remittance_flow", 0))
-            feat["news_em_risk"]        = float(fresh_anal.get("global_em_risk", 0))
-            raw["news_intel"]           = fresh_anal
-            raw["news_headlines"]       = fresh_hl[:40]
-            raw["news_headlines_count"] = len(fresh_hl)
-        else:
-            for k in ["news_overall","news_nigeria","news_cbn","news_oil","news_usd",
-                      "news_crypto","news_geopolitics","news_political_risk","news_remittance","news_em_risk"]:
-                feat[k] = 0.0
-            raw["news_intel"] = {}
-            raw["news_headlines"] = []
-            raw["news_headlines_count"] = 0
+        anal = (st.session_state.global_signals or {}).get("analysis", {})
 
-    # HISTORICAL MOMENTUM
+    if anal:
+        feat["news_overall"]        = float(anal.get("overall_score", 0))
+        feat["news_nigeria"]        = float(anal.get("nigeria_macro", 0))
+        feat["news_cbn"]            = float(anal.get("cbn_policy", 0))
+        feat["news_oil"]            = float(anal.get("oil_impact", 0))
+        feat["news_usd"]            = float(anal.get("usd_fed_impact", 0))
+        feat["news_crypto"]         = float(anal.get("crypto_sentiment", 0))
+        feat["news_geopolitics"]    = float(anal.get("geopolitical_risk", 0))
+        feat["news_political_risk"] = float(anal.get("political_risk_nigeria", 0))
+        feat["news_remittance"]     = float(anal.get("remittance_flow", 0))
+        feat["news_em_risk"]        = float(anal.get("global_em_risk", 0))
+        raw["news_intel"]           = anal
+        raw["news_headlines"]       = [h.get("full","") for h in cached_sig.get("headlines",[])[:40]]
+        raw["news_headlines_count"] = len(raw["news_headlines"])
+    else:
+        for k in ["news_overall","news_nigeria","news_cbn","news_oil","news_usd",
+                  "news_crypto","news_geopolitics","news_political_risk","news_remittance","news_em_risk"]:
+            feat[k] = 0.0
+        raw["news_intel"]           = {}
+        raw["news_headlines"]       = []
+        raw["news_headlines_count"] = 0
+
+    # ── Historical Momentum (on CBN rate) ──
     hist = st.session_state.rate_history
     if len(hist) >= 2:
-        recent_rates = [h["p2p_mid"] for h in hist[-10:] if h.get("p2p_mid")]
-        if len(recent_rates) >= 2:
-            feat["momentum_1"]   = recent_rates[-1] - recent_rates[-2]
-            feat["momentum_avg"] = recent_rates[-1] - np.mean(recent_rates[:-1])
-            feat["volatility"]   = float(np.std(recent_rates))
-            x = np.arange(len(recent_rates))
-            slope = float(np.polyfit(x, recent_rates, 1)[0])
-            feat["trend_slope"]  = slope
-            feat["trend_accel"]  = feat["momentum_1"] - (recent_rates[-2] - recent_rates[-3]) if len(recent_rates) >= 3 else 0.0
-        if len(recent_rates) >= 5:
-            feat["rate_ma5"]     = float(np.mean(recent_rates[-5:]))
-            feat["rate_ma5_dev"] = recent_rates[-1] - feat["rate_ma5"]
+        recent = [h["cbn_rate"] for h in hist[-10:] if h.get("cbn_rate")]
+        if len(recent) >= 2:
+            feat["momentum_1"]   = recent[-1] - recent[-2]
+            feat["momentum_avg"] = recent[-1] - float(np.mean(recent[:-1]))
+            feat["volatility"]   = float(np.std(recent))
+            x = np.arange(len(recent))
+            feat["trend_slope"]  = float(np.polyfit(x, recent, 1)[0])
+            feat["trend_accel"]  = (feat["momentum_1"] - (recent[-2] - recent[-3])
+                                    if len(recent) >= 3 else 0.0)
+        if len(recent) >= 5:
+            feat["rate_ma5_dev"] = recent[-1] - float(np.mean(recent[-5:]))
     else:
-        for k in ["momentum_1","momentum_avg","volatility","trend_slope","trend_accel"]:
+        for k in ["momentum_1","momentum_avg","volatility","trend_slope","trend_accel","rate_ma5_dev"]:
             feat[k] = 0.0
 
+    # Sanitise NaN / Inf
     for k, v in feat.items():
-        if isinstance(v, float) and np.isnan(v):
+        if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
             feat[k] = 0.0
 
     raw["timestamp"] = datetime.datetime.now().isoformat()
@@ -1332,124 +992,133 @@ def build_training_data() -> tuple:
         return None, None, None
     X_rows, y_vals, times = [], [], []
     for i in range(len(hist) - 1):
-        feat = hist[i].get("features", {})
-        next_rate = hist[i + 1].get("p2p_mid")
+        feat      = hist[i].get("features", {})
+        next_rate = hist[i+1].get("cbn_rate")   # ← predict next CBN rate
         if next_rate and feat:
             X_rows.append(features_to_vector(feat))
             y_vals.append(float(next_rate))
-            times.append(hist[i].get("timestamp", ""))
+            times.append(hist[i].get("timestamp",""))
     if len(X_rows) < 4:
         return None, None, None
     return np.array(X_rows), np.array(y_vals), times
 
-def train_and_predict(current_feat: dict, current_rate: float) -> dict:
+
+def train_and_predict(current_feat: dict, cbn_rate: float) -> dict:
+    """
+    Train ensemble on historical CBN rates and return next-observation prediction.
+    Confidence is NEVER fabricated — it is either:
+      (a) None  → not yet validated (fewer than 2 walk-forward pairs)
+      (b) int   → derived from real walk-forward MAPE
+    """
     X, y, times = build_training_data()
-    cold_start = (X is None)
+    cold_start  = (X is None)
+    bt_stats    = compute_backtest_stats()
 
     if cold_start:
-        score = 0.0
-        score += current_feat.get("btc_24h_change", 0) * 0.3
+        # Simple heuristic — directional nudge only, no confidence claimed
+        score  = 0.0
+        score += feat.get("btc_24h_change", 0) * 0.3 if (feat := current_feat) else 0
         score += -current_feat.get("dxy_proxy", 0) * 0.01
         score += current_feat.get("news_overall", 0) * 0.5
-        score += -current_feat.get("premium_pct", 0) * 0.2
         score += current_feat.get("momentum_1", 0) * 0.8
-        direction_factor = 1 + score / 5000.0
-        est = round(current_rate * direction_factor, 2)
+        est = round(cbn_rate * (1 + score / 5000.0), 2)
         return {
             "cold_start": True,
             "n_training_points": 0,
             "ridge_pred": est, "rf_pred": est, "gb_pred": est, "ensemble": est,
-            "pred_low": round(current_rate * 0.992, 2),
-            "pred_high": round(current_rate * 1.008, 2),
-            "confidence": 35, "direction": "BULLISH" if est > current_rate else "BEARISH" if est < current_rate else "NEUTRAL",
+            "pred_low":   round(cbn_rate * 0.992, 2),
+            "pred_high":  round(cbn_rate * 1.008, 2),
+            "confidence":        None,   # ← intentionally None
+            "confidence_source": "cold start — no history yet",
+            "direction": "BULLISH" if est > cbn_rate else "BEARISH" if est < cbn_rate else "NEUTRAL",
             "model_agreement": 100.0,
-            "ridge_cv_mae": None, "rf_cv_mae": None, "gb_cv_mae": None,
             "rf_feature_importance": {},
-            "note": "COLD START — fewer than 5 data points. Confidence capped at 35%.",
+            "backtest": bt_stats,
+            "note": "COLD START — fewer than 5 data points. Run analysis daily to build history.",
         }
 
     scaler   = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     x_pred   = scaler.transform(features_to_vector(current_feat).reshape(1, -1))
+    cv_k     = min(5, len(X_scaled))
 
     # Ridge
     ridge = Ridge(alpha=10.0)
     ridge.fit(X_scaled, y)
-    ridge_pred = float(ridge.predict(x_pred)[0])
-    ridge_cv_mae = None
-    if len(X_scaled) >= 5:
-        cv = cross_val_score(ridge, X_scaled, y, cv=min(5, len(X_scaled)), scoring="neg_mean_absolute_error")
-        ridge_cv_mae = float(-cv.mean())
+    ridge_pred    = float(ridge.predict(x_pred)[0])
+    ridge_cv_mae  = float(-cross_val_score(ridge, X_scaled, y, cv=cv_k,
+                          scoring="neg_mean_absolute_error").mean()) if len(X_scaled) >= 5 else None
 
     # Random Forest
-    rf = RandomForestRegressor(n_estimators=200, max_depth=6, min_samples_leaf=2, random_state=42, n_jobs=-1)
+    rf = RandomForestRegressor(n_estimators=200, max_depth=6, min_samples_leaf=2,
+                                random_state=42, n_jobs=-1)
     rf.fit(X_scaled, y)
-    rf_pred = float(rf.predict(x_pred)[0])
-    rf_cv_mae = None
-    if len(X_scaled) >= 5:
-        cv = cross_val_score(rf, X_scaled, y, cv=min(5, len(X_scaled)), scoring="neg_mean_absolute_error")
-        rf_cv_mae = float(-cv.mean())
-    imp = dict(zip(FEATURE_COLS, rf.feature_importances_))
-    top_features = dict(sorted(imp.items(), key=lambda x: x[1], reverse=True)[:10])
+    rf_pred    = float(rf.predict(x_pred)[0])
+    rf_cv_mae  = float(-cross_val_score(rf, X_scaled, y, cv=cv_k,
+                       scoring="neg_mean_absolute_error").mean()) if len(X_scaled) >= 5 else None
+    top_features = dict(sorted(
+        dict(zip(FEATURE_COLS, rf.feature_importances_)).items(),
+        key=lambda x: x[1], reverse=True)[:10])
 
     # Gradient Boosting
-    gb = GradientBoostingRegressor(n_estimators=150, learning_rate=0.08, max_depth=4, subsample=0.8, random_state=42)
+    gb = GradientBoostingRegressor(n_estimators=150, learning_rate=0.08,
+                                    max_depth=4, subsample=0.8, random_state=42)
     gb.fit(X_scaled, y)
-    gb_pred = float(gb.predict(x_pred)[0])
-    gb_cv_mae = None
-    if len(X_scaled) >= 5:
-        cv = cross_val_score(gb, X_scaled, y, cv=min(5, len(X_scaled)), scoring="neg_mean_absolute_error")
-        gb_cv_mae = float(-cv.mean())
+    gb_pred    = float(gb.predict(x_pred)[0])
+    gb_cv_mae  = float(-cross_val_score(gb, X_scaled, y, cv=cv_k,
+                       scoring="neg_mean_absolute_error").mean()) if len(X_scaled) >= 5 else None
 
     # Ensemble
-    weights  = np.array([0.25, 0.35, 0.40])
     preds    = np.array([ridge_pred, rf_pred, gb_pred])
-    ensemble = float(np.dot(weights, preds))
+    ensemble = float(np.dot([0.25, 0.35, 0.40], preds))
+    pred_std = float(np.std(preds))
+    agreement_score = max(0.0, 1.0 - pred_std / max(abs(float(np.mean(preds))), 1)) * 100
 
-    # Confidence
-    pred_std      = float(np.std(preds))
-    pred_mean     = float(np.mean(preds))
-    agreement_score = max(0.0, 1.0 - (pred_std / max(pred_mean, 1.0))) * 100
-    maes = [m for m in [ridge_cv_mae, rf_cv_mae, gb_cv_mae] if m is not None]
-    mae_conf = max(0.0, min(100.0, 100.0 - (np.mean(maes) / max(current_rate, 1.0) * 100 * 5))) if maes else 50.0
-    n = len(X_scaled)
-    size_bonus = min(20.0, n * 0.4)
-    raw_conf   = agreement_score * 0.45 + mae_conf * 0.40 + size_bonus * 0.15
-    confidence = int(min(92, max(30, round(raw_conf))))
+    # ── CONFIDENCE: walk-forward validated ONLY ──
+    if bt_stats["ready"]:
+        # Decay confidence with mape
+        conf      = bt_stats["conf_from_bt"]
+        conf_src  = f"walk-forward backtest ({bt_stats['n']} real observations, MAPE={bt_stats['mape']}%)"
+    else:
+        conf      = None   # Do NOT invent a number
+        conf_src  = bt_stats["message"]
 
     # Prediction interval
-    vol = current_feat.get("volatility", current_rate * 0.003)
-    half_range = max(pred_std * 2, vol * 1.5, current_rate * 0.003)
+    vol        = current_feat.get("volatility", cbn_rate * 0.003) or cbn_rate * 0.003
+    half_range = max(pred_std * 2, vol * 1.5, cbn_rate * 0.003)
     pred_low   = round(ensemble - half_range, 2)
     pred_high  = round(ensemble + half_range, 2)
 
-    direction = ("BULLISH" if ensemble > current_rate * 1.0005
-                 else "BEARISH" if ensemble < current_rate * 0.9995
+    direction = ("BULLISH" if ensemble > cbn_rate * 1.0005
+                 else "BEARISH" if ensemble < cbn_rate * 0.9995
                  else "NEUTRAL")
 
-    y_in_sample = [float(gb.predict(X_scaled[i:i+1])[0]) for i in range(len(X_scaled))]
-    r2 = float(r2_score(y, y_in_sample)) if len(y) > 1 else None
+    y_hat = [float(gb.predict(X_scaled[i:i+1])[0]) for i in range(len(X_scaled))]
+    r2    = float(r2_score(y, y_hat)) if len(y) > 1 else None
 
-    metrics = {
-        "n_training_points": n,
+    st.session_state.ml_metrics = {
+        "n_training_points": len(X_scaled),
         "ridge_cv_mae": ridge_cv_mae, "rf_cv_mae": rf_cv_mae, "gb_cv_mae": gb_cv_mae,
-        "r2_in_sample": r2, "pred_std": pred_std,
-        "agreement_score": agreement_score, "mae_conf": mae_conf, "size_bonus": size_bonus,
+        "r2_in_sample": r2, "pred_std": pred_std, "agreement_score": agreement_score,
         "rf_feature_importance": top_features,
     }
-    st.session_state.ml_metrics = metrics
 
     return {
         "cold_start": False,
-        "n_training_points": n,
-        "ridge_pred": round(ridge_pred, 2), "rf_pred": round(rf_pred, 2),
-        "gb_pred": round(gb_pred, 2), "ensemble": round(ensemble, 2),
-        "pred_low": pred_low, "pred_high": pred_high,
-        "confidence": confidence, "direction": direction,
-        "model_agreement": round(agreement_score, 1),
+        "n_training_points": len(X_scaled),
+        "ridge_pred": round(ridge_pred, 2),
+        "rf_pred":    round(rf_pred, 2),
+        "gb_pred":    round(gb_pred, 2),
+        "ensemble":   round(ensemble, 2),
+        "pred_low":   pred_low, "pred_high": pred_high,
+        "confidence":        conf,
+        "confidence_source": conf_src,
+        "direction":         direction,
+        "model_agreement":   round(agreement_score, 1),
         "ridge_cv_mae": ridge_cv_mae, "rf_cv_mae": rf_cv_mae, "gb_cv_mae": gb_cv_mae,
         "r2_in_sample": r2, "rf_feature_importance": top_features,
-        "note": f"Ensemble of Ridge + RF + GradientBoosting trained on {n} observations.",
+        "backtest": bt_stats,
+        "note": f"Ensemble trained on {len(X_scaled)} CBN-rate observations.",
     }
 
 
@@ -1457,253 +1126,211 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
 # MULTI-TIMEFRAME FORECASTING ENGINE
 # ══════════════════════════════════════════════════════
 TIMEFRAMES = [
-    {"label": "24H",   "hours": 24,    "key": "24h"},
-    {"label": "7 DAY", "hours": 168,   "key": "7d"},
-    {"label": "30 DAY","hours": 720,   "key": "30d"},
-    {"label": "3 MO",  "hours": 2160,  "key": "3m"},
-    {"label": "6 MO",  "hours": 4320,  "key": "6m"},
-    {"label": "12 MO", "hours": 8760,  "key": "12m"},
-    {"label": "2 YR",  "hours": 17520, "key": "2yr"},
+    {"label":"24H",    "hours":24,    "key":"24h"},
+    {"label":"7 DAY",  "hours":168,   "key":"7d"},
+    {"label":"30 DAY", "hours":720,   "key":"30d"},
+    {"label":"3 MO",   "hours":2160,  "key":"3m"},
+    {"label":"6 MO",   "hours":4320,  "key":"6m"},
+    {"label":"12 MO",  "hours":8760,  "key":"12m"},
+    {"label":"2 YR",   "hours":17520, "key":"2yr"},
 ]
 
-def build_multi_timeframe_forecast(current_rate: float, ml: dict, feat: dict, raw: dict) -> dict:
-    """
-    Generate statistically-grounded multi-timeframe predictions.
-    Uses:
-    1. ML ensemble directional bias as the near-term anchor
-    2. Qualitative macro score for medium-term direction
-    3. Historical volatility scaling for uncertainty bounds
-    4. Confidence decays with √time (statistical law)
-    5. Structural NGN bias toward depreciation over long-term
-    """
-    ensemble      = ml.get("ensemble", current_rate)
-    base_conf     = ml.get("confidence", 35)
-    direction     = ml.get("direction", "NEUTRAL")
-    vol           = feat.get("volatility", current_rate * 0.005) or current_rate * 0.005
-    news_score    = feat.get("news_overall", 0)
-    premium_pct   = feat.get("premium_pct", 5)
-    trend_slope   = feat.get("trend_slope", 0)
-    btc_change    = feat.get("btc_24h_change", 0) or 0
-    oil_impact    = feat.get("news_oil", 0) or 0
-    cbn_score     = feat.get("news_cbn", 0) or 0
-    em_risk       = feat.get("news_em_risk", 0) or 0
+def build_multi_timeframe_forecast(cbn_rate: float, ml: dict, feat: dict) -> dict:
+    ensemble   = ml.get("ensemble", cbn_rate)
+    vol        = feat.get("volatility", cbn_rate*0.005) or cbn_rate*0.005
+    news_score = feat.get("news_overall", 0)
+    cbn_score  = feat.get("news_cbn", 0) or 0
+    oil_impact = feat.get("news_oil", 0) or 0
+    em_risk    = feat.get("news_em_risk", 0) or 0
+    trend_slope= feat.get("trend_slope", 0)
+    step_24h   = ensemble - cbn_rate
 
-    # 24h: tight ML-anchored prediction
-    step_24h = (ensemble - current_rate)
+    annual_depr = 0.08
+    if abs(news_score) > 30:
+        annual_depr += news_score * 0.001
+    if cbn_score > 20:
+        annual_depr -= 0.02
+    annual_depr = max(0.02, min(0.25, annual_depr))
 
-    # Structural factors that compound over time
-    annual_depreciation_rate = 0.08   # Historical NGN long-term depreciation ~8-15%/yr
-    if abs(news_score) > 30:          # Strong qualitative signal
-        annual_depreciation_rate += news_score * 0.001
-    if premium_pct > 8:               # High black-market premium = structural pressure
-        annual_depreciation_rate += 0.02
-    if cbn_score > 20:                # CBN tightening bearish for parallel market
-        annual_depreciation_rate -= 0.02
-    annual_depreciation_rate = max(0.02, min(0.25, annual_depreciation_rate))
+    bt_stats = ml.get("backtest", {})
+    bt_ready = bt_stats.get("ready", False)
+    bt_conf  = bt_stats.get("conf_from_bt")  # None if not ready
 
     forecasts = {}
     for tf in TIMEFRAMES:
-        hours   = tf["hours"]
-        years   = hours / 8760.0
-        days    = hours / 24.0
+        hours = tf["hours"]
+        years = hours / 8760.0
+        days  = hours / 24.0
 
-        # Central estimate
         if hours <= 24:
-            # Near-term: ML-anchored
             central = ensemble
-            trend_contrib = step_24h
         elif hours <= 168:
-            # 7 days: blend ML direction with weekly trend
-            weekly_trend = trend_slope * days * 4   # extrapolate trend
-            central = current_rate + step_24h + weekly_trend
+            central = cbn_rate + step_24h + trend_slope * days * 4
         elif hours <= 720:
-            # 30 days: qualitative + trend
-            monthly_factor = (1 + annual_depreciation_rate) ** years
-            central = current_rate * monthly_factor
-            # Adjust for current news score
-            news_adj = (news_score / 100) * current_rate * 0.015
-            central += news_adj
+            central = cbn_rate * (1 + annual_depr) ** years
+            central += (news_score / 100) * cbn_rate * 0.015
         else:
-            # 3m, 6m, 12m, 2yr: fundamental macro model
-            # Compound the depreciation rate
-            factor = (1 + annual_depreciation_rate) ** years
-            central = current_rate * factor
-            # Oil impact diminishes over time
-            oil_adj = (oil_impact / 100) * current_rate * 0.02 * (1 / (1 + years))
-            # EM risk premium
-            em_adj  = (em_risk / 100) * current_rate * 0.03 * min(years, 1)
-            central += oil_adj + em_adj
+            central  = cbn_rate * (1 + annual_depr) ** years
+            central += (oil_impact / 100) * cbn_rate * 0.02 * (1 / (1 + years))
+            central += (em_risk / 100)    * cbn_rate * 0.03 * min(years, 1)
 
-        # Uncertainty range: volatility scales with √time
-        base_vol = max(vol, current_rate * 0.003)
-        vol_scale = base_vol * np.sqrt(days) * 0.4
-        # Add structural uncertainty for longer horizons
-        structural_uncertainty = current_rate * years * 0.04
-        half_range = vol_scale + structural_uncertainty
-        # Ensure minimum meaningful range
-        min_range = current_rate * 0.005 * np.sqrt(days)
-        half_range = max(half_range, min_range)
-
-        low    = round(central - half_range, 0)
-        high   = round(central + half_range, 0)
+        base_vol   = max(vol, cbn_rate * 0.003)
+        half_range = (base_vol * np.sqrt(days) * 0.4
+                      + cbn_rate * years * 0.04
+                      + cbn_rate * 0.005 * np.sqrt(days))
+        low     = round(central - half_range, 0)
+        high    = round(central + half_range, 0)
         central = round(central, 0)
 
-        # Confidence: decays with √time, anchored to base confidence
-        conf_decay = base_conf * (1 / (1 + np.sqrt(years) * 0.8))
-        # Floor: at 2yr, min confidence is 20 (non-trivial direction)
-        conf = int(max(20, min(base_conf, round(conf_decay))))
+        # Confidence ONLY from walk-forward backtest, decayed by horizon
+        if bt_ready and bt_conf is not None:
+            decayed = bt_conf * (1 / (1 + np.sqrt(years) * 0.8))
+            conf_num = int(max(15, min(bt_conf, round(decayed))))
+            conf_str = f"{conf_num}% (walk-forward validated)"
+        else:
+            conf_num = None
+            conf_str = "— (awaiting backtest data)"
 
-        pct_change = round((central - current_rate) / current_rate * 100, 1)
-        direction_label = "▲ HIGHER" if central > current_rate * 1.002 else "▼ LOWER" if central < current_rate * 0.998 else "◆ STABLE"
-
-        # Bull/base/bear scenarios
-        bull_case = round(low * 0.95, 0)    # NGN strengthens (USDT falls)
-        bear_case = round(high * 1.12, 0)   # NGN weakens more (USDT rises)
+        pct_change    = round((central - cbn_rate) / cbn_rate * 100, 1)
+        direction_lbl = ("▲ HIGHER" if central > cbn_rate*1.002
+                         else "▼ LOWER" if central < cbn_rate*0.998
+                         else "◆ STABLE")
 
         forecasts[tf["key"]] = {
-            "label":         tf["label"],
-            "hours":         hours,
-            "central":       central,
-            "low":           low,
-            "high":          high,
-            "bull_case":     bull_case,
-            "bear_case":     bear_case,
-            "pct_change":    pct_change,
-            "direction":     direction_label,
-            "confidence":    conf,
+            "label": tf["label"], "hours": hours,
+            "central": central, "low": low, "high": high,
+            "bull_case": round(low * 0.95, 0),
+            "bear_case": round(high * 1.12, 0),
+            "pct_change": pct_change,
+            "direction":  direction_lbl,
+            "confidence": conf_num,
+            "confidence_str": conf_str,
         }
-
     return forecasts
 
 
-def build_forecast_narratives(current_rate: float, forecasts: dict, ml: dict, feat: dict, raw: dict) -> dict:
-    """Ask Gemini to generate qualitative narratives for each timeframe."""
+def build_forecast_narratives(cbn_rate: float, forecasts: dict,
+                               ml: dict, feat: dict, raw: dict) -> dict:
     q_intel = raw.get("news_intel", {})
-    sig = st.session_state.global_signals or {}
-    anal = sig.get("analysis", {})
+    sig     = st.session_state.global_signals or {}
+    anal    = sig.get("analysis", {})
+    bt      = ml.get("backtest", {})
+    bt_note = (
+        f"Walk-forward backtest: {bt.get('n',0)} obs · MAE=₦{bt.get('mae','N/A')} · "
+        f"MAPE={bt.get('mape','N/A')}% · Direction accuracy={bt.get('dir_accuracy','N/A')}%."
+        if bt.get("ready") else
+        f"Backtest not yet ready: {bt.get('message','run analysis on multiple days.')}"
+    )
 
-    f24  = forecasts.get("24h", {})
-    f7d  = forecasts.get("7d", {})
-    f30d = forecasts.get("30d", {})
-    f3m  = forecasts.get("3m", {})
-    f6m  = forecasts.get("6m", {})
-    f12m = forecasts.get("12m", {})
-    f2yr = forecasts.get("2yr", {})
+    tf_lines = "\n".join(
+        f"- {forecasts.get(k,{}).get('label','')}: ₦{forecasts.get(k,{}).get('central',0):,.0f} "
+        f"({forecasts.get(k,{}).get('pct_change',0):+.1f}%) Conf: {forecasts.get(k,{}).get('confidence_str','—')}"
+        for k in ["24h","7d","30d","3m","6m","12m","2yr"]
+    )
 
-    prompt = f"""You are Nigeria's premier FX strategist at a tier-1 investment bank.
-Provide sharp, specific multi-timeframe narratives for USDT/NGN predictions.
+    prompt = f"""You are Nigeria's premier FX strategist. Focus on the USD/NGN OFFICIAL CBN rate.
 
-CURRENT LIVE DATA:
-- P2P Mid Rate: ₦{current_rate:,.0f}
-- ML Prediction (24h): ₦{f24.get('central',0):,.0f} ({f24.get('pct_change',0):+.1f}%) — Range: ₦{f24.get('low',0):,.0f}–₦{f24.get('high',0):,.0f}
-- ML Confidence: {ml.get('confidence',0)}% | Model Agreement: {ml.get('model_agreement',0):.1f}%
+CURRENT DATA:
+- CBN Official Rate: ₦{cbn_rate:,.2f}
+- ML Ensemble (24h): ₦{ml.get('ensemble',0):,.0f}
 - Training Points: {ml.get('n_training_points',0)}
+- Backtest Status: {bt_note}
 
-ML FEATURE IMPORTANCES (top):
-{json.dumps(dict(list(ml.get('rf_feature_importance',{}).items())[:5]), indent=2)}
-
-QUALITATIVE MACRO SCORES (-100=NGN strengthens, +100=NGN weakens):
-- Overall: {feat.get('news_overall',0):+.0f}
-- Nigeria Macro: {feat.get('news_nigeria',0):+.0f}
-- CBN Policy: {feat.get('news_cbn',0):+.0f}
-- Oil Markets: {feat.get('news_oil',0):+.0f}
-- USD/Fed: {feat.get('news_usd',0):+.0f}
-- Geopolitics: {feat.get('news_geopolitics',0):+.0f}
-- EM Risk: {feat.get('news_em_risk',0):+.0f}
-
-KEY INTEL:
-- Oil: {q_intel.get('oil_analysis','N/A')}
-- CBN: {q_intel.get('cbn_analysis','N/A')}
-- Top Bull Catalyst: {q_intel.get('top_bullish_catalyst','N/A')}
-- Top Bear Catalyst: {q_intel.get('top_bearish_catalyst','N/A')}
-- Medium-term outlook: {anal.get('medium_term_outlook','N/A')}
-- Long-term outlook: {anal.get('long_term_outlook','N/A')}
-- Structural NGN risks: {anal.get('structural_ngn_risks',[])}
+QUALITATIVE SCORES (+ = NGN weakens):
+- Overall: {feat.get('news_overall',0):+.0f} | CBN Policy: {feat.get('news_cbn',0):+.0f}
+- Oil: {feat.get('news_oil',0):+.0f} | USD/Fed: {feat.get('news_usd',0):+.0f}
+- EM Risk: {feat.get('news_em_risk',0):+.0f} | Geopolitics: {feat.get('news_geopolitics',0):+.0f}
+CBN Analysis: {q_intel.get('cbn_analysis','N/A')}
+Oil Analysis: {q_intel.get('oil_analysis','N/A')}
+Medium-term: {anal.get('medium_term_outlook','N/A')}
+Long-term:   {anal.get('long_term_outlook','N/A')}
 
 STATISTICAL FORECASTS:
-- 24H:  ₦{f24.get('central',0):,.0f} ({f24.get('pct_change',0):+.1f}%) | Conf: {f24.get('confidence',0)}%
-- 7D:   ₦{f7d.get('central',0):,.0f} ({f7d.get('pct_change',0):+.1f}%) | Conf: {f7d.get('confidence',0)}%
-- 30D:  ₦{f30d.get('central',0):,.0f} ({f30d.get('pct_change',0):+.1f}%) | Conf: {f30d.get('confidence',0)}%
-- 3M:   ₦{f3m.get('central',0):,.0f} ({f3m.get('pct_change',0):+.1f}%) | Conf: {f3m.get('confidence',0)}%
-- 6M:   ₦{f6m.get('central',0):,.0f} ({f6m.get('pct_change',0):+.1f}%) | Conf: {f6m.get('confidence',0)}%
-- 12M:  ₦{f12m.get('central',0):,.0f} ({f12m.get('pct_change',0):+.1f}%) | Conf: {f12m.get('confidence',0)}%
-- 2YR:  ₦{f2yr.get('central',0):,.0f} ({f2yr.get('pct_change',0):+.1f}%) | Conf: {f2yr.get('confidence',0)}%
+{tf_lines}
 
-Return ONLY valid JSON (no markdown, no backticks):
+Return ONLY valid JSON (no markdown):
 {{
-  "exec_summary": "<4-5 sentence executive summary combining ML + qualitative signals. What does everything say about USDT/NGN right now?>",
-  "trade_recommendation": "<Specific, actionable trading recommendation with timing>",
-  "best_convert_time": "<Best time window for NGN→USDT or USDT→NGN conversion based on signals>",
-
-  "n24h_narrative": "<2 sentences: 24h outlook driven by specific signals>",
+  "exec_summary": "<4-5 sentences: CBN rate context, ML signal, key drivers>",
+  "trade_recommendation": "<Specific actionable recommendation for USD/NGN conversion>",
+  "best_convert_time": "<Best timing window based on signals>",
+  "n24h_narrative": "<2 sentences: 24h CBN rate outlook>",
   "n24h_drivers": ["<driver 1>", "<driver 2>"],
-  "n24h_risk": "<Main risk to this 24h forecast>",
-
-  "n7d_narrative": "<2 sentences: 7-day outlook — what events this week drive it?>",
+  "n24h_risk": "<Main risk to 24h forecast>",
+  "n7d_narrative": "<2 sentences: 7-day outlook>",
   "n7d_drivers": ["<driver 1>", "<driver 2>"],
-  "n7d_risk": "<Main risk to 7d forecast>",
-
-  "n30d_narrative": "<2 sentences: 30-day outlook — macro factors>",
-  "n30d_bull_scenario": "<NGN strengthens scenario — what would cause it?>",
-  "n30d_bear_scenario": "<NGN weakens scenario — what would cause it?>",
-
-  "n3m_narrative": "<2 sentences: 3-month outlook — policy, oil, elections, IMF>",
-  "n6m_narrative": "<2 sentences: 6-month view — Fed rates, Nigeria growth, OPEC>",
-  "n12m_narrative": "<2 sentences: 12-month view — structural CBN policy trajectory>",
-  "n2yr_narrative": "<2 sentences: 2-year view — Nigeria economic reform trajectory>",
-
-  "key_risks": ["<risk 1>", "<risk 2>", "<risk 3>", "<risk 4>"],
-  "key_upside_catalysts": ["<catalyst 1>", "<catalyst 2>", "<catalyst 3>"],
-  "cbn_watch": "<What to watch from CBN in coming weeks>",
-  "oil_impact_summary": "<How oil movements feed through to NGN over each timeframe>",
-
-  "data_quality_note": "<Brief honest assessment: cold start or trained? How many data points? What would improve predictions?>",
-  "disclaimer_note": "<Brief risk disclaimer for each timeframe horizon>"
+  "n7d_risk": "<Main risk>",
+  "n30d_narrative": "<2 sentences: 30-day macro outlook>",
+  "n30d_bull_scenario": "<What causes NGN to strengthen>",
+  "n30d_bear_scenario": "<What causes NGN to weaken further>",
+  "n3m_narrative": "<2 sentences>",
+  "n6m_narrative": "<2 sentences>",
+  "n12m_narrative": "<2 sentences: CBN structural trajectory>",
+  "n2yr_narrative": "<2 sentences: Nigeria reform trajectory>",
+  "key_risks": ["<risk 1>","<risk 2>","<risk 3>","<risk 4>"],
+  "key_upside_catalysts": ["<catalyst 1>","<catalyst 2>","<catalyst 3>"],
+  "cbn_watch": "<Key CBN signals to monitor>",
+  "oil_impact_summary": "<How oil feeds through to CBN rate>",
+  "data_quality_note": "<Honest assessment of model data quality and backtest status>",
+  "disclaimer_note": "<Risk disclaimer — note confidence is only shown when walk-forward validated>"
 }}"""
 
     try:
-        raw_out = gemini(prompt,
-            "You are Nigeria's most rigorous FX strategist. Be specific, cite real events, give real numbers. Return only valid JSON.")
+        raw_out = gemini(prompt, "Nigeria FX strategist. Return only valid JSON.")
         return _parse_json(raw_out)
-    except Exception as e:
+    except:
         return {
-            "exec_summary": "Analysis complete. Statistical models have generated forecasts across all timeframes. See individual timeframe cards for details.",
-            "trade_recommendation": "Based on current ML signals and qualitative factors — exercise caution and DYOR.",
-            "best_convert_time": "Monitor the next 24-48 hours for confirmation of direction.",
-            "n24h_narrative": f"ML models project ₦{forecasts.get('24h',{}).get('central',0):,.0f} within 24 hours.",
-            "n7d_narrative": f"7-day projection of ₦{forecasts.get('7d',{}).get('central',0):,.0f} based on current trend.",
-            "n30d_narrative": f"30-day target ₦{forecasts.get('30d',{}).get('central',0):,.0f} driven by macro fundamentals.",
-            "n3m_narrative": "3-month outlook subject to CBN policy, oil, and global EM conditions.",
-            "n6m_narrative": "6-month view reflects structural NGN depreciation pressures.",
-            "n12m_narrative": "12-month forecast reflects long-term trajectory of Nigeria FX reform.",
-            "n2yr_narrative": "2-year projection reflects fundamental macroeconomic trajectory.",
-            "key_risks": ["Policy surprise from CBN", "Global oil price shock", "USD strength surge", "Nigeria political risk"],
-            "key_upside_catalysts": ["Oil price rise", "CBN intervention", "Strong remittance inflows"],
-            "cbn_watch": "Monitor CBN FX intervention frequency and reserve levels.",
-            "oil_impact_summary": "Oil prices directly impact Nigeria FX earnings and NGN support.",
-            "data_quality_note": ("ML engine in cold start mode." if ml.get("cold_start") else f"ML engine trained on {ml.get('n_training_points',0)} observations."),
-            "disclaimer_note": "All forecasts carry uncertainty. Confidence degrades with horizon. Not financial advice."
+            "exec_summary": f"CBN rate at ₦{cbn_rate:,.0f}. ML ensemble on {ml.get('n_training_points',0)} observations.",
+            "trade_recommendation": "Confidence metrics not yet walk-forward validated. Exercise caution.",
+            "best_convert_time": "Monitor next 24-48 hours for direction confirmation.",
+            "n24h_narrative": f"ML projects ₦{ml.get('ensemble',0):,.0f} for next observation.",
+            "n7d_narrative": "7-day path driven by CBN policy and global USD dynamics.",
+            "n30d_narrative": "30-day view shaped by oil, CBN reserves, and EM risk appetite.",
+            "n3m_narrative": "3-month view depends on Fed rate trajectory and Nigeria fiscal position.",
+            "n6m_narrative": "6-month outlook reflects structural NGN depreciation pressures.",
+            "n12m_narrative": "12-month view tied to CBN reform execution and oil revenue.",
+            "n2yr_narrative": "2-year trajectory hinges on Nigeria economic reform credibility.",
+            "key_risks": ["CBN policy surprise","Oil price shock","USD strength","Nigeria political risk"],
+            "key_upside_catalysts": ["Oil price surge","CBN rate hike","Strong remittances"],
+            "cbn_watch": "Watch CBN MPC meetings, intervention volumes, and reserve levels.",
+            "oil_impact_summary": "Oil revenue underpins Nigeria FX earnings and NGN support.",
+            "data_quality_note": bt_note,
+            "disclaimer_note": "Confidence % not shown until walk-forward backtest has ≥2 validated predictions."
         }
 
 
+# ══════════════════════════════════════════════════════
+# MAIN ANALYSIS ORCHESTRATOR
+# ══════════════════════════════════════════════════════
 def run_full_analysis() -> dict:
-    raw, feat = collect_features()
-    p2p_mid = raw.get("p2p_mid") or raw.get("p2p_buy") or 1620.0
-    raw["p2p_mid"] = p2p_mid
+    raw, feat    = collect_features()
+    cbn_rate     = raw.get("cbn_rate", 1580.0)
+    raw["cbn_rate"] = cbn_rate
 
+    # Step 1: Resolve previous prediction against today's actual CBN rate
+    resolve_pending_prediction(cbn_rate)
+
+    # Step 2: Store this observation in history
     st.session_state.rate_history.append({
-        "timestamp": raw.get("timestamp"),
-        "p2p_mid":   p2p_mid,
-        "p2p_buy":   raw.get("p2p_buy"),
-        "p2p_sell":  raw.get("p2p_sell"),
-        "official":  raw.get("official"),
-        "features":  feat,
+        "timestamp":   raw.get("timestamp"),
+        "cbn_rate":    cbn_rate,
+        "p2p_mid":     raw.get("p2p_mid"),   # retained as supplementary signal
+        "rate_source": raw.get("source", ""),
+        "rate_status": raw.get("status", ""),
+        "features":    feat,
     })
     _save_history()
 
-    ml = train_and_predict(feat, p2p_mid)
-    forecasts = build_multi_timeframe_forecast(p2p_mid, ml, feat, raw)
-    narratives = build_forecast_narratives(p2p_mid, forecasts, ml, feat, raw)
+    # Step 3: Train ML and predict
+    ml        = train_and_predict(feat, cbn_rate)
+    forecasts = build_multi_timeframe_forecast(cbn_rate, ml, feat)
+    narratives= build_forecast_narratives(cbn_rate, forecasts, ml, feat, raw)
+
+    # Step 4: Store this prediction as pending — resolved on the NEXT run
+    st.session_state.pending_pred = {
+        "ensemble":  ml.get("ensemble"),
+        "timestamp": raw.get("timestamp"),
+        "prev_rate": cbn_rate,
+    }
 
     return {
         "success": True, "raw": raw, "features": feat,
@@ -1717,46 +1344,46 @@ def run_full_analysis() -> dict:
 # CHAT ENGINE
 # ══════════════════════════════════════════════════════
 def chat_response(msg: str, result: dict) -> str:
-    ml = result.get("ml", {})
-    raw = result.get("raw", {})
-    feat = result.get("features", {})
-    forecasts = result.get("forecasts", {})
+    ml         = result.get("ml", {})
+    raw        = result.get("raw", {})
+    feat       = result.get("features", {})
+    forecasts  = result.get("forecasts", {})
     narratives = result.get("narratives", {})
+    bt         = ml.get("backtest", {})
 
-    ctx = f"""USDT/NGN ORACLE — FULL CONTEXT:
-Current P2P Rate: ₦{raw.get("p2p_mid", 0):,.2f}
-ML Ensemble: ₦{ml.get("ensemble", 0):,.2f} | Direction: {ml.get("direction","N/A")} | Confidence: {ml.get("confidence",0)}%
-Training Points: {ml.get("n_training_points",0)} | Cold Start: {ml.get("cold_start",True)}
+    ctx = f"""USD/NGN ORACLE — CBN OFFICIAL RATE CONTEXT
+CBN Rate: ₦{raw.get('cbn_rate',0):,.2f} | Source: {raw.get('source','')}
+P2P (supplementary signal): ₦{raw.get('p2p_mid','N/A')}
+ML Ensemble (24h): ₦{ml.get('ensemble',0):,.2f} | Direction: {ml.get('direction','N/A')}
+Confidence: {ml.get('confidence','Not yet validated')} — {ml.get('confidence_source','')}
+Training Points: {ml.get('n_training_points',0)} | Cold Start: {ml.get('cold_start',True)}
 
-MULTI-TIMEFRAME FORECASTS:
-{json.dumps({k: {
-    "central": v.get("central"), "low": v.get("low"), "high": v.get("high"),
-    "pct_change": v.get("pct_change"), "confidence": v.get("confidence")
-} for k, v in forecasts.items()}, indent=2)}
+WALK-FORWARD BACKTEST:
+- Observations: {bt.get('n',0)}
+- Real MAE: ₦{bt.get('mae','N/A')}
+- Real MAPE: {bt.get('mape','N/A')}%
+- Direction Accuracy: {bt.get('dir_accuracy','N/A')}%
+- Status: {bt.get('message','')}
 
-KEY NARRATIVES:
-- Executive Summary: {narratives.get("exec_summary","N/A")}
-- 24H: {narratives.get("n24h_narrative","N/A")}
-- 7D: {narratives.get("n7d_narrative","N/A")}
-- 30D: {narratives.get("n30d_narrative","N/A")}
-- Trade Rec: {narratives.get("trade_recommendation","N/A")}
-- Key Risks: {narratives.get("key_risks",[])}
+FORECASTS:
+{json.dumps({k:{
+    "central":v.get("central"),"low":v.get("low"),"high":v.get("high"),
+    "pct_change":v.get("pct_change"),"confidence":v.get("confidence_str")
+} for k,v in forecasts.items()}, indent=2)}
 
-QUALITATIVE SCORES:
-- Overall: {feat.get("news_overall",0):+.0f} | Nigeria: {feat.get("news_nigeria",0):+.0f} | CBN: {feat.get("news_cbn",0):+.0f}
-- Oil: {feat.get("news_oil",0):+.0f} | USD/Fed: {feat.get("news_usd",0):+.0f} | Geopolitics: {feat.get("news_geopolitics",0):+.0f}
-- Breaking: {raw.get("news_intel",{}).get("breaking_event","None")}
+EXECUTIVE SUMMARY: {narratives.get('exec_summary','N/A')}
+TRADE REC: {narratives.get('trade_recommendation','N/A')}
+KEY RISKS: {narratives.get('key_risks',[])}
 
-TOP ML FEATURES: {json.dumps(dict(list(ml.get("rf_feature_importance",{}).items())[:5]))}
+QUALITATIVE (+ = NGN weakens):
+Overall:{feat.get('news_overall',0):+.0f} | Nigeria:{feat.get('news_nigeria',0):+.0f} | CBN:{feat.get('news_cbn',0):+.0f}
+Oil:{feat.get('news_oil',0):+.0f} | USD/Fed:{feat.get('news_usd',0):+.0f}
 """
-    hist = "".join(f"\n{'User' if m['r']=='u' else 'Oracle'}: {m['c']}" for m in st.session_state.chat[-6:])
-
-    system = """You are the USDT/NGN Oracle — Nigeria's most authoritative AI FX analyst.
-You have access to live ML models, 40+ news headlines, and multi-timeframe forecasts.
-Be precise, cite specific data points, reference actual events. Never be vague.
-If a user asks about a specific timeframe, give them the specific numbers.
-Speak like a Bloomberg terminal analyst — direct, data-driven, no fluff."""
-
+    hist = "".join(f"\n{'User' if m['r']=='u' else 'Oracle'}: {m['c']}"
+                   for m in st.session_state.chat[-6:])
+    system = """You are the USD/NGN Oracle — Nigeria's AI FX analyst focused on the CBN OFFICIAL rate.
+Always be honest about uncertainty. Distinguish between validated confidence (walk-forward backtest)
+and unvalidated model output. Never invent confidence numbers. Be direct and data-driven."""
     return gemini(f"{ctx}\n\nConversation:{hist}\n\nUser: {msg}\n\nOracle:", system, max_tokens=1500)
 
 
@@ -1767,62 +1394,42 @@ def send_email_alert(to_email, subject, html_body, key) -> bool:
     if not to_email or not key: return False
     try:
         r = requests.post("https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"from": "USDT/NGN Oracle <onboarding@resend.dev>",
-                  "to": [to_email], "subject": subject, "html": html_body}, timeout=15)
+            headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+            json={"from":"USD/NGN Oracle <onboarding@resend.dev>",
+                  "to":[to_email],"subject":subject,"html":html_body},timeout=15)
         return r.status_code == 200
     except: return False
 
-def build_email_html(msg, rate, direction, confidence, pred_low, pred_high, recommendation):
-    dc = "#00e5a0" if direction=="BULLISH" else "#ff4466" if direction=="BEARISH" else "#ffb020"
-    da = "▲" if direction=="BULLISH" else "▼"
-    return f"""<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;
-    background:#060912;color:#cfe0f5;border-radius:16px;overflow:hidden;border:1px solid #172440;">
-    <div style="background:linear-gradient(135deg,#0f1d30,#060912);padding:28px 32px;border-bottom:2px solid #b060ff;">
-    <div style="font-size:10px;letter-spacing:3px;color:#b060ff;text-transform:uppercase;margin-bottom:8px;">
-    🇳🇬 USDT/NGN Oracle · Unified Intelligence</div>
-    <div style="font-size:22px;font-weight:700;">Price Alert Triggered</div></div>
-    <div style="padding:28px 32px;">
-    <div style="background:#0f1d30;border:1px solid #172440;border-left:4px solid #ffb020;
-    border-radius:10px;padding:14px 18px;margin-bottom:20px;font-size:15px;font-weight:600;color:#ffb020;">
-    🔔 {msg}</div>
-    <table style="width:100%;border-collapse:collapse;margin-bottom:18px;">
-    <tr><td style="padding:9px 0;border-bottom:1px solid #172440;color:#6b84a0;font-size:12px;">Direction</td>
-    <td style="text-align:right;font-weight:700;color:{dc};">{da} {direction}</td></tr>
-    <tr><td style="padding:9px 0;border-bottom:1px solid #172440;color:#6b84a0;font-size:12px;">Current Rate</td>
-    <td style="text-align:right;font-weight:700;color:#00e5a0;">₦{rate:,.0f}</td></tr>
-    <tr><td style="padding:9px 0;border-bottom:1px solid #172440;color:#6b84a0;font-size:12px;">24H ML Range</td>
-    <td style="text-align:right;font-weight:600;">₦{pred_low:,.0f} – ₦{pred_high:,.0f}</td></tr>
-    <tr><td style="padding:9px 0;color:#6b84a0;font-size:12px;">Confidence</td>
-    <td style="text-align:right;font-weight:700;color:#ffb020;">{confidence}%</td></tr>
-    </table>
-    <div style="background:#0f1d30;border:1px solid #172440;border-radius:10px;padding:14px 18px;margin-bottom:20px;">
-    <div style="font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:#b060ff;margin-bottom:7px;">Recommendation</div>
-    <div style="font-size:12px;line-height:1.7;color:#9ab0cc;">{recommendation}</div></div>
-    <div style="font-size:10px;color:#4a6080;text-align:center;border-top:1px solid #172440;padding-top:14px;line-height:1.6;">
-    ⚠️ Not financial advice. ML + AI predictions carry uncertainty. Always DYOR.</div>
-    </div></div>"""
-
-def check_and_trigger_alerts(rate, ml, narratives):
+def check_and_trigger_alerts(cbn_rate, ml, narratives):
     triggered = []
-    user_email = st.session_state.get("user_email", "")
-    try: rk = st.secrets.get("RESEND_API_KEY", "")
+    user_email = st.session_state.get("user_email","")
+    try: rk = st.secrets.get("RESEND_API_KEY","")
     except: rk = ""
     for i, a in enumerate(st.session_state.alerts):
         msg = ""
-        if a["type"] == "above" and rate >= a["level"] and i not in st.session_state.alert_triggered:
-            msg = f"Rate crossed ABOVE ₦{a['level']:,} — now at ₦{rate:,.0f}"
+        if a["type"]=="above" and cbn_rate >= a["level"] and i not in st.session_state.alert_triggered:
+            msg = f"CBN rate crossed ABOVE ₦{a['level']:,} — now ₦{cbn_rate:,.0f}"
             triggered.append((i, f"🔔 {msg}"))
             st.session_state.alert_triggered.append(i)
-        elif a["type"] == "below" and rate <= a["level"] and i not in st.session_state.alert_triggered:
-            msg = f"Rate dropped BELOW ₦{a['level']:,} — now at ₦{rate:,.0f}"
+        elif a["type"]=="below" and cbn_rate <= a["level"] and i not in st.session_state.alert_triggered:
+            msg = f"CBN rate dropped BELOW ₦{a['level']:,} — now ₦{cbn_rate:,.0f}"
             triggered.append((i, f"🔔 {msg}"))
             st.session_state.alert_triggered.append(i)
         if msg and user_email and rk:
-            d = ml.get("direction","N/A"); c = ml.get("confidence",0)
-            html = build_email_html(msg, rate, d, c, ml.get("pred_low",0), ml.get("pred_high",0),
-                                    narratives.get("trade_recommendation","See Oracle for details."))
-            send_email_alert(user_email, f"🔔 USDT/NGN Oracle Alert: {msg}", html, rk)
+            conf_disp = f"{ml.get('confidence')}% validated" if ml.get('confidence') else "Not yet validated"
+            html = f"""<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;
+            background:#060912;color:#cfe0f5;border-radius:16px;border:1px solid #172440;padding:24px;">
+            <div style="font-size:10px;letter-spacing:3px;color:#b060ff;text-transform:uppercase;margin-bottom:8px;">
+            🇳🇬 USD/NGN Oracle · CBN Official Rate</div>
+            <h2 style="font-size:20px;font-weight:700;margin-bottom:16px;">Price Alert Triggered</h2>
+            <div style="background:#0f1d30;border-left:4px solid #ffb020;border-radius:8px;
+            padding:12px 16px;margin-bottom:16px;font-size:14px;color:#ffb020;">🔔 {msg}</div>
+            <div style="font-size:12px;color:#9ab0cc;margin-bottom:8px;">Direction: {ml.get('direction','N/A')}</div>
+            <div style="font-size:12px;color:#9ab0cc;margin-bottom:8px;">ML 24h Target: ₦{ml.get('ensemble',0):,.0f}</div>
+            <div style="font-size:12px;color:#9ab0cc;margin-bottom:16px;">Confidence: {conf_disp}</div>
+            <div style="font-size:10px;color:#4a6080;">⚠️ Not financial advice. Always DYOR.</div>
+            </div>"""
+            send_email_alert(user_email, f"🔔 USD/NGN Oracle: {msg}", html, rk)
     return triggered
 
 
@@ -1830,7 +1437,7 @@ def check_and_trigger_alerts(rate, ml, narratives):
 # RENDER HELPERS
 # ══════════════════════════════════════════════════════
 def prog_bar(label, val, color, min_val=-100, max_val=100):
-    norm = max(0, min(100, (val - min_val) / (max_val - min_val) * 100))
+    norm = max(0, min(100, (val-min_val)/(max_val-min_val)*100))
     st.markdown(f"""<div class="prog-wrap">
     <div class="prog-label">
       <span style="color:var(--text2);font-size:11px;">{label}</span>
@@ -1853,16 +1460,22 @@ def headline_color(tag: str) -> str:
     if any(x in t for x in ["FED","USD","DXY","CPI"]): return "var(--blue)"
     return "var(--text2)"
 
-def tf_accent_color(key: str) -> str:
-    colors = {"24h":"#00e5a0","7d":"#4488ff","30d":"#b060ff","3m":"#ffb020","6m":"#ff4466","12m":"#00d4ff","2yr":"#ffd700"}
-    return colors.get(key, "#4488ff")
+def tf_accent(key):
+    return {"24h":"#00e5a0","7d":"#4488ff","30d":"#b060ff","3m":"#ffb020",
+            "6m":"#ff4466","12m":"#00d4ff","2yr":"#ffd700"}.get(key,"#4488ff")
+
+def metric_card(col, accent, label, value, sub, val_color=None):
+    vc = val_color or "var(--text)"
+    col.markdown(f"""<div class="card card-{accent}">
+    <div class="card-label">{label}</div>
+    <div class="card-value" style="color:{vc};font-size:22px;">{value}</div>
+    <div class="card-sub">{sub}</div>
+    </div>""", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════
-# ── UI ──
+# ── UI: ACTION BAR + HEADER ──
 # ══════════════════════════════════════════════════════
-
-# ── ACTION BAR ──
 ab1, ab2, ab3, ab4, ab5 = st.columns([2.5, 1.2, 1.2, 1.2, 5])
 with ab1:
     run_btn = st.button("⚡ Run Full Analysis", use_container_width=True, type="primary")
@@ -1871,58 +1484,57 @@ with ab2:
     st.session_state.auto_refresh = auto_ref
 with ab3:
     if auto_ref:
-        iv = st.selectbox("Interval", [15, 30, 60, 120], index=2,
-                          format_func=lambda x: f"{x}m", label_visibility="collapsed", key="ar_iv")
+        iv = st.selectbox("Interval",[15,30,60,120],index=2,
+                          format_func=lambda x:f"{x}m",label_visibility="collapsed",key="ar_iv")
         st.session_state.refresh_interval = iv
 with ab5:
     if st.session_state.last_time:
-        el = int((datetime.datetime.now() - st.session_state.last_time).total_seconds() // 60)
+        el  = int((datetime.datetime.now()-st.session_state.last_time).total_seconds()//60)
         pts = len(st.session_state.rate_history)
+        bt_n= len(st.session_state.backtest_log)
         st.markdown(
             f'<p style="font-family:var(--font-mono);font-size:10px;color:var(--text2);'
-            f'margin:10px 0 0 0;text-align:right;">'
-            f'<span class="live-dot"></span>Last run {el}m ago &nbsp;·&nbsp; {pts} training pts</p>',
+            f'margin:10px 0 0;text-align:right;">'
+            f'<span class="live-dot"></span>Last run {el}m ago &nbsp;·&nbsp; {pts} training pts'
+            f' &nbsp;·&nbsp; {bt_n} backtest obs</p>',
             unsafe_allow_html=True)
 
-# ── HEADER ──
 st.markdown("""
 <div style="padding:10px 0 20px;">
   <div style="font-family:var(--font-mono);font-size:9px;color:var(--cyan);
   letter-spacing:3px;text-transform:uppercase;margin-bottom:8px;">
-    <span class="live-dot"></span>UNIFIED ML + AI INTELLIGENCE PLATFORM
+    <span class="live-dot"></span>CBN OFFICIAL RATE · ML + GEMINI AI · WALK-FORWARD VALIDATED
   </div>
-  <h1 style="font-family:var(--font-mono);font-size:28px;font-weight:700;
-  margin:0 0 6px;background:linear-gradient(135deg,#cfe0f5 0%,#4488ff 50%,#b060ff 100%);
+  <h1 style="font-family:var(--font-mono);font-size:28px;font-weight:700;margin:0 0 6px;
+  background:linear-gradient(135deg,#cfe0f5 0%,#4488ff 50%,#b060ff 100%);
   -webkit-background-clip:text;-webkit-text-fill-color:transparent;line-height:1.2;">
-    USDT / NGN Oracle
+    USD / NGN Oracle
   </h1>
   <p style="color:var(--text2);font-size:12px;margin:0;font-family:var(--font-mono);">
-    Ridge · Random Forest · Gradient Boosting · Ensemble · Gemini AI · 24H–2YR Multi-Timeframe Forecasts
+    CBN Official Rate · Ridge · Random Forest · Gradient Boosting · Walk-Forward Validated Confidence
   </p>
 </div>""", unsafe_allow_html=True)
 
-# ── METHODOLOGY NOTE ──
 st.markdown("""
 <div class="alert-box alert-info" style="margin-bottom:18px;font-size:12px;">
-  <strong style="color:var(--blue);">🧪 How This Works:</strong>
-  Three statistical ML models (Ridge, Random Forest, Gradient Boosting) train on your live session history.
-  Gemini AI scores 40+ live news headlines across 10 macro dimensions. The combined signals power
-  <strong>7 timeframe forecasts</strong> from 24 hours to 2 years.
-  <em>Confidence degrades mathematically with horizon — this is a feature, not a bug.</em>
-  Reach 5+ runs for full ML accuracy. Run every 15–60 minutes for best training data.
+  <strong style="color:var(--blue);">🏦 v4.0 — What changed:</strong>
+  This Oracle now tracks the <strong>CBN official USD/NGN rate</strong> (not P2P / parallel market).
+  P2P data is retained only as a secondary spread-signal feature.
+  <strong>Confidence % is only displayed after walk-forward validation</strong> — each prediction is stored
+  and compared against the next real CBN rate before any confidence number is shown.
+  In-sample cross-validation is shown for diagnostics only and never used as a headline confidence figure.
 </div>""", unsafe_allow_html=True)
-
 
 # ── RUN + AUTO-REFRESH ──
 if run_btn:
-    with st.spinner("Collecting live features · Training ML models · Generating 7-timeframe forecasts · Running Gemini interpretation..."):
+    with st.spinner("Fetching CBN rate · Resolving backtest · Training ML · Generating forecasts..."):
         result = run_full_analysis()
         st.session_state.result    = result
         st.session_state.last_time = datetime.datetime.now()
     st.rerun()
 
 if auto_ref and st.session_state.last_time and GEMINI_KEY:
-    elapsed_sec  = (datetime.datetime.now() - st.session_state.last_time).total_seconds()
+    elapsed_sec  = (datetime.datetime.now()-st.session_state.last_time).total_seconds()
     interval_sec = st.session_state.refresh_interval * 60
     if elapsed_sec >= interval_sec:
         with st.spinner("Auto-refreshing Oracle..."):
@@ -1932,13 +1544,10 @@ if auto_ref and st.session_state.last_time and GEMINI_KEY:
         st.rerun()
     else:
         rem_sec = int(interval_sec - elapsed_sec)
-        rem_min = rem_sec // 60
-        rem_s   = rem_sec % 60
         st.markdown(
             f'<p style="font-size:10px;color:var(--green);text-align:right;margin-bottom:0;">'
-            f'🔄 Auto-refresh in {rem_min}m {rem_s}s</p>',
+            f'🔄 Auto-refresh in {rem_sec//60}m {rem_sec%60}s</p>',
             unsafe_allow_html=True)
-        # Use JS-based refresh — no dim flash, no sleep() blocking the thread
         from streamlit_autorefresh import st_autorefresh
         st_autorefresh(interval=10_000, limit=None, key="oracle_autorefresh")
 
@@ -1948,38 +1557,48 @@ if auto_ref and st.session_state.last_time and GEMINI_KEY:
 # ══════════════════════════════════════════════════════
 if not st.session_state.result:
     pts    = len(st.session_state.rate_history)
-    needed = max(0, 5 - pts)
+    bt_n   = len(st.session_state.backtest_log)
+    needed = max(0, 5-pts)
     persisted = (
-        f'<div class="alert-box alert-bull" style="max-width:440px;margin:0 auto 12px;">'
-        f'📂 Loaded <strong>{pts}</strong> data points from previous sessions. '
-        f'{"✅ ML engine is ready!" if pts >= 5 else f"Need {needed} more run(s) for full ML."}'
+        f'<div class="alert-box alert-bull" style="max-width:520px;margin:0 auto 12px;">'
+        f'📂 Loaded <strong>{pts}</strong> CBN-rate observations · '
+        f'<strong>{bt_n}</strong> walk-forward backtest pairs. '
+        f'{"✅ ML ready!" if pts >= 5 else f"Need {needed} more run(s) for ML."}'
         f'</div>'
     ) if pts > 0 else ""
-
     st.markdown(f"""
     <div style="text-align:center;padding:60px 20px 40px;">
-      <div style="font-size:50px;margin-bottom:20px;">🔮</div>
+      <div style="font-size:50px;margin-bottom:20px;">🏦</div>
       <h2 style="font-family:var(--font-mono);font-size:26px;font-weight:700;
       background:linear-gradient(135deg,#cfe0f5,#4488ff,#b060ff);-webkit-background-clip:text;
       -webkit-text-fill-color:transparent;margin-bottom:14px;">Oracle Ready</h2>
-      <p style="color:var(--text2);max-width:540px;margin:0 auto 20px;line-height:1.8;font-size:14px;">
-        The Unified Oracle combines <strong style="color:var(--amber);">Ridge + Random Forest + Gradient Boosting</strong>
-        with <strong style="color:var(--cyan);">live Gemini AI intelligence</strong> to generate
-        multi-timeframe forecasts from <strong style="color:var(--green);">24 hours to 2 years</strong>.
+      <p style="color:var(--text2);max-width:600px;margin:0 auto 20px;line-height:1.8;font-size:14px;">
+        Tracks the <strong style="color:var(--amber);">CBN Official USD/NGN Rate</strong>.
+        Confidence % is only shown after <strong style="color:var(--cyan);">walk-forward validation</strong> —
+        predictions are stored and compared against subsequent real rates before any number is displayed.
       </p>
       {persisted}
-      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;
-      max-width:760px;margin:24px auto;">
-        {" ".join(f'''<div class="card card-{'green' if i==0 else 'blue' if i==1 else 'purple' if i==2 else 'amber'}" style="padding:18px 14px;">
-          <div style="font-size:26px;margin-bottom:8px;">{icon}</div>
-          <div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:3px;">{title}</div>
-          <div style="font-size:10px;color:var(--muted);">{sub}</div>
-        </div>''' for i, (icon, title, sub) in enumerate([
-            ("📡","Live P2P Rates","Binance · Bybit · CoinGecko"),
-            ("🌍","40+ Headlines","18 RSS feeds · Gemini scoring"),
-            ("🤖","ML Ensemble","Ridge · RF · GradBoost"),
-            ("📈","7 Timeframes","24H → 2YR forecasts"),
-        ]))}
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;max-width:780px;margin:24px auto;">
+        <div class="card card-green" style="padding:18px 14px;">
+          <div style="font-size:26px;margin-bottom:8px;">🏦</div>
+          <div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:3px;">CBN Official Rate</div>
+          <div style="font-size:10px;color:var(--muted);">ExchangeRate-API · Frankfurter</div>
+        </div>
+        <div class="card card-blue" style="padding:18px 14px;">
+          <div style="font-size:26px;margin-bottom:8px;">🌍</div>
+          <div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:3px;">40+ Headlines</div>
+          <div style="font-size:10px;color:var(--muted);">18 RSS feeds · Gemini scoring</div>
+        </div>
+        <div class="card card-purple" style="padding:18px 14px;">
+          <div style="font-size:26px;margin-bottom:8px;">🤖</div>
+          <div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:3px;">ML Ensemble</div>
+          <div style="font-size:10px;color:var(--muted);">Ridge · RF · GradBoost</div>
+        </div>
+        <div class="card card-amber" style="padding:18px 14px;">
+          <div style="font-size:26px;margin-bottom:8px;">🔬</div>
+          <div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:3px;">Walk-Forward BT</div>
+          <div style="font-size:10px;color:var(--muted);">Real out-of-sample MAE</div>
+        </div>
       </div>
     </div>""", unsafe_allow_html=True)
 
@@ -1996,19 +1615,17 @@ else:
     narratives = r.get("narratives", {})
     metrics    = st.session_state.ml_metrics
 
-    p2p_mid  = raw.get("p2p_mid", 0)
-    official = raw.get("official", 0) or 0
-    ensemble = ml.get("ensemble", 0)
-    direction= ml.get("direction", "NEUTRAL")
-    conf     = ml.get("confidence", 0)
-    pred_low = ml.get("pred_low", 0)
-    pred_high= ml.get("pred_high", 0)
-    n_pts    = ml.get("n_training_points", 0)
-    cold     = ml.get("cold_start", True)
-    prem     = feat.get("premium_pct", 0) or 0
-    p2p_buy  = raw.get("p2p_buy", 0) or 0
-    p2p_sell = raw.get("p2p_sell", 0) or 0
-    spread   = (p2p_buy - p2p_sell) if p2p_buy and p2p_sell else 0
+    cbn_rate  = raw.get("cbn_rate", 0)
+    p2p_mid   = raw.get("p2p_mid")
+    ensemble  = ml.get("ensemble", 0)
+    direction = ml.get("direction", "NEUTRAL")
+    conf      = ml.get("confidence")        # None until walk-forward validated
+    pred_low  = ml.get("pred_low", 0)
+    pred_high = ml.get("pred_high", 0)
+    n_pts     = ml.get("n_training_points", 0)
+    cold      = ml.get("cold_start", True)
+    bt_stats  = ml.get("backtest", {})
+    prem      = feat.get("p2p_premium_pct", 0) or 0
 
     _sig  = st.session_state.global_signals or {}
     _anal = _sig.get("analysis", {})
@@ -2016,160 +1633,161 @@ else:
     _fng  = _sig.get("fear_greed_value", "—")
     _fng_l= _sig.get("fear_greed_label", "N/A")
 
-    dc    = "var(--green)" if direction=="BULLISH" else "var(--red)" if direction=="BEARISH" else "var(--amber)"
-    da    = "▲" if direction=="BULLISH" else "▼" if direction=="BEARISH" else "◆"
-    cc    = "var(--green)" if conf>=65 else "var(--amber)" if conf>=45 else "var(--red)"
-    prem_col = "var(--red)" if prem>8 else "var(--amber)" if prem>4 else "var(--green)"
+    dc       = "var(--green)" if direction=="BULLISH" else "var(--red)" if direction=="BEARISH" else "var(--amber)"
+    da       = "▲" if direction=="BULLISH" else "▼" if direction=="BEARISH" else "◆"
     bias_col = "var(--green)" if _bias=="BUY" else "var(--red)" if _bias=="SELL" else "var(--amber)"
+    prem_col = "var(--red)" if prem>8 else "var(--amber)" if prem>4 else "var(--green)"
 
     # ── LIVE TICKER ──
     btc_u = _sig.get("btc_usd"); btc_c = _sig.get("btc_24h") or 0
     eth_u = _sig.get("eth_usd"); eth_c = _sig.get("eth_24h") or 0
-    eur   = _sig.get("eurusd"); dxy = _sig.get("dxy_proxy")
-    zar   = _sig.get("usd_zar"); ghs = _sig.get("usd_ghs")
+    eur   = _sig.get("eurusd");  dxy   = _sig.get("dxy_proxy")
+    zar   = _sig.get("usd_zar");
 
     def ticker_item(label, val, change=None, fmt=""):
         if val is None: return ""
-        v_str = f"{fmt}{val:,.2f}" if isinstance(val, float) else f"{val}"
+        v_str  = f"{fmt}{val:,.2f}" if isinstance(val, float) else f"{val}"
         ch_str = ""
         if change is not None:
-            cls = "up" if float(change) >= 0 else "dn"
+            cls    = "up" if float(change) >= 0 else "dn"
             ch_str = f' <span class="{cls}">{float(change):+.2f}%</span>'
-        return f'<span class="ticker-item">{label} <span class="val">{v_str}</span>{ch_str}</span><span class="ticker-sep">·</span>'
+        return (f'<span class="ticker-item">{label} <span class="val">{v_str}</span>{ch_str}</span>'
+                f'<span class="ticker-sep">·</span>')
 
-    ticker_items = "".join([
-        ticker_item("USDT/NGN P2P", p2p_mid, None, "₦"),
-        ticker_item("Official", official, None, "₦"),
+    ti = "".join([
+        ticker_item("CBN USD/NGN", cbn_rate, None, "₦"),
+        ticker_item("P2P (signal)", p2p_mid, None, "₦") if p2p_mid else "",
         ticker_item("BTC", btc_u, btc_c, "$"),
         ticker_item("ETH", eth_u, eth_c, "$"),
         ticker_item("EUR/USD", eur, None),
         ticker_item("DXY Proxy", dxy, None),
         ticker_item("USD/ZAR", zar, None),
-        ticker_item("USD/GHS", ghs, None),
         f'<span class="ticker-item">F&G <span class="val">{_fng} — {_fng_l}</span></span><span class="ticker-sep">·</span>',
         f'<span class="ticker-item">30m Bias <span style="color:{bias_col};font-weight:700;">⚡{_bias}</span></span>',
     ])
-    st.markdown(f"""
-    <div class="ticker-wrap">
-      <div class="ticker-inner">{ticker_items}{ticker_items}</div>
-    </div>""", unsafe_allow_html=True)
+    st.markdown(f'<div class="ticker-wrap"><div class="ticker-inner">{ti}{ti}</div></div>',
+                unsafe_allow_html=True)
 
-    # ── TOP METRIC CARDS ──
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-
-    def metric_card(col, accent, label, value, sub, val_color=None):
-        vc = val_color or "var(--text)"
-        col.markdown(f"""<div class="card card-{accent}">
-        <div class="card-label">{label}</div>
-        <div class="card-value" style="color:{vc};font-size:22px;">{value}</div>
-        <div class="card-sub">{sub}</div>
-        </div>""", unsafe_allow_html=True)
+    # ── TOP METRIC CARDS (7) ──
+    c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
 
     with c1:
-        metric_card(c1, "green", "P2P Live Rate", f"₦{p2p_mid:,.0f}",
-                    f"Buy ₦{p2p_buy:,.0f} · Sell ₦{p2p_sell:,.0f}", "var(--green)")
+        src_stat = raw.get("status","")
+        sc = "var(--green)" if src_stat=="live" else "var(--amber)" if src_stat=="proxy" else "var(--red)"
+        metric_card(c1,"green","CBN Official Rate",f"₦{cbn_rate:,.2f}",
+                    f"{raw.get('source','')[:30]}", sc)
     with c2:
-        metric_card(c2, "amber", "B.M. Premium",
-                    f"{prem:+.2f}%", f"vs CBN ₦{official:,.0f}", prem_col)
+        p2p_disp = f"₦{p2p_mid:,.0f}" if p2p_mid else "N/A"
+        metric_card(c2,"amber","P2P Premium (signal)",f"{prem:+.2f}%",
+                    f"P2P ≈ {p2p_disp}", prem_col)
     with c3:
-        metric_card(c3, "green" if direction=="BULLISH" else "red" if direction=="BEARISH" else "amber",
-                    "ML Prediction 24H", f"{da} ₦{ensemble:,.0f}",
-                    f"₦{pred_low:,.0f} – ₦{pred_high:,.0f}", dc)
+        metric_card(c3,
+            "green" if direction=="BULLISH" else "red" if direction=="BEARISH" else "amber",
+            "ML Prediction 24H", f"{da} ₦{ensemble:,.0f}",
+            f"₦{pred_low:,.0f} – ₦{pred_high:,.0f}", dc)
     with c4:
-        metric_card(c4, "purple", "ML Confidence",
-                    f"{conf}%", f"{'⚠️ Cold start' if cold else f'✅ {n_pts} training pts'}", cc)
+        # Walk-forward confidence — ONLY shown when validated
+        if conf is not None:
+            cc = "var(--green)" if conf>=65 else "var(--amber)" if conf>=45 else "var(--red)"
+            metric_card(c4,"purple","Validated Confidence",f"{conf}%",
+                        f"✅ {bt_stats.get('n',0)} real obs · MAE ₦{bt_stats.get('mae','—')}", cc)
+        else:
+            metric_card(c4,"purple","Confidence",
+                        "—",
+                        f"⏳ {bt_stats.get('message','Run on 2+ separate days')[:45]}",
+                        "var(--muted)")
     with c5:
-        metric_card(c5, "blue", "News Signal",
-                    f"{feat.get('news_overall',0):+.0f}",
-                    f"Score: -100=NGN↑ · +100=USDT↑", signal_color(feat.get("news_overall",0)))
+        mae_disp  = f"₦{bt_stats.get('mae',0):,.2f}" if bt_stats.get("mae") else "—"
+        mape_disp = f"{bt_stats.get('mape',0):.3f}%" if bt_stats.get("mape") else "not ready"
+        metric_card(c5,"blue","Real Out-of-Sample MAE",mae_disp,
+                    f"MAPE: {mape_disp} · {bt_stats.get('n',0)} obs","var(--blue)")
     with c6:
-        metric_card(c6, "green" if _bias=="BUY" else "red" if _bias=="SELL" else "amber",
-                    "30-Min Bias", f"⚡ {_bias}", "Qualitative signal", bias_col)
+        dir_acc  = bt_stats.get("dir_accuracy")
+        da_disp  = f"{dir_acc}%" if dir_acc is not None else "—"
+        metric_card(c6,
+            "green" if _bias=="BUY" else "red" if _bias=="SELL" else "amber",
+            "Direction Accuracy", da_disp,
+            f"30m bias: ⚡{_bias}", bias_col)
     with c7:
-        f7d_val = forecasts.get("7d", {}).get("central", 0)
-        f7d_pct = forecasts.get("7d", {}).get("pct_change", 0)
-        c7_color = "var(--green)" if f7d_val > p2p_mid else "var(--red)" if f7d_val < p2p_mid else "var(--amber)"
-        metric_card(c7, "cyan", "7-Day Forecast",
-                    f"₦{f7d_val:,.0f}", f"{f7d_pct:+.1f}% from now", c7_color)
+        f7d = forecasts.get("7d",{})
+        c7c = "var(--green)" if f7d.get("central",0) > cbn_rate else "var(--red)" if f7d.get("central",0) < cbn_rate else "var(--amber)"
+        metric_card(c7,"cyan","7-Day Forecast",
+                    f"₦{f7d.get('central',0):,.0f}",
+                    f"{f7d.get('pct_change',0):+.1f}% from now", c7c)
 
+    # ── STATUS NOTICES ──
     if cold:
-        st.markdown(f'<div class="alert-box alert-warn" style="margin-top:12px;">⚠️ <strong>Cold Start Mode</strong> — {ml.get("note","")} Run analysis 5+ times to unlock full ML accuracy.</div>',
+        st.markdown(f'<div class="alert-box alert-warn" style="margin-top:12px;">⚠️ <strong>Cold Start</strong> — {ml.get("note","")} Run 5+ times to train ML.</div>',
                     unsafe_allow_html=True)
+    if not bt_stats.get("ready"):
+        st.markdown(
+            f'<div class="alert-box alert-info" style="margin-top:8px;font-size:12px;">'
+            f'🔬 <strong>Confidence not yet shown</strong> — {bt_stats.get("message","")} '
+            f'Each run stores your prediction; the <em>next</em> run resolves it against the real CBN rate.</div>',
+            unsafe_allow_html=True)
 
-    # ── TRIGGERED ALERTS ──
-    triggered_alerts = check_and_trigger_alerts(p2p_mid, ml, narratives)
+    triggered_alerts = check_and_trigger_alerts(cbn_rate, ml, narratives)
     for _, msg in triggered_alerts:
         st.markdown(f'<div class="alert-box alert-warn">{msg}</div>', unsafe_allow_html=True)
 
-    # ── RATE SOURCE BADGE ──
-    src = raw.get("rate_source", "unknown")
-    status = raw.get("rate_status", "unknown")
-    src_col = "var(--green)" if status=="live" else "var(--amber)" if status=="estimated" else "var(--red)"
     ts = raw.get("timestamp","")[:19].replace("T"," ")
     st.markdown(
-        f'<p style="font-size:10px;font-family:var(--font-mono);color:{src_col};margin-bottom:0;">'
-        f'<span class="live-dot" style="background:{src_col};"></span>'
-        f'Source: {src} &nbsp;·&nbsp; Buy ₦{p2p_buy:,.0f} &nbsp;|&nbsp; Sell ₦{p2p_sell:,.0f}'
-        f' &nbsp;·&nbsp; <span style="color:var(--muted);">Updated {ts}</span></p>',
+        f'<p style="font-size:10px;font-family:var(--font-mono);color:var(--green);margin-bottom:0;">'
+        f'<span class="live-dot"></span>CBN Rate: ₦{cbn_rate:,.2f} &nbsp;·&nbsp; '
+        f'Source: {raw.get("source","")} &nbsp;·&nbsp; '
+        f'<span style="color:var(--muted);">Updated {ts}</span></p>',
         unsafe_allow_html=True)
-
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ══════ TABS ══════
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-        "📊 Analysis",
-        "📈 Forecasts",
-        "🌍 Global Signals",
-        "💱 Converter",
-        "📉 History",
-        "💬 Chat",
-        "🔔 Alerts",
-        "🔬 ML Metrics",
-        "🩺 Diagnostics",
+    # ══════════════════════════════════════════════════
+    # TABS
+    # ══════════════════════════════════════════════════
+    tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8,tab9 = st.tabs([
+        "📊 Analysis", "📈 Forecasts", "🔬 Backtest",
+        "🌍 Global Signals", "💱 Converter",
+        "📉 History", "💬 Chat", "🔔 Alerts", "🩺 Diagnostics",
     ])
 
 
     # ══════ TAB 1: ANALYSIS ══════
     with tab1:
-        left, right = st.columns([3, 2])
-
+        left, right = st.columns([3,2])
         with left:
-            # Executive Summary
-            exec_sum = narratives.get("exec_summary", "")
+            exec_sum = narratives.get("exec_summary","")
             if exec_sum:
                 st.markdown(f"""<div class="card card-purple" style="margin-bottom:16px;">
                 <div class="sec-header">🧠 EXECUTIVE SUMMARY</div>
                 <p style="font-size:13px;color:var(--text);line-height:1.75;margin:0;">{exec_sum}</p>
                 </div>""", unsafe_allow_html=True)
 
-            # Trade Recommendation
-            trade_rec = narratives.get("trade_recommendation", "")
-            best_time = narratives.get("best_convert_time", "")
+            trade_rec = narratives.get("trade_recommendation","")
+            best_time = narratives.get("best_convert_time","")
             if trade_rec:
-                dir_badge = f'<span class="badge badge-{"bull" if direction=="BULLISH" else "bear" if direction=="BEARISH" else "neu"}">{da} {direction}</span>'
-                st.markdown(f"""<div class="card card-{'green' if direction=='BULLISH' else 'red' if direction=='BEARISH' else 'amber'}" style="margin-bottom:16px;">
-                <div class="sec-header">⚡ TRADE RECOMMENDATION &nbsp;&nbsp; {dir_badge}</div>
-                <p style="font-size:13px;color:var(--text);line-height:1.7;margin:0 0 10px;">{trade_rec}</p>
-                {f'<div style="font-size:11px;color:var(--text2);border-top:1px solid var(--border);padding-top:8px;margin-top:8px;">⏰ Best time: {best_time}</div>' if best_time else ""}
-                </div>""", unsafe_allow_html=True)
+                db = f'<span class="badge badge-{"bull" if direction=="BULLISH" else "bear" if direction=="BEARISH" else "neu"}">{da} {direction}</span>'
+                st.markdown(
+                    f'<div class="card card-{"green" if direction=="BULLISH" else "red" if direction=="BEARISH" else "amber"}" style="margin-bottom:16px;">'
+                    f'<div class="sec-header">⚡ TRADE RECOMMENDATION &nbsp;&nbsp;{db}</div>'
+                    f'<p style="font-size:13px;color:var(--text);line-height:1.7;margin:0 0 10px;">{trade_rec}</p>'
+                    + (f'<div style="font-size:11px;color:var(--text2);border-top:1px solid var(--border);padding-top:8px;">⏰ Best time: {best_time}</div>' if best_time else "")
+                    + '</div>', unsafe_allow_html=True)
 
-            # Model Predictions Breakdown
-            st.markdown("""<div class="card" style="margin-bottom:16px;">
-            <div class="sec-header">🤖 INDIVIDUAL MODEL PREDICTIONS</div>""", unsafe_allow_html=True)
-            for badge_cls, label, pred, desc in [
-                ("badge-ridge", "Ridge Regression",    ml.get("ridge_pred", 0), "Regularised linear — captures long-term trend direction."),
-                ("badge-rf",    "Random Forest",        ml.get("rf_pred", 0),    "Decision tree ensemble — detects non-linear patterns."),
-                ("badge-gb",    "Gradient Boosting",    ml.get("gb_pred", 0),    "Sequential error-correction — best for time-series."),
-                ("badge-ens",   "Weighted Ensemble",    ml.get("ensemble", 0),   "Ridge×0.25 + RF×0.35 + GB×0.40 — final prediction."),
+            # Individual model predictions
+            st.markdown('<div class="card" style="margin-bottom:16px;"><div class="sec-header">🤖 INDIVIDUAL MODEL PREDICTIONS (vs CBN Official)</div>',
+                        unsafe_allow_html=True)
+            for badge_cls,lbl,pred,desc in [
+                ("badge-ridge","Ridge Regression",  ml.get("ridge_pred",0),"Regularised linear — captures trend direction."),
+                ("badge-rf",   "Random Forest",       ml.get("rf_pred",0),  "Decision tree ensemble — non-linear patterns."),
+                ("badge-gb",   "Gradient Boosting",   ml.get("gb_pred",0),  "Sequential error-correction."),
+                ("badge-ens",  "Weighted Ensemble",   ml.get("ensemble",0), "Ridge×0.25 + RF×0.35 + GB×0.40"),
             ]:
-                diff  = pred - p2p_mid
+                diff  = pred - cbn_rate
                 color = "var(--green)" if diff >= 0 else "var(--red)"
                 arr   = "▲" if diff >= 0 else "▼"
-                pct   = diff / max(p2p_mid, 1) * 100
+                pct   = diff / max(cbn_rate, 1) * 100
                 st.markdown(f"""
                 <div style="padding:12px 0;border-bottom:1px solid var(--border);">
                   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;">
-                    <span class="model-badge {badge_cls}">{label}</span>
+                    <span class="model-badge {badge_cls}">{lbl}</span>
                     <div style="display:flex;align-items:center;gap:12px;">
                       <span style="font-family:var(--font-mono);font-size:17px;font-weight:700;color:{color};">₦{pred:,.0f}</span>
                       <span style="font-family:var(--font-mono);font-size:11px;color:{color};">{arr} {diff:+.0f} ({pct:+.2f}%)</span>
@@ -2177,351 +1795,421 @@ else:
                   </div>
                   <p style="font-size:11px;color:var(--muted);margin:0;">{desc}</p>
                 </div>""", unsafe_allow_html=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            # Key Headlines Driving This Prediction
-            headlines_driving = narratives.get("key_headlines_driving_prediction") or []
-            if not headlines_driving:
-                headlines_driving = [raw.get("news_intel",{}).get("top_bullish_catalyst",""),
-                                     raw.get("news_intel",{}).get("top_bearish_catalyst","")]
-            if any(headlines_driving):
-                st.markdown("""<div class="card" style="margin-bottom:16px;">
-                <div class="sec-header">📰 KEY HEADLINES DRIVING PREDICTION</div>""", unsafe_allow_html=True)
-                for h in [x for x in headlines_driving if x]:
-                    st.markdown(f'<div class="hl-row">📌 <span style="font-size:12px;color:var(--text);">{h}</span></div>',
-                                unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
 
         with right:
-            # Confidence Ring visualization
-            conf_color = "var(--green)" if conf>=65 else "var(--amber)" if conf>=45 else "var(--red)"
-            st.markdown(f"""<div class="card" style="margin-bottom:16px;text-align:center;padding:24px 22px;">
-            <div class="sec-header" style="text-align:left;">📊 CONFIDENCE BREAKDOWN</div>
-            <div style="display:flex;align-items:center;justify-content:center;gap:24px;margin:16px 0;">
-              <div style="border: 6px solid {conf_color};border-radius:50%;width:100px;height:100px;
-              display:flex;flex-direction:column;align-items:center;justify-content:center;">
-                <div style="font-family:var(--font-mono);font-size:24px;font-weight:700;color:{conf_color};">{conf}%</div>
-                <div style="font-size:9px;color:var(--muted);letter-spacing:1px;">CONF</div>
-              </div>
-              <div style="text-align:left;">
-                <div style="font-size:11px;color:var(--text2);margin-bottom:6px;">Model Agreement</div>
-                <div style="font-family:var(--font-mono);font-size:18px;color:var(--blue);">{ml.get("model_agreement",0):.1f}%</div>
-                <div style="font-size:10px;color:var(--muted);margin-top:8px;">Training Points</div>
-                <div style="font-family:var(--font-mono);font-size:18px;color:var(--purple);">{n_pts}</div>
-              </div>
-            </div></div>""", unsafe_allow_html=True)
+            # Confidence display — validated vs unvalidated
+            if conf is not None:
+                cc = "var(--green)" if conf>=65 else "var(--amber)" if conf>=45 else "var(--red)"
+                st.markdown(f"""<div class="card" style="margin-bottom:16px;text-align:center;padding:24px 22px;">
+                <div class="sec-header" style="text-align:left;">📊 VALIDATED CONFIDENCE</div>
+                <div style="display:flex;align-items:center;justify-content:center;gap:24px;margin:16px 0;">
+                  <div style="border:6px solid {cc};border-radius:50%;width:100px;height:100px;
+                  display:flex;flex-direction:column;align-items:center;justify-content:center;">
+                    <div style="font-family:var(--font-mono);font-size:24px;font-weight:700;color:{cc};">{conf}%</div>
+                    <div style="font-size:9px;color:var(--muted);letter-spacing:1px;">REAL</div>
+                  </div>
+                  <div style="text-align:left;">
+                    <div style="font-size:10px;color:var(--text2);">From walk-forward backtest</div>
+                    <div style="font-family:var(--font-mono);font-size:14px;color:var(--amber);margin-top:4px;">
+                    MAE ₦{bt_stats.get('mae','—')} ({bt_stats.get('mape','—')}%)</div>
+                    <div style="font-size:10px;color:var(--muted);margin-top:6px;">Direction Accuracy</div>
+                    <div style="font-family:var(--font-mono);font-size:18px;color:var(--green);">{bt_stats.get('dir_accuracy','—')}%</div>
+                  </div>
+                </div></div>""", unsafe_allow_html=True)
+            else:
+                st.markdown(f"""<div class="card card-amber" style="margin-bottom:16px;padding:24px 22px;">
+                <div class="sec-header">⏳ CONFIDENCE NOT YET VALIDATED</div>
+                <p style="font-size:12px;color:var(--text2);line-height:1.65;margin:0;">
+                  {bt_stats.get('message','')}
+                </p>
+                <p style="font-size:11px;color:var(--muted);margin-top:10px;line-height:1.5;">
+                  Each run stores the current ML prediction. The <em>next</em> run compares it to
+                  the real CBN rate and adds to the backtest log. Confidence is only shown once real
+                  prediction error has been measured.
+                </p>
+                </div>""", unsafe_allow_html=True)
 
-            # Rate Summary Table
-            st.markdown("""<div class="card" style="margin-bottom:16px;">
-            <div class="sec-header">💹 RATE SUMMARY</div>
-            <table class="spread-table">
-            <tr><th>Metric</th><th>Value</th></tr>""", unsafe_allow_html=True)
+            # Rate summary table
+            st.markdown('<div class="card" style="margin-bottom:16px;"><div class="sec-header">💹 RATE SUMMARY</div>'
+                        '<table class="spread-table"><tr><th>Metric</th><th>Value</th></tr>',
+                        unsafe_allow_html=True)
             for lbl, val, clr in [
-                ("P2P Live Rate",   f"₦{p2p_mid:,.2f}",              "var(--green)"),
-                ("Official (CBN)",  f"₦{official:,.2f}",             "var(--blue)"),
-                ("B.M. Premium",    f"{prem:+.2f}%",                  "var(--amber)"),
-                ("P2P Spread",      f"₦{spread:.0f}",                 "var(--text2)"),
-                ("Ridge Target",    f"₦{ml.get('ridge_pred',0):,.0f}","var(--blue)"),
-                ("RF Target",       f"₦{ml.get('rf_pred',0):,.0f}",   "var(--green)"),
-                ("GB Target",       f"₦{ml.get('gb_pred',0):,.0f}",   "var(--purple)"),
-                ("Ensemble (24H)",  f"₦{ensemble:,.0f}",              "var(--amber)"),
-                ("Range Low",       f"₦{pred_low:,.0f}",              "var(--text2)"),
-                ("Range High",      f"₦{pred_high:,.0f}",             "var(--text2)"),
+                ("CBN Official",        f"₦{cbn_rate:,.2f}",              "var(--green)"),
+                ("P2P (signal only)",   f"₦{p2p_mid:,.0f}" if p2p_mid else "N/A","var(--text2)"),
+                ("P2P Premium",         f"{prem:+.2f}%",                   "var(--amber)"),
+                ("Ridge Target",        f"₦{ml.get('ridge_pred',0):,.0f}", "var(--blue)"),
+                ("RF Target",           f"₦{ml.get('rf_pred',0):,.0f}",    "var(--green)"),
+                ("GB Target",           f"₦{ml.get('gb_pred',0):,.0f}",    "var(--purple)"),
+                ("Ensemble (24H)",      f"₦{ensemble:,.0f}",               "var(--amber)"),
+                ("Range Low",           f"₦{pred_low:,.0f}",               "var(--text2)"),
+                ("Range High",          f"₦{pred_high:,.0f}",              "var(--text2)"),
+                ("Real MAE",            f"₦{bt_stats.get('mae','—')}",     "var(--cyan)"),
+                ("Real MAPE",           f"{bt_stats.get('mape','—')}%",    "var(--cyan)"),
             ]:
                 st.markdown(f'<tr><td style="font-size:11px;color:var(--text2);">{lbl}</td>'
                             f'<td style="font-family:var(--font-mono);color:{clr};font-size:12px;">{val}</td></tr>',
                             unsafe_allow_html=True)
             st.markdown('</table></div>', unsafe_allow_html=True)
 
-            # Key Risks
-            risks = narratives.get("key_risks", [])
-            catalysts = narratives.get("key_upside_catalysts", [])
+            risks     = narratives.get("key_risks",[])
+            catalysts = narratives.get("key_upside_catalysts",[])
             if risks or catalysts:
-                st.markdown("""<div class="card" style="margin-bottom:16px;">
-                <div class="sec-header">⚠️ KEY RISKS & CATALYSTS</div>""", unsafe_allow_html=True)
-                for r_item in risks[:4]:
-                    if r_item:
-                        st.markdown(f'<div style="font-size:11px;color:#ffaabb;padding:5px 0;border-bottom:1px solid var(--border);">🔻 {r_item}</div>',
-                                    unsafe_allow_html=True)
-                for c_item in catalysts[:3]:
-                    if c_item:
-                        st.markdown(f'<div style="font-size:11px;color:#a0ead4;padding:5px 0;border-bottom:1px solid var(--border);">🔺 {c_item}</div>',
-                                    unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
+                st.markdown('<div class="card"><div class="sec-header">⚠️ KEY RISKS & CATALYSTS</div>',
+                            unsafe_allow_html=True)
+                for ri in risks[:4]:
+                    if ri: st.markdown(f'<div style="font-size:11px;color:#ffaabb;padding:5px 0;border-bottom:1px solid var(--border);">🔻 {ri}</div>',unsafe_allow_html=True)
+                for ci in catalysts[:3]:
+                    if ci: st.markdown(f'<div style="font-size:11px;color:#a0ead4;padding:5px 0;border-bottom:1px solid var(--border);">🔺 {ci}</div>',unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
 
         # Full-width qualitative section
-        q_intel     = raw.get("news_intel", {})
-        n_headlines = raw.get("news_headlines_count", 0)
-
+        q_intel = raw.get("news_intel",{})
+        n_hl    = raw.get("news_headlines_count",0)
         if q_intel:
             st.markdown('<div class="hdivider"></div>', unsafe_allow_html=True)
-            st.markdown(f"""<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;
-            text-transform:uppercase;color:var(--purple);margin-bottom:16px;">
-            🌐 LIVE WORLD INTELLIGENCE — {n_headlines} headlines analysed</div>""", unsafe_allow_html=True)
-
-            breaking = q_intel.get("breaking_event")
-            if breaking and str(breaking).lower() not in ("null","none","n/a",""):
-                st.markdown(f"""<div style="background:rgba(255,68,102,0.1);border:1px solid var(--red);
-                border-left:4px solid var(--red);border-radius:10px;padding:12px 16px;margin-bottom:14px;">
-                <span style="font-size:9px;color:var(--red);font-family:var(--font-mono);
-                letter-spacing:2px;text-transform:uppercase;">⚡ BREAKING EVENT</span>
-                <div style="font-size:13px;color:var(--text);margin-top:5px;line-height:1.6;">{breaking}</div>
-                </div>""", unsafe_allow_html=True)
-
-            # 3 analysis cards
-            qa1, qa2, qa3 = st.columns(3)
-            with qa1:
-                oil_s = feat.get("news_oil", 0)
-                oil_c = signal_color(oil_s)
-                st.markdown(f"""<div class="card" style="height:100%;margin-bottom:0;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-                  <div style="font-family:var(--font-mono);font-size:10px;letter-spacing:1px;
-                  text-transform:uppercase;color:var(--muted);">🛢️ Oil Markets</div>
-                  <div style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:{oil_c};">{oil_s:+.0f}</div>
-                </div>
-                <p style="font-size:12px;color:var(--text2);line-height:1.65;margin:0;">
-                {q_intel.get("oil_analysis","No oil analysis available.")}</p></div>""", unsafe_allow_html=True)
-            with qa2:
-                geo_s = feat.get("news_geopolitics", 0)
-                geo_c = signal_color(geo_s)
-                bull  = q_intel.get("top_bullish_catalyst","")[:160]
-                st.markdown(f"""<div class="card" style="height:100%;margin-bottom:0;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-                  <div style="font-family:var(--font-mono);font-size:10px;letter-spacing:1px;
-                  text-transform:uppercase;color:var(--muted);">🌍 Geopolitics</div>
-                  <div style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:{geo_c};">{geo_s:+.0f}</div>
-                </div>
-                <p style="font-size:12px;color:var(--text2);line-height:1.65;margin:0 0 10px;">
-                {q_intel.get("geopolitical_analysis","N/A")}</p>
-                <div style="font-size:10px;color:var(--muted);">📈 Bullish: <span style="color:var(--text2);">{bull}</span></div>
-                </div>""", unsafe_allow_html=True)
-            with qa3:
-                cbn_s = feat.get("news_cbn", 0)
-                cbn_c = signal_color(cbn_s)
-                bear  = q_intel.get("top_bearish_catalyst","")[:160]
-                st.markdown(f"""<div class="card" style="height:100%;margin-bottom:0;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-                  <div style="font-family:var(--font-mono);font-size:10px;letter-spacing:1px;
-                  text-transform:uppercase;color:var(--muted);">🏦 CBN Watch</div>
-                  <div style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:{cbn_c};">{cbn_s:+.0f}</div>
-                </div>
-                <p style="font-size:12px;color:var(--text2);line-height:1.65;margin:0 0 10px;">
-                {q_intel.get("cbn_analysis","N/A")}</p>
-                <div style="font-size:10px;color:var(--muted);">📉 Bearish: <span style="color:var(--text2);">{bear}</span></div>
-                </div>""", unsafe_allow_html=True)
-
-            # 10-dimension score bars
-            st.markdown('<div class="card" style="margin-top:14px;"><div class="sec-header">📡 10-DIMENSION QUALITATIVE SIGNAL SCORES</div>',
+            st.markdown(f'<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--purple);margin-bottom:16px;">🌐 LIVE WORLD INTELLIGENCE — {n_hl} headlines</div>',
                         unsafe_allow_html=True)
-            st.markdown('<div style="font-size:11px;color:var(--muted);margin-bottom:14px;">-100 = very bullish NGN (USDT falls) &nbsp; · &nbsp; +100 = very bullish USDT (NGN weakens)</div>',
+            breaking = q_intel.get("breaking_event","")
+            if breaking and str(breaking).lower() not in ("null","none","n/a",""):
+                st.markdown(f'<div style="background:rgba(255,68,102,0.1);border:1px solid var(--red);border-left:4px solid var(--red);border-radius:10px;padding:12px 16px;margin-bottom:14px;"><span style="font-size:9px;color:var(--red);font-family:var(--font-mono);letter-spacing:2px;text-transform:uppercase;">⚡ BREAKING</span><div style="font-size:13px;color:var(--text);margin-top:5px;">{breaking}</div></div>',
+                            unsafe_allow_html=True)
+            qa1,qa2,qa3 = st.columns(3)
+            for col,icon_lbl,score_key,analysis_key in [
+                (qa1,"🛢️ Oil Markets","news_oil","oil_analysis"),
+                (qa2,"🌍 Geopolitics","news_geopolitics","geopolitical_analysis"),
+                (qa3,"🏦 CBN Policy","news_cbn","cbn_analysis"),
+            ]:
+                s  = feat.get(score_key,0); sc = signal_color(s)
+                col.markdown(f"""<div class="card" style="height:100%;margin-bottom:0;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                  <div style="font-family:var(--font-mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);">{icon_lbl}</div>
+                  <div style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:{sc};">{s:+.0f}</div>
+                </div>
+                <p style="font-size:12px;color:var(--text2);line-height:1.65;margin:0;">{q_intel.get(analysis_key,"N/A")}</p>
+                </div>""", unsafe_allow_html=True)
+
+            st.markdown('<div class="card" style="margin-top:14px;"><div class="sec-header">📡 10-DIMENSION QUALITATIVE SCORES (+ = NGN weakens)</div>',
                         unsafe_allow_html=True)
             dims = [
-                ("Overall Signal",    feat.get("news_overall",0)),
-                ("Nigeria Macro",     feat.get("news_nigeria",0)),
-                ("CBN Policy",        feat.get("news_cbn",0)),
-                ("Oil Markets",       feat.get("news_oil",0)),
-                ("USD / Fed",         feat.get("news_usd",0)),
-                ("Crypto Sentiment",  feat.get("news_crypto",0)),
-                ("Geopolitics",       feat.get("news_geopolitics",0)),
-                ("Nigeria Politics",  feat.get("news_political_risk",0)),
-                ("Remittances",       feat.get("news_remittance",0)),
-                ("Global EM Risk",    feat.get("news_em_risk",0)),
+                ("Overall Signal",   feat.get("news_overall",0)),
+                ("Nigeria Macro",    feat.get("news_nigeria",0)),
+                ("CBN Policy",       feat.get("news_cbn",0)),
+                ("Oil Markets",      feat.get("news_oil",0)),
+                ("USD / Fed",        feat.get("news_usd",0)),
+                ("Crypto Sentiment", feat.get("news_crypto",0)),
+                ("Geopolitics",      feat.get("news_geopolitics",0)),
+                ("Nigeria Politics", feat.get("news_political_risk",0)),
+                ("Remittances",      feat.get("news_remittance",0)),
+                ("Global EM Risk",   feat.get("news_em_risk",0)),
             ]
             cols_dim = st.columns(2)
-            for i, (lbl, score) in enumerate(dims):
-                with cols_dim[i % 2]:
+            for i,(lbl,score) in enumerate(dims):
+                with cols_dim[i%2]:
                     prog_bar(lbl, score, signal_color(score))
             st.markdown('</div>', unsafe_allow_html=True)
 
 
-    # ══════ TAB 2: MULTI-TIMEFRAME FORECASTS ══════
+    # ══════ TAB 2: FORECASTS ══════
     with tab2:
         st.markdown(f"""<div class="card card-purple" style="margin-bottom:20px;">
-        <div class="sec-header">📈 MULTI-TIMEFRAME FORECAST ENGINE</div>
+        <div class="sec-header">📈 MULTI-TIMEFRAME CBN RATE FORECASTS</div>
         <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;font-size:12px;color:var(--text2);">
-          <div>📌 <strong style="color:var(--text);">Current Rate:</strong> <span style="font-family:var(--font-mono);color:var(--green);">₦{p2p_mid:,.0f}</span></div>
-          <div>🤖 <strong style="color:var(--text);">ML Training Points:</strong> <span style="font-family:var(--font-mono);color:var(--amber);">{n_pts}</span></div>
-          <div>📰 <strong style="color:var(--text);">Headlines Analysed:</strong> <span style="font-family:var(--font-mono);color:var(--blue);">{n_headlines}</span></div>
+          <div>📌 <strong style="color:var(--text);">CBN Rate:</strong> <span style="font-family:var(--font-mono);color:var(--green);">₦{cbn_rate:,.0f}</span></div>
+          <div>🤖 <strong style="color:var(--text);">Training Points:</strong> <span style="font-family:var(--font-mono);color:var(--amber);">{n_pts}</span></div>
+          <div>🔬 <strong style="color:var(--text);">Backtest Obs:</strong> <span style="font-family:var(--font-mono);color:var(--cyan);">{bt_stats.get('n',0)}</span></div>
         </div>
         <div style="margin-top:10px;font-size:11px;color:var(--muted);">
-          ℹ️ Confidence degrades with time horizon (statistical law: uncertainty ∝ √time).
-          Near-term forecasts are ML-anchored; medium/long-term use macro depreciation models + qualitative scores.
-        </div>
-        </div>""", unsafe_allow_html=True)
+          ⚠️ Confidence shown only after walk-forward backtest has ≥2 validated predictions.
+          Uncertainty ranges scale with √time (statistical law).
+        </div></div>""", unsafe_allow_html=True)
 
-        # ── 7 TIMEFRAME CARDS ──
-        # Row 1: 24H + 7D + 30D
+        # Row 1: 24H 7D 30D
         tf_row1 = st.columns(3)
-        tf_keys_row1 = ["24h","7d","30d"]
-        # Row 2: 3M + 6M + 12M + 2YR
+        for col,key in zip(tf_row1,["24h","7d","30d"]):
+            f   = forecasts.get(key,{})
+            ac  = tf_accent(key)
+            ctr = f.get("central",0); pct = f.get("pct_change",0)
+            fc  = "var(--green)" if "HIGHER" in f.get("direction","") else "var(--red)" if "LOWER" in f.get("direction","") else "var(--amber)"
+            col.markdown(f"""<div class="tf-card">
+              <div class="tf-card-accent" style="background:{ac};"></div>
+              <div class="tf-label">{f.get("label","")}</div>
+              <div class="tf-value" style="color:{ac};">₦{ctr:,.0f}</div>
+              <div class="tf-change" style="color:{fc};">{f.get("direction","")}</div>
+              <div class="tf-range">₦{f.get("low",0):,.0f} – ₦{f.get("high",0):,.0f}</div>
+              <div style="font-family:var(--font-mono);font-size:12px;color:{fc};margin-top:4px;">{pct:+.1f}% from now</div>
+              <div class="tf-conf">Confidence: {f.get("confidence_str","—")}</div>
+              <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:10px;color:var(--muted);">
+                Bull ₦{f.get("bull_case",0):,.0f} &nbsp;|&nbsp; Bear ₦{f.get("bear_case",0):,.0f}</div>
+            </div>""", unsafe_allow_html=True)
+
+        # Row 2: 3M 6M 12M 2YR
         tf_row2 = st.columns(4)
-        tf_keys_row2 = ["3m","6m","12m","2yr"]
+        for col,key in zip(tf_row2,["3m","6m","12m","2yr"]):
+            f   = forecasts.get(key,{})
+            ac  = tf_accent(key)
+            ctr = f.get("central",0); pct = f.get("pct_change",0)
+            fc  = "var(--green)" if "HIGHER" in f.get("direction","") else "var(--red)" if "LOWER" in f.get("direction","") else "var(--amber)"
+            col.markdown(f"""<div class="tf-card">
+              <div class="tf-card-accent" style="background:{ac};"></div>
+              <div class="tf-label">{f.get("label","")}</div>
+              <div class="tf-value" style="color:{ac};">₦{ctr:,.0f}</div>
+              <div class="tf-change" style="color:{fc};">{f.get("direction","")}</div>
+              <div class="tf-range">₦{f.get("low",0):,.0f} – ₦{f.get("high",0):,.0f}</div>
+              <div style="font-family:var(--font-mono);font-size:12px;color:{fc};margin-top:4px;">{pct:+.1f}% from now</div>
+              <div class="tf-conf">Confidence: {f.get("confidence_str","—")}</div>
+            </div>""", unsafe_allow_html=True)
 
-        for cols, keys in [(tf_row1, tf_keys_row1), (tf_row2, tf_keys_row2)]:
-            for col, key in zip(cols, keys):
-                f  = forecasts.get(key, {})
-                ac = tf_accent_color(key)
-                central = f.get("central", 0)
-                pct = f.get("pct_change", 0)
-                direction_lbl = f.get("direction","")
-                fconf = f.get("confidence", 0)
-                flow = f.get("low", 0)
-                fhigh = f.get("high", 0)
-                bull_c = f.get("bull_case", 0)
-                bear_c = f.get("bear_case", 0)
-                fcolor = "var(--green)" if "HIGHER" in direction_lbl else "var(--red)" if "LOWER" in direction_lbl else "var(--amber)"
-                col.markdown(f"""
-                <div class="tf-card">
-                  <div class="tf-card-accent" style="background:{ac};"></div>
-                  <div class="tf-label">{f.get("label","")}</div>
-                  <div class="tf-value" style="color:{ac};">₦{central:,.0f}</div>
-                  <div class="tf-change" style="color:{fcolor};">{direction_lbl}</div>
-                  <div class="tf-range">Range: ₦{flow:,.0f} – ₦{fhigh:,.0f}</div>
-                  <div style="font-family:var(--font-mono);font-size:12px;color:{fcolor};margin-top:4px;">{pct:+.1f}% from now</div>
-                  <div class="tf-conf">Confidence: {fconf}%</div>
-                  <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:10px;color:var(--muted);">
-                    Bull ₦{bull_c:,.0f} &nbsp;|&nbsp; Bear ₦{bear_c:,.0f}
-                  </div>
-                </div>""", unsafe_allow_html=True)
-
-        # ── NARRATIVE SECTION ──
         st.markdown('<div class="hdivider"></div>', unsafe_allow_html=True)
         st.markdown('<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--cyan);margin-bottom:16px;">💬 TIMEFRAME NARRATIVES</div>',
                     unsafe_allow_html=True)
 
         nar_data = [
-            ("24H",   "24h", "n24h_narrative",  "n24h_risk",   "n24h_drivers"),
-            ("7 DAY", "7d",  "n7d_narrative",   "n7d_risk",    "n7d_drivers"),
-            ("30 DAY","30d", "n30d_narrative",  None,          None),
-            ("3 MO",  "3m",  "n3m_narrative",   None,          None),
-            ("6 MO",  "6m",  "n6m_narrative",   None,          None),
-            ("12 MO", "12m", "n12m_narrative",  None,          None),
-            ("2 YR",  "2yr", "n2yr_narrative",  None,          None),
+            ("24H","24h","n24h_narrative","n24h_risk","n24h_drivers"),
+            ("7D", "7d", "n7d_narrative", "n7d_risk", "n7d_drivers"),
+            ("30D","30d","n30d_narrative",None,        None),
+            ("3M", "3m", "n3m_narrative", None,        None),
+            ("6M", "6m", "n6m_narrative", None,        None),
+            ("12M","12m","n12m_narrative",None,        None),
+            ("2YR","2yr","n2yr_narrative",None,        None),
         ]
-
-        for lbl, key, nar_key, risk_key, drivers_key in nar_data:
-            nar   = narratives.get(nar_key, "")
-            risk  = narratives.get(risk_key, "") if risk_key else ""
-            drvrs = narratives.get(drivers_key, []) if drivers_key else []
-            ac    = tf_accent_color(key)
-            f_data= forecasts.get(key, {})
-            f_pct = f_data.get("pct_change", 0)
-            f_conf= f_data.get("confidence", 0)
-            fclr  = "var(--green)" if f_pct > 0.5 else "var(--red)" if f_pct < -0.5 else "var(--amber)"
-            central_val = f_data.get("central", 0)
-            fallback_nar = f"Forecast: \u20a6{central_val:,.0f} ({f_pct:+.1f}% from current rate)"
-
-            drivers_html = "".join([
-                f'<span style="background:rgba(68,136,255,0.12);color:var(--blue);border:1px solid rgba(68,136,255,0.25);'
-                f'border-radius:4px;padding:2px 8px;font-size:10px;font-family:var(--font-mono);margin-right:6px;">{d}</span>'
+        for lbl,key,nar_key,risk_key,drivers_key in nar_data:
+            nar   = narratives.get(nar_key,"")
+            risk  = narratives.get(risk_key,"") if risk_key else ""
+            drvrs = narratives.get(drivers_key,[]) if drivers_key else []
+            ac    = tf_accent(key)
+            fd    = forecasts.get(key,{})
+            fpct  = fd.get("pct_change",0); fctr = fd.get("central",0)
+            fconf_s = fd.get("confidence_str","—")
+            fclr  = "var(--green)" if fpct>0.5 else "var(--red)" if fpct<-0.5 else "var(--amber)"
+            drvrs_html = "".join([
+                f'<span style="background:rgba(68,136,255,0.12);color:var(--blue);border:1px solid rgba(68,136,255,0.25);border-radius:4px;padding:2px 8px;font-size:10px;font-family:var(--font-mono);margin-right:6px;">{d}</span>'
                 for d in drvrs if d
             ])
-            drivers_row = f'<div style="margin-bottom:6px;">{drivers_html}</div>' if drivers_html else ""
-            risk_row    = f'<div style="margin-top:8px;font-size:11px;color:#ffaabb;"><strong>\u26a0\ufe0f Key risk:</strong> {risk}</div>' if risk else ""
-            nar_text    = nar if nar else fallback_nar
-
-            # Render the main card (no scenarios_html inside — avoids CSS {} conflict)
+            risk_row = f'<div style="margin-top:8px;font-size:11px;color:#ffaabb;"><strong>⚠️ Risk:</strong> {risk}</div>' if risk else ""
             st.markdown(
                 f'<div class="card" style="margin-bottom:10px;border-left:3px solid {ac};">'
                 f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
                 f'<div style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:{ac};">{lbl} HORIZON</div>'
                 f'<div style="display:flex;gap:10px;align-items:center;">'
-                f'<span style="font-family:var(--font-mono);font-size:13px;color:{fclr};font-weight:700;">'
-                f'\u20a6{central_val:,.0f} ({f_pct:+.1f}%)</span>'
-                f'<span style="font-family:var(--font-mono);font-size:9px;color:var(--muted);">CONF {f_conf}%</span>'
+                f'<span style="font-family:var(--font-mono);font-size:13px;color:{fclr};font-weight:700;">₦{fctr:,.0f} ({fpct:+.1f}%)</span>'
+                f'<span style="font-family:var(--font-mono);font-size:9px;color:var(--muted);">{fconf_s}</span>'
                 f'</div></div>'
-                f'{drivers_row}'
-                f'<p style="font-size:12px;color:var(--text2);line-height:1.65;margin:0;">{nar_text}</p>'
-                f'{risk_row}'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-
-            # Render 30d bull/bear scenarios as a SEPARATE st.markdown call (avoids f-string CSS {} clash)
+                + (f'<div style="margin-bottom:6px;">{drvrs_html}</div>' if drvrs_html else "")
+                + f'<p style="font-size:12px;color:var(--text2);line-height:1.65;margin:0;">{nar if nar else f"CBN Rate target: ₦{fctr:,.0f} ({fpct:+.1f}%)"}</p>'
+                + risk_row + '</div>', unsafe_allow_html=True)
             if key == "30d":
-                bull_s = narratives.get("n30d_bull_scenario", "")
-                bear_s = narratives.get("n30d_bear_scenario", "")
+                bull_s = narratives.get("n30d_bull_scenario","")
+                bear_s = narratives.get("n30d_bear_scenario","")
                 if bull_s or bear_s:
                     st.markdown(
                         '<div style="display:flex;gap:10px;margin-top:-6px;margin-bottom:10px;">'
                         '<div class="scenario-card scenario-bull" style="flex:1;">'
-                        '<div style="font-size:9px;color:var(--green);font-family:var(--font-mono);'
-                        'letter-spacing:1px;margin-bottom:5px;">&#x1F4C8; BULL SCENARIO</div>'
-                        f'<div style="font-size:11px;color:var(--text2);line-height:1.5;">{bull_s}</div>'
-                        '</div>'
+                        '<div style="font-size:9px;color:var(--green);font-family:var(--font-mono);letter-spacing:1px;margin-bottom:5px;">📈 BULL SCENARIO</div>'
+                        f'<div style="font-size:11px;color:var(--text2);">{bull_s}</div></div>'
                         '<div class="scenario-card scenario-bear" style="flex:1;">'
-                        '<div style="font-size:9px;color:var(--red);font-family:var(--font-mono);'
-                        'letter-spacing:1px;margin-bottom:5px;">&#x1F4C9; BEAR SCENARIO</div>'
-                        f'<div style="font-size:11px;color:var(--text2);line-height:1.5;">{bear_s}</div>'
-                        '</div>'
-                        '</div>',
-                        unsafe_allow_html=True
-                    )
+                        '<div style="font-size:9px;color:var(--red);font-family:var(--font-mono);letter-spacing:1px;margin-bottom:5px;">📉 BEAR SCENARIO</div>'
+                        f'<div style="font-size:11px;color:var(--text2);">{bear_s}</div></div>'
+                        '</div>', unsafe_allow_html=True)
 
-        # Oil impact + CBN watch
-        oil_impact_sum = narratives.get("oil_impact_summary", "")
-        cbn_watch_str  = narratives.get("cbn_watch", "")
-        if oil_impact_sum or cbn_watch_str:
-            oi1, oi2 = st.columns(2)
-            with oi1:
-                if oil_impact_sum:
-                    st.markdown(f"""<div class="card">
-                    <div class="sec-header">🛢️ OIL → NGN TRANSMISSION MECHANISM</div>
-                    <p style="font-size:12px;color:var(--text2);line-height:1.7;margin:0;">{oil_impact_sum}</p>
-                    </div>""", unsafe_allow_html=True)
-            with oi2:
-                if cbn_watch_str:
-                    st.markdown(f"""<div class="card">
-                    <div class="sec-header">🏦 CBN WATCH LIST</div>
-                    <p style="font-size:12px;color:var(--text2);line-height:1.7;margin:0;">{cbn_watch_str}</p>
-                    </div>""", unsafe_allow_html=True)
+        oil_sum = narratives.get("oil_impact_summary","")
+        cbn_watch = narratives.get("cbn_watch","")
+        if oil_sum or cbn_watch:
+            oi1,oi2 = st.columns(2)
+            if oil_sum:
+                oi1.markdown(f'<div class="card"><div class="sec-header">🛢️ OIL → CBN RATE TRANSMISSION</div><p style="font-size:12px;color:var(--text2);line-height:1.7;margin:0;">{oil_sum}</p></div>',
+                             unsafe_allow_html=True)
+            if cbn_watch:
+                oi2.markdown(f'<div class="card"><div class="sec-header">🏦 CBN WATCH LIST</div><p style="font-size:12px;color:var(--text2);line-height:1.7;margin:0;">{cbn_watch}</p></div>',
+                             unsafe_allow_html=True)
 
-        # Data quality note
-        dq_note = narratives.get("data_quality_note", "")
-        disc_note = narratives.get("disclaimer_note", "")
-        if dq_note:
-            st.markdown(f'<div class="alert-box alert-info" style="margin-top:14px;font-size:11px;"><strong>🔬 Data Quality:</strong> {dq_note}</div>',
+        dq = narratives.get("data_quality_note",""); disc = narratives.get("disclaimer_note","")
+        if dq:
+            st.markdown(f'<div class="alert-box alert-info" style="margin-top:14px;font-size:11px;"><strong>🔬 Data Quality:</strong> {dq}</div>',
                         unsafe_allow_html=True)
-        if disc_note:
-            st.markdown(f'<div style="font-size:10px;color:var(--muted);margin-top:8px;line-height:1.6;">⚠️ {disc_note}</div>',
+        if disc:
+            st.markdown(f'<div style="font-size:10px;color:var(--muted);margin-top:8px;line-height:1.6;">⚠️ {disc}</div>',
                         unsafe_allow_html=True)
 
 
-    # ══════ TAB 3: GLOBAL SIGNALS ══════
+    # ══════ TAB 3: WALK-FORWARD BACKTEST ══════
     with tab3:
+        bt_log   = st.session_state.backtest_log
+        bt_stats = compute_backtest_stats()
+
+        st.markdown("""<div class="card card-cyan" style="margin-bottom:18px;">
+        <div class="sec-header">🔬 WALK-FORWARD BACKTEST ENGINE</div>
+        <p style="font-size:12px;color:var(--text2);line-height:1.7;margin:0;">
+          Every time you run the Oracle, the current ML ensemble prediction is stored.
+          On the <em>next</em> run, it is resolved against the actual CBN rate — producing a genuine
+          out-of-sample prediction error. <strong style="color:var(--amber);">Confidence % is only shown
+          once at least 2 pairs have been validated.</strong> This is the only honest approach.
+        </p>
+        </div>""", unsafe_allow_html=True)
+
+        # Stats cards
+        bts1, bts2, bts3, bts4 = st.columns(4)
+        def bt_card(col, label, val, sub, color):
+            col.markdown(f"""<div class="card" style="text-align:center;padding:16px 12px;">
+            <div class="card-label">{label}</div>
+            <div style="font-family:var(--font-mono);font-size:22px;font-weight:700;color:{color};">{val}</div>
+            <div style="font-size:10px;color:var(--muted);margin-top:4px;">{sub}</div>
+            </div>""", unsafe_allow_html=True)
+
+        n_obs = bt_stats.get("n", 0)
+        mae_d = f"₦{bt_stats['mae']:,.2f}" if bt_stats.get("mae") else "—"
+        mape_d = f"{bt_stats['mape']:.3f}%" if bt_stats.get("mape") else "—"
+        dir_d  = f"{bt_stats['dir_accuracy']}%" if bt_stats.get("dir_accuracy") is not None else "—"
+        conf_d = f"{bt_stats['conf_from_bt']}%" if bt_stats.get("conf_from_bt") else "—"
+
+        bt_card(bts1, "Observations", str(n_obs), "Walk-forward validated pairs", "var(--cyan)")
+        bt_card(bts2, "Real MAE", mae_d, "Mean Absolute Error (out-of-sample)", "var(--amber)")
+        bt_card(bts3, "Real MAPE", mape_d, "Mean Absolute Percentage Error", "var(--blue)")
+        bt_card(bts4, "Direction Accuracy", dir_d, "% correct up/down calls", "var(--green)")
+
+        if not bt_stats.get("ready"):
+            st.markdown(f"""<div class="alert-box alert-info" style="margin-top:14px;">
+            ⏳ <strong>Backtest not yet ready:</strong> {bt_stats.get('message','')}
+            <br><br>
+            How walk-forward validation works:
+            <ol style="margin-top:8px;padding-left:18px;font-size:12px;line-height:1.8;">
+              <li>Run the Oracle now → prediction is stored as "pending"</li>
+              <li>Run it again later (same day or next day) → that run fetches the real CBN rate and resolves the previous prediction</li>
+              <li>Error metrics accumulate over time → confidence % becomes available</li>
+            </ol>
+            </div>""", unsafe_allow_html=True)
+        else:
+            # Confidence derivation explanation
+            c_val = bt_stats["conf_from_bt"]
+            c_col = "var(--green)" if c_val>=65 else "var(--amber)" if c_val>=45 else "var(--red)"
+            st.markdown(f"""<div class="card card-purple" style="margin-top:14px;">
+            <div class="sec-header">📊 VALIDATED CONFIDENCE DERIVATION</div>
+            <div style="display:grid;grid-template-columns:auto 1fr;gap:20px;align-items:center;">
+              <div style="text-align:center;">
+                <div style="border:5px solid {c_col};border-radius:50%;width:90px;height:90px;
+                display:flex;flex-direction:column;align-items:center;justify-content:center;margin:0 auto;">
+                  <div style="font-family:var(--font-mono);font-size:22px;font-weight:700;color:{c_col};">{c_val}%</div>
+                  <div style="font-size:9px;color:var(--muted);letter-spacing:1px;">REAL</div>
+                </div>
+              </div>
+              <div style="font-size:12px;color:var(--text2);line-height:1.7;">
+                Derived from <strong style="color:var(--text);">real walk-forward MAPE = {bt_stats.get('mape','?')}%</strong>
+                on <strong style="color:var(--text);">{n_obs} observations</strong>.<br>
+                Formula: MAPE ≤ 0.1% → 85% · MAPE ≥ 2.0% → 25% · Linear interpolation between.<br>
+                Direction accuracy: <strong style="color:var(--green);">{dir_d}</strong> of up/down calls were correct.
+              </div>
+            </div>
+            </div>""", unsafe_allow_html=True)
+
+        # Walk-forward log table
+        if bt_log:
+            st.markdown('<div class="hdivider"></div>', unsafe_allow_html=True)
+            st.markdown(f'<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--cyan);margin-bottom:14px;">📋 WALK-FORWARD LOG (last {min(len(bt_log),30)} entries)</div>',
+                        unsafe_allow_html=True)
+
+            st.markdown('<div class="card"><table class="wf-table">'
+                        '<tr><th>Timestamp</th><th>Predicted</th><th>Actual</th><th>Error (₦)</th><th>MAPE</th><th>Direction</th></tr>',
+                        unsafe_allow_html=True)
+            for row in reversed(bt_log[-30:]):
+                ts    = str(row.get("timestamp",""))[:16].replace("T"," ")
+                pred  = row.get("predicted", 0)
+                actual= row.get("actual", 0)
+                err   = row.get("error_abs", 0)
+                mape_r= row.get("error_pct", 0)
+                dir_ok= row.get("direction_correct")
+                err_c = "var(--green)" if err < actual*0.005 else "var(--amber)" if err < actual*0.015 else "var(--red)"
+                dir_sym = ("✅" if dir_ok else "❌") if dir_ok is not None else "—"
+                st.markdown(f"""<tr>
+                  <td style="color:var(--muted);">{ts}</td>
+                  <td>₦{pred:,.0f}</td>
+                  <td style="color:var(--green);">₦{actual:,.0f}</td>
+                  <td style="color:{err_c};">₦{err:,.2f}</td>
+                  <td style="color:{err_c};">{mape_r:.3f}%</td>
+                  <td>{dir_sym}</td>
+                </tr>""", unsafe_allow_html=True)
+            st.markdown('</table></div>', unsafe_allow_html=True)
+
+            # SVG error-over-time chart
+            errors_over_time = [r.get("error_abs", 0) for r in bt_log[-30:]]
+            if len(errors_over_time) >= 2:
+                max_err = max(errors_over_time) * 1.1 or 1
+                n_e     = len(errors_over_time)
+                path_pts = " ".join(
+                    f"{'M' if i==0 else 'L'} {i*(560/(n_e-1)):.1f} {((max_err-v)/max_err*70):.1f}"
+                    for i, v in enumerate(errors_over_time)
+                )
+                avg_e = sum(errors_over_time)/len(errors_over_time)
+                avg_y = (max_err - avg_e) / max_err * 70
+                st.markdown(f"""<div class="card" style="margin-top:12px;">
+                <div class="sec-header">📉 PREDICTION ERROR OVER TIME</div>
+                <svg width="100%" viewBox="0 0 600 90" style="overflow:visible;">
+                  <defs>
+                    <linearGradient id="err_grad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stop-color="#ffb020" stop-opacity="0.3"/>
+                      <stop offset="100%" stop-color="#ffb020" stop-opacity="0"/>
+                    </linearGradient>
+                  </defs>
+                  <path d="{path_pts} L {560:.1f} 70 L 0 70 Z" fill="url(#err_grad)"/>
+                  <path d="{path_pts}" fill="none" stroke="#ffb020" stroke-width="2"/>
+                  <line x1="0" y1="{avg_y:.1f}" x2="560" y2="{avg_y:.1f}"
+                        stroke="#4488ff" stroke-width="1" stroke-dasharray="4,4"/>
+                  <text x="565" y="{avg_y+4:.1f}" fill="#4488ff" font-size="9" font-family="JetBrains Mono">avg</text>
+                  <text x="0" y="85" fill="var(--muted)" font-size="9" font-family="JetBrains Mono">₦0</text>
+                  <text x="0" y="12" fill="var(--muted)" font-size="9" font-family="JetBrains Mono">₦{max_err:,.0f}</text>
+                  <text x="490" y="85" fill="#ffb020" font-size="9" font-family="JetBrains Mono">latest ₦{errors_over_time[-1]:,.2f}</text>
+                </svg>
+                </div>""", unsafe_allow_html=True)
+
+        # Pending prediction box
+        pend = st.session_state.pending_pred
+        if pend:
+            ts_p   = str(pend.get("timestamp",""))[:16].replace("T"," ")
+            ens_p  = pend.get("ensemble", 0)
+            prev_p = pend.get("prev_rate", 0)
+            st.markdown(f"""<div class="alert-box alert-bull" style="margin-top:14px;font-size:12px;">
+            ⏳ <strong>Pending prediction:</strong> ₦{ens_p:,.0f} (stored at {ts_p}, from rate ₦{prev_p:,.0f}).
+            This will be resolved against the CBN rate on the <strong>next</strong> run and added to the backtest log.
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("""<div class="alert-box alert-info" style="margin-top:14px;font-size:12px;">
+            No pending prediction. Run the Oracle to store one.
+            </div>""", unsafe_allow_html=True)
+
+
+    # ══════ TAB 4: GLOBAL SIGNALS ══════
+    with tab4:
         sig  = st.session_state.global_signals or {}
         anal = sig.get("analysis", {})
         now_gs = st.session_state.global_signals_time
 
-        age_str, next_str = "never", "5m 0s"
+        age_str, next_str = "never", f"{SIGNALS_TTL//60}m 0s"
         if now_gs:
-            age_s   = int((datetime.datetime.now() - now_gs).total_seconds())
-            age_str = f"{age_s}s ago" if age_s < 60 else f"{age_s//60}m {age_s%60}s ago"
-            rem     = max(0, SIGNALS_TTL - age_s)
-            next_str= f"{rem//60}m {rem%60}s"
+            age_s    = int((datetime.datetime.now() - now_gs).total_seconds())
+            age_str  = f"{age_s}s ago" if age_s < 60 else f"{age_s//60}m {age_s%60}s ago"
+            rem      = max(0, SIGNALS_TTL - age_s)
+            next_str = f"{rem//60}m {rem%60}s"
 
-        gs_col1, gs_col2 = st.columns([6,1])
-        with gs_col1:
-            n_hl = sig.get("headline_count", 0)
-            n_src= len(sig.get("sources", []))
+        gs1, gs2 = st.columns([6,1])
+        with gs1:
+            n_hl  = sig.get("headline_count", 0)
+            n_src = len(sig.get("sources", []))
             st.markdown(f"""<div style="margin-bottom:14px;">
             <div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;
-            text-transform:uppercase;color:var(--purple);margin-bottom:4px;">🌐 LIVE GLOBAL SIGNALS</div>
+            text-transform:uppercase;color:var(--purple);margin-bottom:4px;">🌐 LIVE GLOBAL SIGNALS — CBN RATE CONTEXT</div>
             <div style="font-size:11px;color:var(--text2);">
               {n_hl} headlines &nbsp;·&nbsp; {n_src} sources &nbsp;·&nbsp;
               <span style="color:var(--green);">Updated {age_str}</span> &nbsp;·&nbsp;
               Next refresh: {next_str}
             </div></div>""", unsafe_allow_html=True)
-        with gs_col2:
+        with gs2:
             if st.button("↻ Refresh", key="gs_refresh", use_container_width=True):
                 maybe_refresh_signals(force=True)
                 st.rerun()
 
         if not sig:
-            st.markdown('<div class="card" style="text-align:center;padding:40px;"><div style="font-size:32px;margin-bottom:12px;">📡</div><p style="color:var(--text2);">Press ↻ Refresh to load live global signals.</p></div>',
+            st.markdown('<div class="card" style="text-align:center;padding:40px;"><div style="font-size:32px;margin-bottom:12px;">📡</div><p style="color:var(--text2);">Press ↻ Refresh or run the Oracle to load live signals.</p></div>',
                         unsafe_allow_html=True)
         else:
-            # Breaking event
             breaking = anal.get("breaking_event","")
             if breaking and str(breaking).lower() not in ("null","none","n/a",""):
                 st.markdown(f"""<div style="background:rgba(255,68,102,0.1);border:1px solid var(--red);
@@ -2531,7 +2219,6 @@ else:
                 <div style="font-size:13px;color:var(--text);margin-top:5px;line-height:1.6;">{breaking}</div>
                 </div>""", unsafe_allow_html=True)
 
-            # Top mover
             top_mover = anal.get("top_mover_today","")
             if top_mover:
                 st.markdown(f"""<div style="background:var(--purple2);border:1px solid rgba(176,96,255,0.3);
@@ -2541,57 +2228,50 @@ else:
                 <div style="font-size:12px;color:var(--text);margin-top:5px;">{top_mover}</div>
                 </div>""", unsafe_allow_html=True)
 
-            # Market metrics row
             btc_u = sig.get("btc_usd"); btc_c = sig.get("btc_24h") or 0
             eth_u = sig.get("eth_usd"); eth_c = sig.get("eth_24h") or 0
-            eur   = sig.get("eurusd"); dxy = sig.get("dxy_proxy")
-            zar   = sig.get("usd_zar"); fng_v = sig.get("fear_greed_value","—")
+            eur   = sig.get("eurusd");  dxy   = sig.get("dxy_proxy")
+            fng_v = sig.get("fear_greed_value","—")
             fng_l = sig.get("fear_greed_label","N/A")
 
             gm = st.columns(4)
             for col, lbl, val, sub, clr in [
-                (gm[0], "BTC/USD",        f"${btc_u:,.0f}" if btc_u else "N/A", f"{btc_c:+.2f}% 24h", "var(--green)" if btc_c>=0 else "var(--red)"),
-                (gm[1], "ETH/USD",        f"${eth_u:,.0f}" if eth_u else "N/A", f"{eth_c:+.2f}% 24h", "var(--green)" if eth_c>=0 else "var(--red)"),
-                (gm[2], "EUR/USD",        f"{eur:.4f}" if eur else "N/A",       f"DXY proxy: {dxy}", "var(--blue)"),
-                (gm[3], "Fear & Greed",   f"{fng_v}",                           fng_l, "var(--green)" if isinstance(fng_v,int) and fng_v>60 else "var(--red)" if isinstance(fng_v,int) and fng_v<30 else "var(--amber)"),
+                (gm[0], "BTC/USD",      f"${btc_u:,.0f}" if btc_u else "N/A", f"{btc_c:+.2f}% 24h", "var(--green)" if btc_c>=0 else "var(--red)"),
+                (gm[1], "ETH/USD",      f"${eth_u:,.0f}" if eth_u else "N/A", f"{eth_c:+.2f}% 24h", "var(--green)" if eth_c>=0 else "var(--red)"),
+                (gm[2], "EUR/USD",      f"{eur:.4f}" if eur else "N/A",       f"DXY proxy: {dxy}", "var(--blue)"),
+                (gm[3], "Fear & Greed", f"{fng_v}", fng_l, "var(--green)" if isinstance(fng_v,int) and fng_v>60 else "var(--red)" if isinstance(fng_v,int) and fng_v<30 else "var(--amber)"),
             ]:
                 col.markdown(f"""<div class="card" style="margin-bottom:12px;">
                 <div class="card-label">{lbl}</div>
                 <div style="font-family:var(--font-mono);font-size:18px;font-weight:700;color:{clr};">{val}</div>
                 <div class="card-sub">{sub}</div></div>""", unsafe_allow_html=True)
 
-            # Signal cards: Oil, Geo, CBN, Crypto, EM
             signal_cards = [
-                ("🛢️ Oil Markets",      "oil_impact",           "oil_analysis",           "CoinGecko+RSS",   "OIL-ORACLE"),
-                ("🌍 Geopolitics",       "geopolitical_risk",    "geopolitical_analysis",  "Google News",     "GEO-SIGNAL"),
-                ("🏦 CBN Policy",        "cbn_policy",           "cbn_analysis",           "CBN Watch",       "CBN-POLICY"),
-                ("₿ Crypto Sentiment",   "crypto_sentiment",     "crypto_analysis",        "CoinGecko",       "CRYPTO-SIG"),
-                ("📊 EM FX Risk",        "global_em_risk",       "em_analysis",            "FX Data",         "EM-RISK"),
-                ("💸 Remittance Flow",   "remittance_flow",      None,                     "NG News",         "REMIT-SIG"),
+                ("🛢️ Oil Markets",    "oil_impact",        "oil_analysis",          "Oil-CBN"),
+                ("🌍 Geopolitics",    "geopolitical_risk", "geopolitical_analysis", "GEO"),
+                ("🏦 CBN Policy",     "cbn_policy",        "cbn_analysis",          "CBN"),
+                ("₿ Crypto Sentiment","crypto_sentiment",  "crypto_analysis",       "Crypto"),
+                ("📊 EM FX Risk",     "global_em_risk",    "em_analysis",           "EM FX"),
+                ("💸 Remittances",    "remittance_flow",   None,                    "Remit"),
             ]
-            for icon_lbl, score_key, analysis_key, src_lbl, src_tag in signal_cards:
+            for icon_lbl, score_key, analysis_key, _ in signal_cards:
                 score = anal.get(score_key, 0) or 0
                 body  = anal.get(analysis_key, "") if analysis_key else f"Score: {score:+.0f}"
-                score_c = signal_color(score)
+                sc    = signal_color(score)
                 score_lbl = "BEARISH NGN" if score > 15 else "BULLISH NGN" if score < -15 else "NEUTRAL"
-                st.markdown(f"""
-                <div style="background:var(--card);border:1px solid var(--border);border-radius:var(--r-lg);
+                st.markdown(f"""<div style="background:var(--card);border:1px solid var(--border);border-radius:var(--r-lg);
                 padding:14px 18px;margin-bottom:10px;">
                   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:8px;">
                     <span style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:var(--text);">{icon_lbl}</span>
                     <div style="display:flex;align-items:center;gap:10px;">
-                      <span style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:{score_c};">{score:+.0f}</span>
-                      <span style="background:rgba({score_c.replace('var(--','').replace(')','')},0.1);color:{score_c};
-                      border:1px solid {score_c}44;border-radius:4px;padding:2px 8px;font-size:9px;
-                      font-family:var(--font-mono);font-weight:700;">{score_lbl}</span>
+                      <span style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:{sc};">{score:+.0f}</span>
+                      <span style="background:rgba(255,255,255,0.05);color:{sc};border:1px solid {sc}44;
+                      border-radius:4px;padding:2px 8px;font-size:9px;font-family:var(--font-mono);font-weight:700;">{score_lbl}</span>
                     </div>
                   </div>
-                  <div style="font-size:12px;color:var(--text2);line-height:1.65;">
-                    {body if body else "No analysis available."}
-                  </div>
+                  <div style="font-size:12px;color:var(--text2);line-height:1.65;">{body or "No analysis available."}</div>
                 </div>""", unsafe_allow_html=True)
 
-            # Bull/Bear catalysts
             bull = anal.get("top_bullish_catalyst","")
             bear = anal.get("top_bearish_catalyst","")
             bb1, bb2 = st.columns(2)
@@ -2599,76 +2279,60 @@ else:
                 bb1.markdown(f"""<div style="background:var(--green3);border:1px solid rgba(0,229,160,0.3);
                 border-radius:var(--r-md);padding:14px 16px;">
                 <div style="font-size:9px;color:var(--green);font-family:var(--font-mono);
-                letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;">📈 Top Bullish Catalyst (USDT)</div>
-                <div style="font-size:12px;color:var(--text2);line-height:1.65;">{bull}</div>
-                </div>""", unsafe_allow_html=True)
+                letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;">📈 Top Bullish Catalyst (USD)</div>
+                <div style="font-size:12px;color:var(--text2);line-height:1.65;">{bull}</div></div>""",
+                unsafe_allow_html=True)
             if bear:
                 bb2.markdown(f"""<div style="background:rgba(255,68,102,0.05);border:1px solid rgba(255,68,102,0.25);
                 border-radius:var(--r-md);padding:14px 16px;">
                 <div style="font-size:9px;color:var(--red);font-family:var(--font-mono);
-                letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;">📉 Top Bearish Catalyst (USDT)</div>
-                <div style="font-size:12px;color:var(--text2);line-height:1.65;">{bear}</div>
-                </div>""", unsafe_allow_html=True)
+                letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;">📉 Top Bearish Catalyst (USD)</div>
+                <div style="font-size:12px;color:var(--text2);line-height:1.65;">{bear}</div></div>""",
+                unsafe_allow_html=True)
 
-            # Watch items
             watch = anal.get("key_watch_items", [])
             if watch:
                 st.markdown(f"""<div style="margin-top:14px;font-size:11px;border-top:1px solid var(--border);padding-top:12px;color:var(--muted);">
-                <strong style="font-family:var(--font-mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);">👁 WATCH THIS WEEK: </strong>
+                <strong style="font-family:var(--font-mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;">👁 WATCH THIS WEEK: </strong>
                 {"  &nbsp;·&nbsp;  ".join(f'<span style="color:var(--amber);">{w}</span>' for w in watch)}
                 </div>""", unsafe_allow_html=True)
 
-            # Medium/Long-term outlooks from qualitative
-            mt_outlook = anal.get("medium_term_outlook","")
-            lt_outlook = anal.get("long_term_outlook","")
-            if mt_outlook or lt_outlook:
+            mt = anal.get("medium_term_outlook",""); lt = anal.get("long_term_outlook","")
+            if mt or lt:
                 mo1, mo2 = st.columns(2)
-                if mt_outlook:
-                    mo1.markdown(f"""<div class="card" style="margin-top:14px;">
-                    <div class="sec-header">📅 30–90 DAY QUALITATIVE OUTLOOK</div>
-                    <p style="font-size:12px;color:var(--text2);line-height:1.7;margin:0;">{mt_outlook}</p>
-                    </div>""", unsafe_allow_html=True)
-                if lt_outlook:
-                    mo2.markdown(f"""<div class="card" style="margin-top:14px;">
-                    <div class="sec-header">📆 6–12 MONTH QUALITATIVE OUTLOOK</div>
-                    <p style="font-size:12px;color:var(--text2);line-height:1.7;margin:0;">{lt_outlook}</p>
-                    </div>""", unsafe_allow_html=True)
+                if mt: mo1.markdown(f'<div class="card" style="margin-top:14px;"><div class="sec-header">📅 30–90 DAY OUTLOOK</div><p style="font-size:12px;color:var(--text2);line-height:1.7;margin:0;">{mt}</p></div>', unsafe_allow_html=True)
+                if lt: mo2.markdown(f'<div class="card" style="margin-top:14px;"><div class="sec-header">📆 6–12 MONTH OUTLOOK</div><p style="font-size:12px;color:var(--text2);line-height:1.7;margin:0;">{lt}</p></div>', unsafe_allow_html=True)
 
-            # All Headlines
             headlines = sig.get("headlines", [])
             if headlines:
                 st.markdown("<br>", unsafe_allow_html=True)
-                with st.expander(f"📋 All {len(headlines)} live scraped headlines"):
+                with st.expander(f"📋 All {len(headlines)} live headlines"):
                     for h in headlines:
-                        clr  = headline_color(h.get("tag",""))
-                        desc = f'<br><span style="color:var(--muted);font-size:10px;">{h["desc"]}</span>' if h.get("desc") else ""
+                        clr = headline_color(h.get("tag",""))
                         st.markdown(
                             f'<div class="hl-row"><span style="color:{clr};font-family:var(--font-mono);">{h.get("tag","")}</span> '
-                            f'<span style="color:var(--text);">{h.get("title","")}</span>{desc}</div>',
+                            f'<span style="color:var(--text);">{h.get("title","")}</span></div>',
                             unsafe_allow_html=True)
 
 
-    # ══════ TAB 4: CONVERTER ══════
-    with tab4:
-        st.markdown('<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--cyan);margin-bottom:16px;">💱 SMART CURRENCY CONVERTER</div>',
+    # ══════ TAB 5: CONVERTER ══════
+    with tab5:
+        st.markdown('<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--cyan);margin-bottom:16px;">💱 USD / NGN CONVERTER</div>',
                     unsafe_allow_html=True)
-
         cc1, cc2 = st.columns(2)
+        conv_rates = {
+            "CBN Official":        cbn_rate,
+            "P2P (signal only)":   raw.get("p2p_mid") or cbn_rate,
+            "ML Prediction (24H)": ensemble,
+            "7D Forecast":         forecasts.get("7d",{}).get("central", cbn_rate),
+            "30D Forecast":        forecasts.get("30d",{}).get("central", cbn_rate),
+        }
         with cc1:
-            usdt_in = st.number_input("USDT Amount", min_value=0.0, value=100.0, step=10.0)
-            rates_for_conv = {
-                "P2P Sell (you receive)": p2p_sell or p2p_mid,
-                "P2P Mid": p2p_mid,
-                "P2P Buy (you pay)": p2p_buy or p2p_mid,
-                "Official (CBN)": official or p2p_mid,
-                "ML Prediction (24H)": ensemble,
-                "7D Forecast": forecasts.get("7d",{}).get("central", p2p_mid),
-                "30D Forecast": forecasts.get("30d",{}).get("central", p2p_mid),
-            }
-            st.markdown('<div class="card"><div class="sec-header">USDT → NGN</div>', unsafe_allow_html=True)
-            for lbl, rate_v in rates_for_conv.items():
-                if rate_v:
-                    ngn_out = usdt_in * rate_v
+            usd_in = st.number_input("USD Amount", min_value=0.0, value=100.0, step=10.0)
+            st.markdown('<div class="card"><div class="sec-header">USD → NGN</div>', unsafe_allow_html=True)
+            for lbl, rv in conv_rates.items():
+                if rv:
+                    ngn_out = usd_in * rv
                     st.markdown(f'<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);">'
                                 f'<span style="font-size:12px;color:var(--text2);">{lbl}</span>'
                                 f'<span style="font-family:var(--font-mono);font-size:13px;font-weight:700;color:var(--green);">₦{ngn_out:,.2f}</span>'
@@ -2676,127 +2340,110 @@ else:
             st.markdown('</div>', unsafe_allow_html=True)
         with cc2:
             ngn_in = st.number_input("NGN Amount", min_value=0.0, value=100000.0, step=1000.0)
-            st.markdown('<div class="card"><div class="sec-header">NGN → USDT</div>', unsafe_allow_html=True)
-            for lbl, rate_v in rates_for_conv.items():
-                if rate_v:
-                    usdt_out = ngn_in / rate_v
+            st.markdown('<div class="card"><div class="sec-header">NGN → USD</div>', unsafe_allow_html=True)
+            for lbl, rv in conv_rates.items():
+                if rv:
+                    usd_out = ngn_in / rv
                     st.markdown(f'<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);">'
                                 f'<span style="font-size:12px;color:var(--text2);">{lbl}</span>'
-                                f'<span style="font-family:var(--font-mono);font-size:13px;font-weight:700;color:var(--cyan);">${usdt_out:,.4f}</span>'
+                                f'<span style="font-family:var(--font-mono);font-size:13px;font-weight:700;color:var(--cyan);">${usd_out:,.4f}</span>'
                                 f'</div>', unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="alert-box alert-info" style="margin-top:12px;font-size:11px;">ℹ️ CBN Official rate is sourced from ExchangeRate-API / Frankfurter (IMF/central bank data). P2P is the parallel market rate shown for reference only.</div>',
+                    unsafe_allow_html=True)
 
-
-    # ══════ TAB 5: HISTORY ══════
-    with tab5:
+    # ══════ TAB 6: HISTORY ══════
+    with tab6:
         hist_data = st.session_state.rate_history
         if len(hist_data) < 2:
-            st.markdown('<div class="card" style="text-align:center;padding:40px;"><p style="color:var(--text2);">Run the analysis at least twice to see history.</p></div>',
+            st.markdown('<div class="card" style="text-align:center;padding:40px;"><p style="color:var(--text2);">Run the analysis at least twice to see CBN rate history.</p></div>',
                         unsafe_allow_html=True)
         else:
-            st.markdown(f'<div style="font-size:10px;font-family:var(--font-mono);color:var(--text2);margin-bottom:16px;"><span class="live-dot"></span>{len(hist_data)} data points in history</div>',
+            st.markdown(f'<div style="font-size:10px;font-family:var(--font-mono);color:var(--text2);margin-bottom:16px;"><span class="live-dot"></span>{len(hist_data)} CBN-rate observations in history</div>',
                         unsafe_allow_html=True)
-            df = pd.DataFrame([{
-                "Time":     d.get("timestamp","")[:16].replace("T"," "),
-                "P2P Mid":  d.get("p2p_mid"),
-                "P2P Buy":  d.get("p2p_buy"),
-                "P2P Sell": d.get("p2p_sell"),
-                "Official": d.get("official"),
-            } for d in hist_data[-50:]])
-            df = df.dropna(subset=["P2P Mid"])
-
-            import json as _json
-            # Chart data
-            chart_vals = [d.get("p2p_mid") for d in hist_data[-50:] if d.get("p2p_mid")]
+            chart_vals = [d.get("cbn_rate") for d in hist_data[-50:] if d.get("cbn_rate")]
             if len(chart_vals) >= 2:
                 chart_min = min(chart_vals) * 0.998
                 chart_max = max(chart_vals) * 1.002
-                n_pts_chart = len(chart_vals)
+                n_c = len(chart_vals)
                 path_d = " ".join(
-                    f"{'M' if i==0 else 'L'} {i*(560/(n_pts_chart-1)):.1f} {((chart_max - v)/(chart_max-chart_min)*80):.1f}"
+                    f"{'M' if i==0 else 'L'} {i*(560/(n_c-1)):.1f} {((chart_max - v)/(chart_max - chart_min)*80):.1f}"
                     for i, v in enumerate(chart_vals)
                 )
-                latest_v = chart_vals[-1]
-                trend_up = chart_vals[-1] >= chart_vals[0]
-                line_color = "#00e5a0" if trend_up else "#ff4466"
-
+                trend_up  = chart_vals[-1] >= chart_vals[0]
+                line_color= "#00e5a0" if trend_up else "#ff4466"
                 st.markdown(f"""<div class="card" style="margin-bottom:16px;">
-                <div class="sec-header">📉 P2P RATE CHART (last {n_pts_chart} observations)</div>
+                <div class="sec-header">📉 CBN OFFICIAL RATE CHART (last {n_c} observations)</div>
                 <svg width="100%" viewBox="0 0 600 100" style="overflow:visible;">
                   <defs>
-                    <linearGradient id="cg" x1="0" y1="0" x2="0" y2="1">
+                    <linearGradient id="cg2" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stop-color="{line_color}" stop-opacity="0.2"/>
                       <stop offset="100%" stop-color="{line_color}" stop-opacity="0"/>
                     </linearGradient>
                   </defs>
-                  <path d="{path_d} L {560:.1f} 80 L 0 80 Z" fill="url(#cg)"/>
+                  <path d="{path_d} L 560 80 L 0 80 Z" fill="url(#cg2)"/>
                   <path d="{path_d}" fill="none" stroke="{line_color}" stroke-width="2"/>
                   <text x="0" y="90" fill="var(--muted)" font-size="9" font-family="JetBrains Mono">₦{chart_min:,.0f}</text>
-                  <text x="0" y="8" fill="var(--muted)" font-size="9" font-family="JetBrains Mono">₦{chart_max:,.0f}</text>
-                  <text x="480" y="90" fill="{line_color}" font-size="9" font-family="JetBrains Mono">₦{latest_v:,.0f}</text>
+                  <text x="0" y="8"  fill="var(--muted)" font-size="9" font-family="JetBrains Mono">₦{chart_max:,.0f}</text>
+                  <text x="470" y="90" fill="{line_color}" font-size="9" font-family="JetBrains Mono">₦{chart_vals[-1]:,.0f}</text>
                 </svg></div>""", unsafe_allow_html=True)
 
-            # Table
+            df_hist = pd.DataFrame([{
+                "Time":     d.get("timestamp","")[:16].replace("T"," "),
+                "CBN Rate": d.get("cbn_rate"),
+                "P2P Mid":  d.get("p2p_mid"),
+                "Source":   d.get("rate_source",""),
+            } for d in hist_data[-50:]]).dropna(subset=["CBN Rate"])
+
             st.markdown('<div class="card"><div class="sec-header">DATA TABLE</div>', unsafe_allow_html=True)
-            st.dataframe(
-                df.tail(30).sort_values("Time", ascending=False),
-                use_container_width=True,
-                hide_index=True
-            )
+            st.dataframe(df_hist.tail(30).sort_values("Time", ascending=False),
+                         use_container_width=True, hide_index=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
-            # Stats
             if len(chart_vals) >= 3:
-                s1, s2, s3, s4 = st.columns(4)
+                s1,s2,s3,s4 = st.columns(4)
                 for col, lbl, val, clr in [
-                    (s1, "Avg Rate", f"₦{np.mean(chart_vals):,.0f}", "var(--text)"),
-                    (s2, "Volatility (σ)", f"₦{np.std(chart_vals):,.0f}", "var(--amber)"),
-                    (s3, "Session High", f"₦{max(chart_vals):,.0f}", "var(--green)"),
-                    (s4, "Session Low", f"₦{min(chart_vals):,.0f}", "var(--red)"),
+                    (s1,"Avg CBN Rate", f"₦{np.mean(chart_vals):,.0f}", "var(--text)"),
+                    (s2,"Volatility (σ)",f"₦{np.std(chart_vals):,.0f}","var(--amber)"),
+                    (s3,"Session High",  f"₦{max(chart_vals):,.0f}",   "var(--green)"),
+                    (s4,"Session Low",   f"₦{min(chart_vals):,.0f}",   "var(--red)"),
                 ]:
                     col.markdown(f"""<div class="card" style="margin-top:12px;padding:14px 16px;">
                     <div class="card-label">{lbl}</div>
                     <div style="font-family:var(--font-mono);font-size:18px;font-weight:700;color:{clr};">{val}</div>
                     </div>""", unsafe_allow_html=True)
 
-
-    # ══════ TAB 6: CHAT ══════
-    with tab6:
-        st.markdown('<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--cyan);margin-bottom:12px;">💬 ASK THE ORACLE</div>',
+    # ══════ TAB 7: CHAT ══════
+    with tab7:
+        st.markdown('<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--cyan);margin-bottom:12px;">💬 ASK THE ORACLE (CBN RATE FOCUS)</div>',
                     unsafe_allow_html=True)
-
-        # Quick prompts
         quick_prompts = [
-            "What's your 7-day forecast and why?",
-            "Which timeframe has the highest confidence?",
-            "What are the biggest risks to the 30-day forecast?",
-            "Should I convert USDT to NGN today?",
-            "How does oil price affect NGN right now?",
-            "What's the 2-year structural outlook?",
+            "What's the 7-day CBN rate forecast and why?",
+            "How reliable are the current confidence numbers?",
+            "What are the biggest risks to NGN right now?",
+            "Should I convert USD to NGN today?",
+            "How does oil price affect the CBN official rate?",
+            "What's the 2-year structural outlook for NGN?",
         ]
         clicked = None
         qcols = st.columns(3)
         for i, qp in enumerate(quick_prompts):
             if qcols[i%3].button(qp, key=f"qp_{i}", use_container_width=True):
                 clicked = qp
-
         st.markdown('<div class="hdivider"></div>', unsafe_allow_html=True)
-
-        # Chat messages
         for msg_data in st.session_state.chat:
             if msg_data["r"] == "u":
                 st.markdown(f'<div class="chat-u">👤 {msg_data["c"]}</div>', unsafe_allow_html=True)
             else:
-                st.markdown(f'<div class="chat-a"><div class="chat-badge">🔮 ORACLE</div>{msg_data["c"]}</div>',
+                st.markdown(f'<div class="chat-a"><div class="chat-badge">🏦 CBN ORACLE</div>{msg_data["c"]}</div>',
                             unsafe_allow_html=True)
-
         inp_col, btn_col = st.columns([5,1])
         with inp_col:
-            user_msg = st.text_input("Ask Oracle anything about USDT/NGN...", key="chat_input", label_visibility="collapsed",
-                                     placeholder="e.g. What's the 30-day forecast and what's driving it?")
+            user_msg = st.text_input("Ask the Oracle about USD/NGN...", key="chat_input",
+                                     label_visibility="collapsed",
+                                     placeholder="e.g. What is driving the CBN rate today?")
         with btn_col:
             send = st.button("Send →", use_container_width=True)
-
         question = user_msg if (send and user_msg) else clicked
         if question:
             st.session_state.chat.append({"r":"u","c":question})
@@ -2804,349 +2451,168 @@ else:
                 reply = chat_response(question, r)
             st.session_state.chat.append({"r":"a","c":reply})
             st.rerun()
-
         if st.session_state.chat:
             if st.button("🗑 Clear Chat", key="clear_chat"):
                 st.session_state.chat = []
                 st.rerun()
 
-
-    # ══════ TAB 7: ALERTS ══════
-    with tab7:
+    # ══════ TAB 8: ALERTS ══════
+    with tab8:
         al1, al2 = st.columns(2)
         with al1:
             st.markdown("""<div class="card"><div class="sec-header">📧 EMAIL ALERTS</div>
             <p style="font-size:12px;color:var(--text2);line-height:1.6;margin-bottom:12px;">
-            Get notified when the rate crosses your target — includes live ML prediction and recommendation.</p>
-            </div>""", unsafe_allow_html=True)
-
-            user_email = st.text_input("Your Email Address", value=st.session_state.user_email,
+            Get notified when the CBN official rate crosses your target.</p></div>""",
+            unsafe_allow_html=True)
+            user_email = st.text_input("Your Email", value=st.session_state.user_email,
                                        placeholder="yourname@gmail.com", key="alert_email_input")
             st.session_state.user_email = user_email
-
             if user_email:
                 if st.button("🧪 Send Test Email", use_container_width=True):
                     rk = RESEND_KEY
                     if rk:
-                        test_html = build_email_html("Test — Oracle email is connected!",
-                                                     p2p_mid, direction, conf, pred_low, pred_high,
-                                                     narratives.get("trade_recommendation","See Oracle for full analysis."))
-                        ok = send_email_alert(user_email, "✅ USDT/NGN Oracle — Test Alert", test_html, rk)
+                        html = (f'<div style="font-family:Arial;padding:20px;background:#060912;color:#cfe0f5;border-radius:10px;">'
+                                f'<h2>✅ CBN Rate Oracle — Test Email</h2>'
+                                f'<p>CBN Rate: ₦{cbn_rate:,.2f} | Direction: {direction}</p></div>')
+                        ok = send_email_alert(user_email, "✅ CBN Rate Oracle — Test Alert", html, rk)
                         if ok: st.success("✅ Test email sent!")
                         else:  st.error("❌ Failed. Check RESEND_API_KEY in secrets.")
                     else:
-                        st.error("❌ RESEND_API_KEY not configured in secrets.toml.")
+                        st.error("❌ RESEND_API_KEY not configured.")
                 if RESEND_KEY:
-                    st.markdown('<div class="alert-box alert-bull" style="margin-top:8px;font-size:11px;">✅ Email service connected</div>',
-                                unsafe_allow_html=True)
+                    st.markdown('<div class="alert-box alert-bull" style="margin-top:8px;font-size:11px;">✅ Email service connected</div>', unsafe_allow_html=True)
                 else:
-                    st.markdown('<div class="alert-box alert-warn" style="margin-top:8px;font-size:11px;">⚠️ Add RESEND_API_KEY to secrets.toml. Free at resend.com</div>',
-                                unsafe_allow_html=True)
-
+                    st.markdown('<div class="alert-box alert-warn" style="margin-top:8px;font-size:11px;">⚠️ Add RESEND_API_KEY to secrets.toml (free at resend.com)</div>', unsafe_allow_html=True)
         with al2:
-            st.markdown(f"""<div class="card"><div class="sec-header">🔔 SET PRICE ALERT</div>
-            <p style="font-size:12px;color:var(--text2);line-height:1.6;margin-bottom:12px;">
-            Alert fires on next analysis run when the live P2P rate crosses your target.</p>
-            </div>""", unsafe_allow_html=True)
-
+            st.markdown(f"""<div class="card"><div class="sec-header">🔔 SET PRICE ALERT (CBN RATE)</div></div>""",
+                        unsafe_allow_html=True)
             a_level = st.number_input("Alert price (₦)", min_value=100.0, max_value=9999.0,
-                                       value=float(round(p2p_mid * 1.01)), step=10.0, key="alert_price_input")
-            a_type  = st.selectbox("Alert when rate goes:", ["above", "below"], key="alert_type_select")
+                                      value=float(round(cbn_rate * 1.01)), step=10.0, key="alert_price_input")
+            a_type  = st.selectbox("Alert when CBN rate goes:", ["above","below"], key="alert_type_select")
             if st.button("+ Add Alert", use_container_width=True, key="add_alert_btn"):
                 st.session_state.alerts.append({"level": a_level, "type": a_type})
-                em = "📧" if user_email else "🔕"
-                st.success(f"Alert set: {em} notify when rate goes {a_type} ₦{a_level:,.0f}")
-
-            st.markdown(f"""<div style="background:var(--bg2);border:1px solid var(--border);
-            border-radius:var(--r-sm);padding:12px 14px;margin-top:8px;text-align:center;">
-            <div style="font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-family:var(--font-mono);">Current P2P Rate</div>
-            <div style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:var(--green);margin-top:4px;">₦{p2p_mid:,.2f}</div>
-            <div style="font-size:10px;color:var(--muted2);">{raw.get("rate_source","—")}</div>
+                st.success(f"Alert set: notify when CBN rate goes {a_type} ₦{a_level:,.0f}")
+            st.markdown(f"""<div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-sm);
+            padding:12px 14px;margin-top:8px;text-align:center;">
+            <div style="font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-family:var(--font-mono);">CBN Official Rate</div>
+            <div style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:var(--green);margin-top:4px;">₦{cbn_rate:,.2f}</div>
+            <div style="font-size:10px;color:var(--muted2);">{raw.get("source","—")[:35]}</div>
             </div>""", unsafe_allow_html=True)
-
         if st.session_state.alerts:
             st.markdown('<div class="card" style="margin-top:16px;"><div class="sec-header">ACTIVE ALERTS</div>',
                         unsafe_allow_html=True)
             for i, a in enumerate(st.session_state.alerts):
                 triggered_flag = i in st.session_state.alert_triggered
-                acol1, acol2, acol3 = st.columns([4,2,1])
-                with acol1:
+                ac1, ac2, ac3 = st.columns([4,2,1])
+                with ac1:
                     arrow = "▲" if a["type"]=="above" else "▼"
-                    em = "📧" if st.session_state.user_email else "🔕"
-                    status_badge = ('<span style="color:var(--green);font-size:10px;">✅ Triggered</span>'
-                                   if triggered_flag else '<span style="color:var(--amber);font-size:10px;">⏳ Watching</span>')
-                    st.markdown(f'<span style="font-size:13px;">{em} {arrow} ₦{a["level"]:,} ({a["type"]})</span> {status_badge}',
-                                unsafe_allow_html=True)
-                with acol2:
-                    dist = a["level"] - p2p_mid
+                    status = '<span style="color:var(--green);font-size:10px;">✅ Triggered</span>' if triggered_flag else '<span style="color:var(--amber);font-size:10px;">⏳ Watching</span>'
+                    st.markdown(f'<span style="font-size:13px;">{arrow} ₦{a["level"]:,} ({a["type"]})</span> {status}', unsafe_allow_html=True)
+                with ac2:
+                    dist = a["level"] - cbn_rate
                     dc2 = "var(--green)" if ((a["type"]=="above" and dist>0) or (a["type"]=="below" and dist<0)) else "var(--red)"
-                    st.markdown(f'<span style="font-family:var(--font-mono);font-size:11px;color:{dc2};">{dist:+,.0f} from now</span>',
-                                unsafe_allow_html=True)
-                with acol3:
+                    st.markdown(f'<span style="font-family:var(--font-mono);font-size:11px;color:{dc2};">{dist:+,.0f} from now</span>', unsafe_allow_html=True)
+                with ac3:
                     if st.button("✕", key=f"del_alert_{i}"):
                         st.session_state.alerts.pop(i)
                         if i in st.session_state.alert_triggered:
                             st.session_state.alert_triggered.remove(i)
                         st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
-        else:
-            st.markdown("""<div class="card" style="text-align:center;padding:24px;margin-top:16px;">
-            <div style="font-size:24px;opacity:0.3;margin-bottom:8px;">🔔</div>
-            <p style="color:var(--text2);font-size:12px;">No active alerts. Set one above.</p>
-            </div>""", unsafe_allow_html=True)
-
-
-    # ══════ TAB 8: ML METRICS ══════
-    with tab8:
-        st.markdown('<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--purple);margin-bottom:16px;">🔬 ML MODEL DIAGNOSTICS</div>',
-                    unsafe_allow_html=True)
-
-        if cold:
-            st.markdown(f'<div class="alert-box alert-warn">⚠️ <strong>Cold Start Mode</strong> — {ml.get("note","")} Run analysis 5+ times to unlock full ML metrics.</div>',
-                        unsafe_allow_html=True)
-        else:
-            mm1, mm2, mm3, mm4 = st.columns(4)
-            for col, lbl, val, clr in [
-                (mm1, "Training Points", str(metrics.get("n_training_points",0)), "var(--amber)"),
-                (mm2, "R² In-Sample",    f"{metrics.get('r2_in_sample',0):.4f}" if metrics.get("r2_in_sample") else "N/A", "var(--blue)"),
-                (mm3, "Model Agreement", f"{metrics.get('agreement_score',0):.1f}%", "var(--green)"),
-                (mm4, "MAE Confidence",  f"{metrics.get('mae_conf',0):.1f}%", "var(--purple)"),
-            ]:
-                col.markdown(f"""<div class="card">
-                <div class="card-label">{lbl}</div>
-                <div style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:{clr};">{val}</div>
-                </div>""", unsafe_allow_html=True)
-
-            st.markdown("<br>", unsafe_allow_html=True)
-
-            # Cross-val MAEs
-            ml_met1, ml_met2 = st.columns(2)
-            with ml_met1:
-                st.markdown('<div class="card"><div class="sec-header">CROSS-VALIDATED MAE (5-FOLD)</div>',
-                            unsafe_allow_html=True)
-                for m_lbl, m_badge, mae_val in [
-                    ("Ridge Regression",   "badge-ridge", metrics.get("ridge_cv_mae")),
-                    ("Random Forest",      "badge-rf",    metrics.get("rf_cv_mae")),
-                    ("Gradient Boosting",  "badge-gb",    metrics.get("gb_cv_mae")),
-                ]:
-                    val_s = f"₦{mae_val:.2f}" if mae_val else "N/A"
-                    pct_s = f"({mae_val/max(p2p_mid,1)*100:.3f}% of rate)" if mae_val else ""
-                    st.markdown(f"""<div style="padding:10px 0;border-bottom:1px solid var(--border);
-                    display:flex;align-items:center;justify-content:space-between;">
-                    <span class="model-badge {m_badge}">{m_lbl}</span>
-                    <div style="font-family:var(--font-mono);font-size:13px;">
-                    <span style="color:var(--amber);">{val_s}</span>
-                    <span style="color:var(--muted);font-size:10px;"> {pct_s}</span></div>
-                    </div>""", unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-
-            with ml_met2:
-                # Feature Importances
-                top_f = ml.get("rf_feature_importance", {})
-                if top_f:
-                    st.markdown('<div class="card"><div class="sec-header">RF FEATURE IMPORTANCES (TOP 10)</div>',
-                                unsafe_allow_html=True)
-                    max_imp = max(top_f.values()) if top_f else 1
-                    for fname, fval in list(top_f.items())[:10]:
-                        pct = fval / max_imp * 100
-                        clean_name = fname.replace("_"," ").upper()
-                        st.markdown(f"""<div class="prog-wrap">
-                        <div class="prog-label">
-                          <span style="font-size:10px;color:var(--text2);">{clean_name}</span>
-                          <span style="font-family:var(--font-mono);font-size:10px;color:var(--amber);">{fval:.4f}</span>
-                        </div>
-                        <div class="prog-track"><div class="prog-fill" style="width:{pct}%;background:var(--blue);"></div></div>
-                        </div>""", unsafe_allow_html=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-
-            # Methodology explainer
-            st.markdown(f"""<div class="card" style="margin-top:14px;">
-            <div class="sec-header">📚 MODEL METHODOLOGY</div>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;font-size:12px;color:var(--text2);line-height:1.65;">
-              <div><strong style="color:var(--blue);">Ridge Regression (weight: 25%)</strong><br>
-              Regularised linear model. Best for capturing stable directional trends. Prevents overfitting via L2 penalty.</div>
-              <div><strong style="color:var(--green);">Random Forest (weight: 35%)</strong><br>
-              Ensemble of 200 decision trees. Detects non-linear patterns, regime shifts. Feature importance from node impurity.</div>
-              <div><strong style="color:var(--purple);">Gradient Boosting (weight: 40%)</strong><br>
-              Sequential error-correction (150 estimators). Most powerful for time-series patterns. Highest ensemble weight.</div>
-              <div><strong style="color:var(--amber);">Confidence Score</strong><br>
-              = 45% × model agreement + 40% × MAE-based accuracy + 15% × sample size bonus. Capped at 92%.</div>
-            </div>
-            </div>""", unsafe_allow_html=True)
-
 
     # ══════ TAB 9: DIAGNOSTICS ══════
     with tab9:
-        st.markdown('''<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;
-        text-transform:uppercase;color:var(--cyan);margin-bottom:16px;">
-        🩺 LIVE SYSTEM DIAGNOSTICS — why qualitative scores are 0 and what each pipeline stage returned
-        </div>''', unsafe_allow_html=True)
-
+        st.markdown('<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--cyan);margin-bottom:16px;">🩺 SYSTEM DIAGNOSTICS</div>',
+                    unsafe_allow_html=True)
         sig_diag = st.session_state.global_signals or {}
-
-        # ── FORCE REFRESH BUTTON ──
-        col_btn1, col_btn2 = st.columns([1,3])
-        with col_btn1:
-            if st.button("🔄 Force Refresh All Signals Now", key="diag_refresh"):
+        c_btn, _ = st.columns([1,3])
+        with c_btn:
+            if st.button("🔄 Force Refresh All Signals", key="diag_refresh"):
                 maybe_refresh_signals(force=True)
                 st.rerun()
 
-        # ── SHOW ALL ERRORS FIRST (most useful diagnostic info) ──
-        gen_errs_top = sig_diag.get("errors", [])
-        rss_errs_top = sig_diag.get("rss_errors", [])
-        all_errs = gen_errs_top + rss_errs_top
+        gen_errs = sig_diag.get("errors", [])
+        rss_errs = sig_diag.get("rss_errors", [])
+        all_errs = gen_errs + rss_errs
         if all_errs:
-            st.markdown('''<div class="alert-box alert-warn" style="margin-top:10px;">
-            <strong>🚨 Pipeline errors detected — these explain why data is missing:</strong>
-            </div>''', unsafe_allow_html=True)
+            st.markdown('<div class="alert-box alert-warn"><strong>🚨 Pipeline errors:</strong></div>', unsafe_allow_html=True)
             for e in all_errs[:20]:
-                st.markdown(
-                    f'<div style="font-size:11px;font-family:var(--font-mono);color:var(--red);'
-                    f'background:rgba(255,68,102,0.07);padding:4px 10px;border-radius:4px;margin-bottom:3px;">'
-                    f'❌ {e}</div>',
-                    unsafe_allow_html=True)
+                st.markdown(f'<div style="font-size:11px;font-family:var(--font-mono);color:var(--red);background:rgba(255,68,102,0.07);padding:4px 10px;border-radius:4px;margin-bottom:3px;">❌ {e}</div>', unsafe_allow_html=True)
 
-        # ── NETWORK DIAGNOSIS ──
-        all_sources_empty = len(sig_diag.get("sources", [])) == 0
-        if all_sources_empty:
-            st.markdown('''<div class="alert-box alert-warn" style="margin-top:10px;">
-            <strong>⛔ ALL data sources failed simultaneously.</strong><br><br>
-            This almost always means <strong>outbound HTTP is blocked</strong> on this server — not a code bug.<br><br>
-            <strong>If running on Streamlit Community Cloud:</strong> outbound requests to some domains
-            may be rate-limited or blocked by Cloudflare WAF. Try switching to a paid proxy or VPN-routed deployment.<br><br>
-            <strong>If running locally:</strong> check your firewall / corporate proxy settings.
-            Run this in your terminal to test:<br>
-            <code>curl -I https://api.coingecko.com/api/v3/ping</code><br>
-            A 200 response means the network is fine and the issue is elsewhere.
-            A timeout or 403 confirms network blocking.
-            </div>''', unsafe_allow_html=True)
-
-        # ── PIPELINE STATUS ──
-        st.markdown('''<div class="sec-header" style="margin-top:12px;">⚙️ PIPELINE STATUS</div>''', unsafe_allow_html=True)
+        st.markdown('<div class="sec-header" style="margin-top:12px;">⚙️ PIPELINE STATUS</div>', unsafe_allow_html=True)
         pipe_items = [
-            ("CoinGecko (BTC/ETH prices)",  bool(sig_diag.get("btc_usd")),         f"BTC=${sig_diag.get('btc_usd','missing')}"),
-            ("ExchangeRate-API (FX rates)", bool(sig_diag.get("usd_ngn_official")), f"USD/NGN={sig_diag.get('usd_ngn_official','missing')}"),
-            ("Fear & Greed Index",          bool(sig_diag.get("fear_greed_value")), f"{sig_diag.get('fear_greed_value','missing')} — {sig_diag.get('fear_greed_label','')}"),
-            ("Google News RSS",             sig_diag.get("rss_ok_count",0) > 0,     f"{sig_diag.get('rss_ok_count',0)}/{18} feeds returned headlines"),
-            ("GNews API",                   sig_diag.get("gnews_count",0) > 0,      f"{sig_diag.get('gnews_count',0)} headlines fetched from GNews"),
-            ("Headlines parsed",            sig_diag.get("headline_count",0) > 0,   f"{sig_diag.get('headline_count',0)} total headlines"),
-            ("Gemini AI analysis",          bool(sig_diag.get("analysis")),          "JSON parsed OK" if sig_diag.get("analysis") else "FAILED or empty"),
+            ("CBN Rate Fetched",        bool(raw.get("cbn_rate")),          f"₦{raw.get('cbn_rate',0):,.2f} | {raw.get('source','')}"),
+            ("P2P Rate (signal)",       bool(raw.get("p2p_mid")),           f"₦{raw.get('p2p_mid','N/A')}"),
+            ("ExchangeRate-API (FX)",   bool(sig_diag.get("usd_ngn_official")), f"USD/NGN={sig_diag.get('usd_ngn_official','missing')}"),
+            ("CoinGecko (BTC/ETH)",     bool(sig_diag.get("btc_usd")),      f"BTC=${sig_diag.get('btc_usd','missing')}"),
+            ("Fear & Greed",            bool(sig_diag.get("fear_greed_value")), f"{sig_diag.get('fear_greed_value','missing')}"),
+            ("Google News RSS",         sig_diag.get("rss_ok_count",0) > 0, f"{sig_diag.get('rss_ok_count',0)}/18 feeds"),
+            ("GNews API",               sig_diag.get("gnews_count",0) > 0,  f"{sig_diag.get('gnews_count',0)} headlines"),
+            ("Gemini AI",               bool(sig_diag.get("analysis")),     "JSON parsed OK" if sig_diag.get("analysis") else "FAILED"),
+            ("Walk-Forward Backtest",   bt_stats.get("ready",False),        f"{bt_stats.get('n',0)} obs · MAE ₦{bt_stats.get('mae','—')}"),
         ]
-        for label, ok, detail in pipe_items:
+        for lbl, ok, detail in pipe_items:
             icon  = "✅" if ok else "❌"
             color = "var(--green)" if ok else "var(--red)"
-            st.markdown(
-                f'''<div style="display:flex;justify-content:space-between;padding:8px 12px;
-                border:1px solid var(--border);border-radius:6px;margin-bottom:6px;background:rgba(255,255,255,0.02);">
-                <span style="font-size:12px;color:var(--text2);">{icon} {label}</span>
-                <span style="font-family:var(--font-mono);font-size:11px;color:{color};">{detail}</span>
-                </div>''', unsafe_allow_html=True)
+            st.markdown(f'<div style="display:flex;justify-content:space-between;padding:8px 12px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;background:rgba(255,255,255,0.02);">'
+                        f'<span style="font-size:12px;color:var(--text2);">{icon} {lbl}</span>'
+                        f'<span style="font-family:var(--font-mono);font-size:11px;color:{color};">{detail}</span>'
+                        f'</div>', unsafe_allow_html=True)
 
-        # ── QUALITATIVE SCORES ──
-        st.markdown('''<div class="sec-header" style="margin-top:16px;">📊 QUALITATIVE SCORES (what the model received)</div>''', unsafe_allow_html=True)
-        analysis_diag = sig_diag.get("analysis", {})
-        score_fields = [
-            ("overall_score",           "Overall Signal"),
-            ("nigeria_macro",           "Nigeria Macro"),
-            ("cbn_policy",              "CBN Policy"),
-            ("oil_impact",              "Oil Impact"),
-            ("usd_fed_impact",          "USD / Fed"),
-            ("crypto_sentiment",        "Crypto Sentiment"),
-            ("geopolitical_risk",       "Geopolitical Risk"),
-            ("political_risk_nigeria",  "Nigeria Political"),
-            ("remittance_flow",         "Remittance Flow"),
-            ("global_em_risk",          "Global EM Risk"),
-        ]
-        if analysis_diag:
-            for key, label in score_fields:
-                val = analysis_diag.get(key, "MISSING")
-                color = "var(--green)" if isinstance(val,int) and val>5 else "var(--red)" if isinstance(val,int) and val<-5 else "var(--amber)"
-                zero_warn = " ⚠️ zero!" if val == 0 else ""
-                st.markdown(
-                    f'<span style="font-size:11px;color:var(--text2);font-family:var(--font-mono);">{label}: '
-                    f'<strong style="color:{color};">{val}{zero_warn}</strong></span><br>',
-                    unsafe_allow_html=True)
+        # ML Diagnostics
+        st.markdown('<div class="sec-header" style="margin-top:14px;">🤖 ML MODEL DIAGNOSTICS</div>', unsafe_allow_html=True)
+        if cold:
+            st.markdown(f'<div class="alert-box alert-warn">⚠️ Cold Start — {ml.get("note","")} Run analysis 5+ times.</div>', unsafe_allow_html=True)
         else:
-            st.markdown('''<div class="alert-box alert-warn">⚠️ No analysis object found.
-            Gemini either failed to respond or returned non-JSON text. See errors below.</div>''', unsafe_allow_html=True)
+            mm1,mm2,mm3,mm4 = st.columns(4)
+            for col, lbl, val, clr in [
+                (mm1,"Training Points",str(metrics.get("n_training_points",0)),"var(--amber)"),
+                (mm2,"R² In-Sample",   f"{metrics.get('r2_in_sample',0):.4f}" if metrics.get("r2_in_sample") else "N/A","var(--blue)"),
+                (mm3,"Model Agreement",f"{metrics.get('agreement_score',0):.1f}%","var(--green)"),
+                (mm4,"In-Sample MAE",  f"₦{min(x for x in [metrics.get('ridge_cv_mae'),metrics.get('rf_cv_mae'),metrics.get('gb_cv_mae')] if x) :,.2f}" if any(metrics.get(k) for k in ['ridge_cv_mae','rf_cv_mae','gb_cv_mae']) else "N/A","var(--amber)"),
+            ]:
+                col.markdown(f"""<div class="card" style="margin-top:6px;padding:12px 14px;">
+                <div class="card-label">{lbl}</div>
+                <div style="font-family:var(--font-mono);font-size:18px;font-weight:700;color:{clr};">{val}</div>
+                </div>""", unsafe_allow_html=True)
+            st.markdown("""<div class="alert-box alert-info" style="margin-top:12px;font-size:11px;">
+            ℹ️ <strong>In-sample metrics (above) are shown for diagnostics only</strong> and are NOT used to compute
+            the headline confidence %. Confidence is derived exclusively from the walk-forward backtest
+            to prevent data leakage and overconfident reporting.</div>""", unsafe_allow_html=True)
 
-        # ── GEMINI RAW RESPONSE ──
+            top_f = ml.get("rf_feature_importance", {})
+            if top_f:
+                st.markdown('<div class="card" style="margin-top:12px;"><div class="sec-header">RF FEATURE IMPORTANCES (TOP 10)</div>', unsafe_allow_html=True)
+                max_imp = max(top_f.values()) if top_f else 1
+                for fname, fval in list(top_f.items())[:10]:
+                    pct = fval / max_imp * 100
+                    st.markdown(f"""<div class="prog-wrap">
+                    <div class="prog-label">
+                      <span style="font-size:10px;color:var(--text2);">{fname.replace("_"," ").upper()}</span>
+                      <span style="font-family:var(--font-mono);font-size:10px;color:var(--amber);">{fval:.4f}</span>
+                    </div>
+                    <div class="prog-track"><div class="prog-fill" style="width:{pct}%;background:var(--blue);"></div></div>
+                    </div>""", unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
         if sig_diag.get("gemini_raw_response"):
-            st.markdown('''<div class="sec-header" style="margin-top:16px;">🤖 GEMINI RAW RESPONSE (first 500 chars)</div>''', unsafe_allow_html=True)
+            st.markdown('<div class="sec-header" style="margin-top:16px;">🤖 GEMINI RAW RESPONSE</div>', unsafe_allow_html=True)
             st.code(sig_diag["gemini_raw_response"], language="json")
 
-        # ── RSS FIRST RESPONSE (key diagnostic — confirms if Cloudflare is intercepting) ──
-        rss_first = sig_diag.get("rss_first_response")
-        if rss_first:
-            st.markdown('''<div class="sec-header" style="margin-top:16px;">📡 RSS FIRST RAW RESPONSE (confirms if Cloudflare is blocking)</div>''', unsafe_allow_html=True)
-            st.code(rss_first, language=None)
-            if "DOCTYPE html" in rss_first or "cloudflare" in rss_first.lower() or "captcha" in rss_first.lower() or "Just a moment" in rss_first:
-                st.markdown('''<div class="alert-box alert-warn">
-                ⛔ <strong>Confirmed: Cloudflare is intercepting RSS requests.</strong>
-                Google News RSS is returning an HTML CAPTCHA page instead of XML.
-                This is a known Streamlit Cloud issue. The fix is to use GNews API only (already enabled)
-                or add a proxy. Check if GNews errors below show why it also failed.
-                </div>''', unsafe_allow_html=True)
-        if sig_diag.get("coingecko_raw"):
-            st.markdown('''<div class="sec-header" style="margin-top:10px;">🪙 COINGECKO RAW RESPONSE</div>''', unsafe_allow_html=True)
-            st.code(sig_diag["coingecko_raw"], language=None)
-
-        # ── RSS ERRORS ──
-        rss_errs = sig_diag.get("rss_errors", [])
-        if rss_errs:
-            st.markdown('''<div class="sec-header" style="margin-top:16px;">📡 RSS FEED ERRORS</div>''', unsafe_allow_html=True)
-            for e in rss_errs:
-                st.markdown(f'<div style="font-size:11px;font-family:var(--font-mono);color:var(--red);padding:2px 0;">❌ {e}</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div style="font-size:11px;color:var(--amber);margin-top:10px;">⚠️ No RSS errors logged — but 0 headlines means requests returned 200 with non-RSS content (CAPTCHA/redirect)</div>', unsafe_allow_html=True)
-
-        # ── GEMINI RAW ERROR ──
-        if sig_diag.get("gemini_raw_error"):
-            st.markdown('''<div class="sec-header" style="margin-top:16px;">🤖 GEMINI ERROR DETAIL</div>''', unsafe_allow_html=True)
-            st.code(sig_diag["gemini_raw_error"], language=None)
-
-        # ── SAMPLE HEADLINES ──
         headlines_diag = sig_diag.get("headlines", [])
-        st.markdown(f'''<div class="sec-header" style="margin-top:16px;">📰 SAMPLE HEADLINES FETCHED ({len(headlines_diag)} total)</div>''', unsafe_allow_html=True)
+        st.markdown(f'<div class="sec-header" style="margin-top:16px;">📰 SAMPLE HEADLINES ({len(headlines_diag)} total)</div>', unsafe_allow_html=True)
         if headlines_diag:
             for h in headlines_diag[:12]:
-                st.markdown(
-                    f'<div style="font-size:11px;color:var(--text2);padding:4px 0;border-bottom:1px solid var(--border);">'
-                    f'<span style="color:var(--cyan);font-family:var(--font-mono);font-size:9px;">{h.get("tag","")}</span> '
-                    f'{h.get("title","")}</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('''<div class="alert-box alert-warn">
-            ⚠️ <strong>Zero headlines fetched.</strong> This is why qualitative scores are all 0.<br><br>
-            <strong>Possible causes:</strong><br>
-            • Google News RSS is returning empty XML or a CAPTCHA/redirect (common on new deployments)<br>
-            • Network/firewall blocking outbound RSS requests from the server<br>
-            • The RSS CDATA format changed — try clicking Force Refresh above<br>
-            • Weekend/after-hours: news still flows 24/7, this should not cause 0 headlines<br><br>
-            <strong>Fix:</strong> Add a NewsAPI key to secrets.toml as NEWS_KEY — it is a more reliable fallback.
-            </div>''', unsafe_allow_html=True)
+                st.markdown(f'<div style="font-size:11px;color:var(--text2);padding:4px 0;border-bottom:1px solid var(--border);">'
+                            f'<span style="color:var(--cyan);font-family:var(--font-mono);font-size:9px;">{h.get("tag","")}</span> '
+                            f'{h.get("title","")}</div>', unsafe_allow_html=True)
 
-        # ── DATA SOURCES ──
-        sources = sig_diag.get("sources", [])
-        st.markdown(f'''<div class="sec-header" style="margin-top:16px;">✅ ACTIVE DATA SOURCES ({len(sources)})</div>''', unsafe_allow_html=True)
-        for s in sources:
-            st.markdown(f'<div style="font-size:11px;color:var(--green);font-family:var(--font-mono);padding:2px 0;">✓ {s}</div>', unsafe_allow_html=True)
-
-        # ── SIGNALS TTL ──
-        sig_time = st.session_state.global_signals_time
-        if sig_time:
-            age_s = (datetime.datetime.now() - sig_time).total_seconds()
-            st.markdown(
-                f'''<div style="font-size:11px;font-family:var(--font-mono);color:var(--muted);margin-top:14px;">
-                🕐 Signals last fetched: {int(age_s//60)}m {int(age_s%60)}s ago
-                (TTL={SIGNALS_TTL}s — refreshes every {SIGNALS_TTL//60}min)
-                </div>''', unsafe_allow_html=True)
-
-    # ── DISCLAIMER ──
+    # ── FOOTER DISCLAIMER ──
     st.markdown("""
     <div style="font-size:10px;color:var(--muted);margin-top:24px;line-height:1.7;
     padding:14px 16px;border-top:1px solid var(--border);text-align:center;">
-      ⚠️ Statistical models and AI predictions carry inherent uncertainty.
-      Confidence degrades with time horizon — this is by design.
-      Not financial advice. Always do your own research (DYOR) before converting funds.
-      Short-term ML accuracy improves with more training data — run analysis frequently.
+      ⚠️ CBN official rate sourced from ExchangeRate-API / Frankfurter (IMF/central bank data, updates once per business day).
+      ML predictions use 3 models trained on historical CBN observations.
+      <strong>Confidence % is only shown once walk-forward backtest has ≥2 validated prediction pairs.</strong>
+      Not financial advice. Always DYOR before converting funds.
     </div>""", unsafe_allow_html=True)

@@ -1931,9 +1931,17 @@ if auto_ref and st.session_state.last_time and GEMINI_KEY:
             st.session_state.last_time = datetime.datetime.now()
         st.rerun()
     else:
-        rem = int((interval_sec - elapsed_sec) // 60)
-        st.markdown(f'<p style="font-size:10px;color:var(--green);text-align:right;margin-bottom:0;">🔄 Auto-refresh in {rem}m</p>',
-                    unsafe_allow_html=True)
+        rem_sec = int(interval_sec - elapsed_sec)
+        rem_min = rem_sec // 60
+        rem_s   = rem_sec % 60
+        st.markdown(
+            f'<p style="font-size:10px;color:var(--green);text-align:right;margin-bottom:0;">'
+            f'🔄 Auto-refresh in {rem_min}m {rem_s}s</p>',
+            unsafe_allow_html=True)
+        # Force Streamlit to re-execute the script every second so the
+        # elapsed-time check above can actually fire without user interaction.
+        time.sleep(1)
+        st.rerun()
 
 
 # ══════════════════════════════════════════════════════

@@ -522,10 +522,12 @@ init()
 try:
     GEMINI_KEY = st.secrets["GEMINI_KEY"]
     NEWS_KEY   = st.secrets.get("NEWS_KEY", "")
+    GNEWS_KEY  = st.secrets.get("GNEWS_KEY", "99cd5e7bef4bad5dbf125c9220282247")
     RESEND_KEY = st.secrets.get("RESEND_API_KEY", "")
 except Exception:
     GEMINI_KEY = ""
     NEWS_KEY   = ""
+    GNEWS_KEY  = "99cd5e7bef4bad5dbf125c9220282247"
     RESEND_KEY = ""
 
 if not GEMINI_KEY:
@@ -773,6 +775,58 @@ def fetch_global_signals() -> dict:
     sig["rss_ok_count"] = rss_ok_count
     sig["rss_errors"]   = rss_errors
 
+    # GNews API — primary paid supplement (always active when key is present)
+    gnews_count = 0
+    if GNEWS_KEY:
+        gnews_queries = [
+            ("Nigeria naira exchange rate",     "🇳🇬 GNews"),
+            ("CBN central bank forex Nigeria",  "🏦 GNews"),
+            ("Nigeria economy inflation",        "📉 GNews"),
+            ("crude oil price OPEC Brent",      "🛢️ GNews"),
+            ("Bitcoin crypto market",           "₿ GNews"),
+            ("US Federal Reserve dollar",       "🇺🇸 GNews"),
+            ("Nigeria USDT P2P crypto",         "💱 GNews"),
+            ("emerging markets currency",       "📊 GNews"),
+        ]
+        for q, tag in gnews_queries:
+            try:
+                r = requests.get(
+                    "https://gnews.io/api/v4/search",
+                    params={
+                        "q":        q,
+                        "lang":     "en",
+                        "max":      3,
+                        "sortby":   "publishedAt",
+                        "apikey":   GNEWS_KEY,
+                    },
+                    timeout=8,
+                    headers={"User-Agent": "Mozilla/5.0"}
+                )
+                if r.status_code == 200:
+                    for a in r.json().get("articles", [])[:2]:
+                        t = (a.get("title") or "").strip()
+                        d = (a.get("description") or "")[:150].strip()
+                        if t and len(t) > 8:
+                            headlines_raw.append({
+                                "tag":  tag,
+                                "title": t,
+                                "desc":  d,
+                                "full":  f"{tag} | {t}",
+                            })
+                            gnews_count += 1
+                elif r.status_code == 429:
+                    sig["errors"].append("GNews: rate limit hit (100 req/day free tier)")
+                    break
+                elif r.status_code == 403:
+                    sig["errors"].append(f"GNews: invalid API key or quota exceeded")
+                    break
+            except Exception as e:
+                sig["errors"].append(f"GNews {q[:20]}: {str(e)[:50]}")
+        if gnews_count > 0:
+            sig["sources"].append(f"GNews API ({gnews_count} headlines)")
+    sig["gnews_count"] = gnews_count
+
+    # NewsAPI — optional secondary supplement
     if NEWS_KEY:
         for q in ["Nigeria naira USDT", "oil price Iran", "CBN forex", "Nigeria economy"]:
             try:
@@ -792,8 +846,9 @@ def fetch_global_signals() -> dict:
 
     sig["headlines"]      = headlines_raw
     sig["headline_count"] = len(headlines_raw)
+    rss_src = f"Google News RSS ({rss_ok_count}/{len(rss_topics)} feeds)"
     if headlines_raw:
-        sig["sources"].append(f"Google News RSS ({len(headlines_raw)} headlines, {rss_ok_count}/{len(rss_topics)} feeds ok)")
+        sig["sources"].append(rss_src)
 
     # 6. GEMINI DEEP ANALYSIS
     # IMPORTANT: Always runs even without headlines — uses live market data as minimum input.
@@ -2797,6 +2852,7 @@ else:
             ("ExchangeRate-API (FX rates)", bool(sig_diag.get("usd_ngn_official")), f"USD/NGN={sig_diag.get('usd_ngn_official','missing')}"),
             ("Fear & Greed Index",          bool(sig_diag.get("fear_greed_value")), f"{sig_diag.get('fear_greed_value','missing')} — {sig_diag.get('fear_greed_label','')}"),
             ("Google News RSS",             sig_diag.get("rss_ok_count",0) > 0,     f"{sig_diag.get('rss_ok_count',0)}/{18} feeds returned headlines"),
+            ("GNews API",                   sig_diag.get("gnews_count",0) > 0,      f"{sig_diag.get('gnews_count',0)} headlines fetched from GNews"),
             ("Headlines parsed",            sig_diag.get("headline_count",0) > 0,   f"{sig_diag.get('headline_count',0)} total headlines"),
             ("Gemini AI analysis",          bool(sig_diag.get("analysis")),          "JSON parsed OK" if sig_diag.get("analysis") else "FAILED or empty"),
         ]

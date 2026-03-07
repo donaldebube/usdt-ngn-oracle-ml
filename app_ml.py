@@ -2139,42 +2139,55 @@ else:
             f_pct = f_data.get("pct_change", 0)
             f_conf= f_data.get("confidence", 0)
             fclr  = "var(--green)" if f_pct > 0.5 else "var(--red)" if f_pct < -0.5 else "var(--amber)"
+            central_val = f_data.get("central", 0)
+            fallback_nar = f"Forecast: \u20a6{central_val:,.0f} ({f_pct:+.1f}% from current rate)"
 
-            scenarios_html = ""
+            drivers_html = "".join([
+                f'<span style="background:rgba(68,136,255,0.12);color:var(--blue);border:1px solid rgba(68,136,255,0.25);'
+                f'border-radius:4px;padding:2px 8px;font-size:10px;font-family:var(--font-mono);margin-right:6px;">{d}</span>'
+                for d in drvrs if d
+            ])
+            drivers_row = f'<div style="margin-bottom:6px;">{drivers_html}</div>' if drivers_html else ""
+            risk_row    = f'<div style="margin-top:8px;font-size:11px;color:#ffaabb;"><strong>\u26a0\ufe0f Key risk:</strong> {risk}</div>' if risk else ""
+            nar_text    = nar if nar else fallback_nar
+
+            # Render the main card (no scenarios_html inside — avoids CSS {} conflict)
+            st.markdown(
+                f'<div class="card" style="margin-bottom:10px;border-left:3px solid {ac};">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+                f'<div style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:{ac};">{lbl} HORIZON</div>'
+                f'<div style="display:flex;gap:10px;align-items:center;">'
+                f'<span style="font-family:var(--font-mono);font-size:13px;color:{fclr};font-weight:700;">'
+                f'\u20a6{central_val:,.0f} ({f_pct:+.1f}%)</span>'
+                f'<span style="font-family:var(--font-mono);font-size:9px;color:var(--muted);">CONF {f_conf}%</span>'
+                f'</div></div>'
+                f'{drivers_row}'
+                f'<p style="font-size:12px;color:var(--text2);line-height:1.65;margin:0;">{nar_text}</p>'
+                f'{risk_row}'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+            # Render 30d bull/bear scenarios as a SEPARATE st.markdown call (avoids f-string CSS {} clash)
             if key == "30d":
-                bull_s = narratives.get("n30d_bull_scenario","")
-                bear_s = narratives.get("n30d_bear_scenario","")
+                bull_s = narratives.get("n30d_bull_scenario", "")
+                bear_s = narratives.get("n30d_bear_scenario", "")
                 if bull_s or bear_s:
-                    scenarios_html = f"""
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px;">
-                      <div class="scenario-card scenario-bull">
-                        <div style="font-size:9px;color:var(--green);font-family:var(--font-mono);letter-spacing:1px;margin-bottom:5px;">📈 BULL SCENARIO</div>
-                        <div style="font-size:11px;color:var(--text2);line-height:1.5;">{bull_s}</div>
-                      </div>
-                      <div class="scenario-card scenario-bear">
-                        <div style="font-size:9px;color:var(--red);font-family:var(--font-mono);letter-spacing:1px;margin-bottom:5px;">📉 BEAR SCENARIO</div>
-                        <div style="font-size:11px;color:var(--text2);line-height:1.5;">{bear_s}</div>
-                      </div>
-                    </div>"""
-
-            drivers_html = "".join([f'<span style="background:rgba(68,136,255,0.12);color:var(--blue);border:1px solid rgba(68,136,255,0.25);border-radius:4px;padding:2px 8px;font-size:10px;font-family:var(--font-mono);margin-right:6px;">{d}</span>' for d in drvrs if d])
-
-            st.markdown(f"""
-            <div class="card" style="margin-bottom:10px;border-left:3px solid {ac};">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                <div style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:{ac};">{lbl} HORIZON</div>
-                <div style="display:flex;gap:10px;align-items:center;">
-                  <span style="font-family:var(--font-mono);font-size:13px;color:{fclr};font-weight:700;">₦{f_data.get("central",0):,.0f} ({f_pct:+.1f}%)</span>
-                  <span style="font-family:var(--font-mono);font-size:9px;color:var(--muted);">CONF {f_conf}%</span>
-                </div>
-              </div>
-              {f'<div style="margin-bottom:6px;">{drivers_html}</div>' if drivers_html else ""}
-              <p style="font-size:12px;color:var(--text2);line-height:1.65;margin:0;">
-                {nar if nar else f"Forecast: ₦{f_data.get('central',0):,.0f} ({f_pct:+.1f}% from current rate)"}
-              </p>
-              {f'<div style="margin-top:8px;font-size:11px;color:#ffaabb;"><strong>⚠️ Key risk:</strong> {risk}</div>' if risk else ""}
-              {scenarios_html}
-            </div>""", unsafe_allow_html=True)
+                    st.markdown(
+                        '<div style="display:flex;gap:10px;margin-top:-6px;margin-bottom:10px;">'
+                        '<div class="scenario-card scenario-bull" style="flex:1;">'
+                        '<div style="font-size:9px;color:var(--green);font-family:var(--font-mono);'
+                        'letter-spacing:1px;margin-bottom:5px;">&#x1F4C8; BULL SCENARIO</div>'
+                        f'<div style="font-size:11px;color:var(--text2);line-height:1.5;">{bull_s}</div>'
+                        '</div>'
+                        '<div class="scenario-card scenario-bear" style="flex:1;">'
+                        '<div style="font-size:9px;color:var(--red);font-family:var(--font-mono);'
+                        'letter-spacing:1px;margin-bottom:5px;">&#x1F4C9; BEAR SCENARIO</div>'
+                        f'<div style="font-size:11px;color:var(--text2);line-height:1.5;">{bear_s}</div>'
+                        '</div>'
+                        '</div>',
+                        unsafe_allow_html=True
+                    )
 
         # Oil impact + CBN watch
         oil_impact_sum = narratives.get("oil_impact_summary", "")

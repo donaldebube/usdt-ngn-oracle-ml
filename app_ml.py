@@ -622,15 +622,27 @@ def _signals_stale() -> bool:
     return (datetime.datetime.now() - t).total_seconds() > SIGNALS_TTL
 
 def fetch_global_signals() -> dict:
+    # Standard browser headers — required for Streamlit Cloud which often gets blocked
+    # when using bare Python requests without proper User-Agent / Accept headers
+    _BROWSER_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/html, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+    }
     sig = {"fetched_at": datetime.datetime.now().isoformat(), "sources": [], "errors": []}
 
     # 1. CRYPTO PRICES
+    # Primary: CoinGecko v3 — fallback: Binance public ticker (no auth needed, very reliable on Streamlit Cloud)
+    crypto_ok = False
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price"
             "?ids=bitcoin,ethereum,tether,binancecoin,solana,ripple"
             "&vs_currencies=usd,ngn&include_24hr_change=true&include_market_cap=true",
-            timeout=12, headers={"User-Agent": "Mozilla/5.0"}
+            timeout=12, headers=_BROWSER_HEADERS
         )
         if r.status_code == 200:
             d = r.json()
@@ -644,31 +656,68 @@ def fetch_global_signals() -> dict:
             sig["xrp_usd"]     = d.get("ripple",{}).get("usd")
             sig["usdt_ngn_cg"] = d.get("tether",{}).get("ngn")
             sig["sources"].append("CoinGecko")
+            crypto_ok = True
+        else:
+            sig["errors"].append(f"CoinGecko HTTP {r.status_code}: {r.text[:80]}")
     except Exception as e:
         sig["errors"].append(f"CoinGecko: {type(e).__name__}: {str(e)[:120]}")
 
-    # 2. FX RATES
+    # Fallback: Binance public API (no CORS issues, reliable from cloud servers)
+    if not crypto_ok:
+        try:
+            btc_r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT", timeout=8, headers=_BROWSER_HEADERS)
+            eth_r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDT", timeout=8, headers=_BROWSER_HEADERS)
+            if btc_r.status_code == 200:
+                bd = btc_r.json()
+                sig["btc_usd"] = float(bd.get("lastPrice", 0))
+                sig["btc_24h"] = float(bd.get("priceChangePercent", 0))
+            if eth_r.status_code == 200:
+                ed = eth_r.json()
+                sig["eth_usd"] = float(ed.get("lastPrice", 0))
+                sig["eth_24h"] = float(ed.get("priceChangePercent", 0))
+            if btc_r.status_code == 200 or eth_r.status_code == 200:
+                sig["sources"].append("Binance ticker (CoinGecko fallback)")
+                crypto_ok = True
+        except Exception as e:
+            sig["errors"].append(f"Binance fallback: {type(e).__name__}: {str(e)[:100]}")
+
+    # 2. FX RATES — primary: open.er-api.com, fallback: frankfurter.app (ECB data, no auth, cloud-friendly)
+    fx_ok = False
+    def _apply_fx_rates(rates, sig):
+        sig["usd_ngn_official"] = rates.get("NGN")
+        sig["usd_eur"]  = rates.get("EUR")
+        sig["usd_gbp"]  = rates.get("GBP")
+        sig["usd_zar"]  = rates.get("ZAR")
+        sig["usd_kes"]  = rates.get("KES")
+        sig["usd_ghs"]  = rates.get("GHS")
+        sig["usd_jpy"]  = rates.get("JPY")
+        sig["usd_cny"]  = rates.get("CNY")
+        sig["eurusd"]   = round(1 / rates["EUR"], 5) if rates.get("EUR") else None
+        sig["dxy_proxy"]= round(rates["EUR"] * 100, 3) if rates.get("EUR") else None
     try:
-        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=8)
+        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=8, headers=_BROWSER_HEADERS)
         if r.status_code == 200:
-            rates = r.json().get("rates", {})
-            sig["usd_ngn_official"] = rates.get("NGN")
-            sig["usd_eur"]  = rates.get("EUR")
-            sig["usd_gbp"]  = rates.get("GBP")
-            sig["usd_zar"]  = rates.get("ZAR")
-            sig["usd_kes"]  = rates.get("KES")
-            sig["usd_ghs"]  = rates.get("GHS")
-            sig["usd_jpy"]  = rates.get("JPY")
-            sig["usd_cny"]  = rates.get("CNY")
-            sig["eurusd"]   = round(1 / rates["EUR"], 5) if rates.get("EUR") else None
-            sig["dxy_proxy"]= round(rates["EUR"] * 100, 3) if rates.get("EUR") else None
+            _apply_fx_rates(r.json().get("rates", {}), sig)
             sig["sources"].append("ExchangeRate-API")
+            fx_ok = True
+        else:
+            sig["errors"].append(f"ExchangeRate-API HTTP {r.status_code}")
     except Exception as e:
         sig["errors"].append(f"FX API: {type(e).__name__}: {str(e)[:120]}")
+    if not fx_ok:
+        try:
+            # frankfurter.app — ECB-sourced, open, no API key, very reliable
+            r2 = requests.get("https://api.frankfurter.app/latest?from=USD", timeout=8, headers=_BROWSER_HEADERS)
+            if r2.status_code == 200:
+                _apply_fx_rates(r2.json().get("rates", {}), sig)
+                sig["sources"].append("Frankfurter FX (ECB fallback)")
+                fx_ok = True
+        except Exception as e2:
+            sig["errors"].append(f"Frankfurter FX fallback: {type(e2).__name__}: {str(e2)[:100]}")
 
     # 3. FEAR & GREED
     try:
-        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8)
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8, headers=_BROWSER_HEADERS)
         if r.status_code == 200:
             fng = r.json().get("data", [{}])[0]
             sig["fear_greed_value"] = int(fng.get("value", 50))
@@ -966,7 +1015,7 @@ def collect_features() -> tuple:
 
     # P2P RATES
     try:
-        headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+        headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "Accept": "application/json, */*", "Accept-Language": "en-US,en;q=0.9"}
         for side, key in [("BUY", "p2p_buy"), ("SELL", "p2p_sell")]:
             payload = {"asset": "USDT", "fiat": "NGN", "merchantCheck": False,
                        "page": 1, "payTypes": [], "publisherType": None, "rows": 10, "tradeType": side}
@@ -996,7 +1045,7 @@ def collect_features() -> tuple:
             r = requests.get(
                 "https://api2.bybit.com/fiat/otc/item/list?userId=&tokenId=USDT&currencyId=NGN"
                 "&payment=&side=1&size=10&page=1&amount=&authMaker=false&canTrade=false",
-                headers={"User-Agent": "Mozilla/5.0"}, timeout=12
+headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "Accept": "application/json, */*", "Accept-Language": "en-US,en;q=0.9"}, timeout=12
             )
             if r.status_code == 200:
                 prices = [float(i.get("price", 0)) for i in r.json().get("result", {}).get("items", [])
@@ -1014,7 +1063,7 @@ def collect_features() -> tuple:
     if not raw.get("p2p_buy"):
         try:
             r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=ngn",
-                             timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                             timeout=10, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "Accept": "application/json, */*", "Accept-Language": "en-US,en;q=0.9"})
             if r.status_code == 200:
                 ngn_val = r.json().get("tether", {}).get("ngn")
                 if ngn_val and float(ngn_val) > 100:
@@ -1046,7 +1095,7 @@ def collect_features() -> tuple:
     official = None
     for url in ["https://open.er-api.com/v6/latest/USD", "https://api.exchangerate-api.com/v4/latest/USD"]:
         try:
-            r = requests.get(url, timeout=10)
+            r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"})
             if r.status_code == 200:
                 rates_obj = r.json().get("rates", {})
                 ngn = rates_obj.get("NGN")

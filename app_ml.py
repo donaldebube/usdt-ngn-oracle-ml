@@ -645,7 +645,7 @@ def fetch_global_signals() -> dict:
             sig["usdt_ngn_cg"] = d.get("tether",{}).get("ngn")
             sig["sources"].append("CoinGecko")
     except Exception as e:
-        sig["errors"].append(f"CoinGecko: {str(e)[:60]}")
+        sig["errors"].append(f"CoinGecko: {type(e).__name__}: {str(e)[:120]}")
 
     # 2. FX RATES
     try:
@@ -664,7 +664,7 @@ def fetch_global_signals() -> dict:
             sig["dxy_proxy"]= round(rates["EUR"] * 100, 3) if rates.get("EUR") else None
             sig["sources"].append("ExchangeRate-API")
     except Exception as e:
-        sig["errors"].append(f"FX API: {str(e)[:60]}")
+        sig["errors"].append(f"FX API: {type(e).__name__}: {str(e)[:120]}")
 
     # 3. FEAR & GREED
     try:
@@ -675,7 +675,7 @@ def fetch_global_signals() -> dict:
             sig["fear_greed_label"] = fng.get("value_classification", "N/A")
             sig["sources"].append("Fear&Greed Index")
     except Exception as e:
-        sig["errors"].append(f"FnG: {str(e)[:40]}")
+        sig["errors"].append(f"Fear&Greed: {type(e).__name__}: {str(e)[:120]}")
 
     # 4. OIL HEADLINE
     try:
@@ -770,7 +770,7 @@ def fetch_global_signals() -> dict:
             else:
                 rss_errors.append(f"{tag}: HTTP {r.status_code}")
         except Exception as e:
-            rss_errors.append(f"{tag}: {str(e)[:60]}")
+            rss_errors.append(f"{tag}: {type(e).__name__}: {str(e)[:120]}")
 
     sig["rss_ok_count"] = rss_ok_count
     sig["rss_errors"]   = rss_errors
@@ -821,7 +821,7 @@ def fetch_global_signals() -> dict:
                     sig["errors"].append(f"GNews: invalid API key or quota exceeded")
                     break
             except Exception as e:
-                sig["errors"].append(f"GNews {q[:20]}: {str(e)[:50]}")
+                sig["errors"].append(f"GNews '{q[:20]}': {type(e).__name__}: {str(e)[:120]}")
         if gnews_count > 0:
             sig["sources"].append(f"GNews API ({gnews_count} headlines)")
     sig["gnews_count"] = gnews_count
@@ -924,8 +924,8 @@ Return ONLY valid JSON (no markdown, no backticks, no extra text):
             sig["errors"].append("⚠️ Gemini returned all-zero scores — may be a parsing issue")
     except Exception as e:
         sig["analysis"] = {}
-        sig["gemini_raw_error"] = str(e)[:200]
-        sig["errors"].append(f"Gemini JSON parse error: {str(e)[:100]}")
+        sig["gemini_raw_error"] = f"{type(e).__name__}: {str(e)}"
+        sig["errors"].append(f"Gemini: {type(e).__name__}: {str(e)[:150]}")
 
 
 def maybe_refresh_signals(force: bool = False):
@@ -2841,9 +2841,41 @@ else:
         sig_diag = st.session_state.global_signals or {}
 
         # ── FORCE REFRESH BUTTON ──
-        if st.button("🔄 Force Refresh All Signals Now", key="diag_refresh"):
-            maybe_refresh_signals(force=True)
-            st.rerun()
+        col_btn1, col_btn2 = st.columns([1,3])
+        with col_btn1:
+            if st.button("🔄 Force Refresh All Signals Now", key="diag_refresh"):
+                maybe_refresh_signals(force=True)
+                st.rerun()
+
+        # ── SHOW ALL ERRORS FIRST (most useful diagnostic info) ──
+        gen_errs_top = sig_diag.get("errors", [])
+        rss_errs_top = sig_diag.get("rss_errors", [])
+        all_errs = gen_errs_top + rss_errs_top
+        if all_errs:
+            st.markdown('''<div class="alert-box alert-warn" style="margin-top:10px;">
+            <strong>🚨 Pipeline errors detected — these explain why data is missing:</strong>
+            </div>''', unsafe_allow_html=True)
+            for e in all_errs[:20]:
+                st.markdown(
+                    f'<div style="font-size:11px;font-family:var(--font-mono);color:var(--red);'
+                    f'background:rgba(255,68,102,0.07);padding:4px 10px;border-radius:4px;margin-bottom:3px;">'
+                    f'❌ {e}</div>',
+                    unsafe_allow_html=True)
+
+        # ── NETWORK DIAGNOSIS ──
+        all_sources_empty = len(sig_diag.get("sources", [])) == 0
+        if all_sources_empty:
+            st.markdown('''<div class="alert-box alert-warn" style="margin-top:10px;">
+            <strong>⛔ ALL data sources failed simultaneously.</strong><br><br>
+            This almost always means <strong>outbound HTTP is blocked</strong> on this server — not a code bug.<br><br>
+            <strong>If running on Streamlit Community Cloud:</strong> outbound requests to some domains
+            may be rate-limited or blocked by Cloudflare WAF. Try switching to a paid proxy or VPN-routed deployment.<br><br>
+            <strong>If running locally:</strong> check your firewall / corporate proxy settings.
+            Run this in your terminal to test:<br>
+            <code>curl -I https://api.coingecko.com/api/v3/ping</code><br>
+            A 200 response means the network is fine and the issue is elsewhere.
+            A timeout or 403 confirms network blocking.
+            </div>''', unsafe_allow_html=True)
 
         # ── PIPELINE STATUS ──
         st.markdown('''<div class="sec-header" style="margin-top:12px;">⚙️ PIPELINE STATUS</div>''', unsafe_allow_html=True)
@@ -2908,12 +2940,10 @@ else:
         else:
             st.markdown('<div style="font-size:11px;color:var(--green);margin-top:10px;">✅ No RSS errors logged</div>', unsafe_allow_html=True)
 
-        # ── GENERAL ERRORS ──
-        gen_errs = sig_diag.get("errors", [])
-        if gen_errs:
-            st.markdown('''<div class="sec-header" style="margin-top:16px;">🚨 ALL PIPELINE ERRORS</div>''', unsafe_allow_html=True)
-            for e in gen_errs:
-                st.markdown(f'<div style="font-size:11px;font-family:var(--font-mono);color:var(--amber);padding:2px 0;">⚠️ {e}</div>', unsafe_allow_html=True)
+        # ── GEMINI RAW ERROR ──
+        if sig_diag.get("gemini_raw_error"):
+            st.markdown('''<div class="sec-header" style="margin-top:16px;">🤖 GEMINI ERROR DETAIL</div>''', unsafe_allow_html=True)
+            st.code(sig_diag["gemini_raw_error"], language=None)
 
         # ── SAMPLE HEADLINES ──
         headlines_diag = sig_diag.get("headlines", [])

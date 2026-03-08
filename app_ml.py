@@ -657,6 +657,9 @@ def _seed_historical_history():
     st.session_state.history_seeded = True
 
 
+# ── Call on startup: inject 1200+ hardcoded CBN rates into rate_history (instant, no network) ──
+_seed_historical_history()
+
 
 # ══════════════════════════════════════════════════════
 # API KEYS
@@ -1461,10 +1464,13 @@ def build_training_data() -> tuple:
 
         feat = hist[i].get("features")
         if feat and isinstance(feat, dict) and len(feat) >= 5:
-            # Good: live entry with full features
-            feat_source_counts["live"] += 1
+            # Has a features dict — could be live session OR seeded (both work)
+            if hist[i].get("seeded"):
+                feat_source_counts["synth"] += 1   # seeded = historical/synthetic
+            else:
+                feat_source_counts["live"] += 1    # live session run
         else:
-            # Seeded or migrated entry: synthesise features from rate sequence
+            # No features dict at all — synthesise from rate sequence
             feat = _synth_features_from_rate(hist, i)
             feat_source_counts["synth"] += 1
 

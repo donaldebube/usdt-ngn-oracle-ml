@@ -1450,7 +1450,10 @@ def build_training_data() -> tuple:
     JSON loads). Now we synthesise features from the rate sequence for any row
     that lacks them, so ALL history contributes to training.
     """
-    hist = st.session_state.rate_history
+    hist_raw = st.session_state.rate_history
+    # Exclude future-dated seed entries — they are interpolated estimates, not real data
+    _today_iso = datetime.date.today().isoformat()
+    hist = [h for h in hist_raw if h.get("timestamp","")[:10] <= _today_iso]
     if len(hist) < 5:
         return None, None, None
 
@@ -3119,7 +3122,8 @@ else:
 
             # Chart: use all available points (up to 200 for seeded, all live)
             # Show recent 90 days of seed + all live for a useful chart
-            chart_pts = [h for h in hist_data if _rate(h)]
+            _today_iso  = datetime.date.today().isoformat()
+            chart_pts   = [h for h in hist_data if _rate(h) and h.get("timestamp","")[:10] <= _today_iso]
             # For chart: last 90 of seed, all live
             seed_chart = [h for h in chart_pts if h.get("seeded")][-90:]
             live_chart = [h for h in chart_pts if not h.get("seeded")]
@@ -3162,8 +3166,12 @@ else:
                   <text x="480" y="90" fill="{line_color}" font-size="9" font-family="JetBrains Mono">₦{latest_v:,.0f}</text>
                 </svg></div>""", unsafe_allow_html=True)
 
-            # ── TABLE: last 50 points, sorted newest first, no P2P filter ──
-            table_pts = sorted(hist_data, key=lambda h: h.get("timestamp",""), reverse=True)[:50]
+            # ── TABLE: 50 most recent points up to today, live points first ──
+            _today_iso = datetime.date.today().isoformat()
+            # Exclude any future-dated seed entries (artifact of old hardcoded range)
+            hist_no_future = [h for h in hist_data if h.get("timestamp","")[:10] <= _today_iso]
+            # Sort newest first, then take 50
+            table_pts = sorted(hist_no_future, key=lambda h: h.get("timestamp",""), reverse=True)[:50]
             df = pd.DataFrame([{
                 "Time":         h.get("timestamp","")[:16].replace("T"," "),
                 "CBN Rate (₦)": f"₦{_rate(h):,.2f}" if _rate(h) else "—",

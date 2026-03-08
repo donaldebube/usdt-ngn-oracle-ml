@@ -2034,6 +2034,28 @@ def run_full_analysis() -> dict:
     cbn_rate = raw.get("cbn_rate", 1620.0)
     p2p_mid  = raw.get("p2p_mid")   # supplementary signal only
 
+    # ── SEED BACKFILL: on the very first live run, update the last seeded entry
+    # with the actual fetched CBN rate for that date, replacing the interpolated estimate.
+    # This ensures no rate jump between seed and live data — the seed ends at the real price.
+    today_iso = datetime.date.today().isoformat()
+    hist = st.session_state.rate_history
+    live_count = sum(1 for h in hist if not h.get("seeded"))
+    if live_count == 0 and hist:
+        # Find the last seeded entry — it should be today or yesterday
+        for i in range(len(hist) - 1, -1, -1):
+            if hist[i].get("seeded"):
+                seed_date = hist[i].get("timestamp", "")[:10]
+                # Only update if it's today or within 2 days (it's the bridge point)
+                seed_dt   = datetime.datetime.strptime(seed_date, "%Y-%m-%d").date() if seed_date else None
+                today_dt  = datetime.date.today()
+                if seed_dt and (today_dt - seed_dt).days <= 2:
+                    hist[i]["cbn_rate"]    = cbn_rate   # replace interpolated with real
+                    hist[i]["rate_source"] = raw.get("rate_source", "live-backfill")
+                    hist[i]["rate_status"] = "live-backfill"
+                    # Keep seeded=True so it stays in historical category, but mark it
+                    hist[i]["backfilled"]  = True
+                break
+
     st.session_state.rate_history.append({
         "timestamp":   raw.get("timestamp"),
         "cbn_rate":    cbn_rate,     # PRIMARY — used as ML target
@@ -3118,6 +3140,8 @@ else:
 
             def _source_label(d):
                 src = d.get("rate_source") or d.get("rate_status") or ""
+                if d.get("backfilled"):
+                    return "📅 Seed (rate verified live)"
                 if d.get("seeded"):
                     return "📅 Historical seed"
                 if src:
@@ -3354,15 +3378,17 @@ else:
         seed_count = len(seed_pts)
         live_count = len(live_pts)
 
-        seed_start = seed_pts[0].get("timestamp","")[:10]  if seed_pts else "—"
-        seed_end   = seed_pts[-1].get("timestamp","")[:10] if seed_pts else "—"
-        live_start = live_pts[0].get("timestamp","")[:16].replace("T"," ")  if live_pts else "—"
-
-        seed_rates = [h["cbn_rate"] for h in seed_pts if h.get("cbn_rate")]
-        live_rates = [h["cbn_rate"] for h in live_pts if h.get("cbn_rate")]
-
-        seed_min = f"₦{min(seed_rates):,.0f}" if seed_rates else "—"
-        seed_max = f"₦{max(seed_rates):,.0f}" if seed_rates else "—"
+        # Read seed card stats from dict (truth source) — never stale even if session has old data
+        _today_iso       = datetime.date.today().isoformat()
+        _dict_dates_past = sorted(d for d in _HARDCODED_NGN_RATES if d <= _today_iso)
+        seed_start  = _dict_dates_past[0]  if _dict_dates_past else "—"
+        seed_end    = _dict_dates_past[-1] if _dict_dates_past else "—"
+        _dict_rates = [_HARDCODED_NGN_RATES[d] for d in _dict_dates_past]
+        seed_min    = f"₦{min(_dict_rates):,.0f}" if _dict_rates else "—"
+        seed_max    = f"₦{max(_dict_rates):,.0f}" if _dict_rates else "—"
+        seed_count  = len(_dict_dates_past)
+        live_start  = live_pts[0].get("timestamp","")[:16].replace("T"," ")  if live_pts else "—"
+        live_rates  = [h["cbn_rate"] for h in live_pts if h.get("cbn_rate")]
         live_min = f"₦{min(live_rates):,.0f}" if live_rates else "—"
         live_max = f"₦{max(live_rates):,.0f}" if live_rates else "—"
 

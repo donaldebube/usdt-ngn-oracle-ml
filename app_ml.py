@@ -606,8 +606,9 @@ def _fetch_historical_ngn_rates() -> list:
     to fill in anything newer than the hardcoded data. If the API fails, the
     hardcoded data is used as-is — app still works perfectly.
     """
-    # Start with the full hardcoded baseline
-    results = dict(_HARDCODED_NGN_RATES)
+    # Start with the full hardcoded baseline, but exclude future dates
+    today_str = datetime.date.today().isoformat()
+    results = {k: v for k, v in _HARDCODED_NGN_RATES.items() if k <= today_str}
 
     # Supplement: fetch last 30 days from live API to get most recent rates
     hdrs = {"User-Agent": "Mozilla/5.0 (compatible)", "Accept": "application/json"}
@@ -1538,13 +1539,9 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
     if len(Xc) < 4:
         Xc, yc = X, y   # don't filter if too aggressive
 
-    # ── SCALE DATASET: cap at 800 most recent points to balance speed vs coverage ──
-    # With 1200 points, training all of them is slow and adds diminishing returns.
-    # The most recent 800 points still cover 2+ years of CBN rate history.
-    MAX_TRAIN = 800
-    if len(Xc) > MAX_TRAIN:
-        Xc = Xc[-MAX_TRAIN:]
-        yc = yc[-MAX_TRAIN:]
+    # ── Use all available points — no arbitrary cap ──
+    # With RobustScaler + Ridge(alpha=100) the models handle 1200+ points fine.
+    # Removing the 800-point cap means ALL seeded + live data trains the model.
 
     # RobustScaler: median/IQR — far more stable than StandardScaler with regime-change data
     scaler   = RobustScaler()
@@ -2702,41 +2699,49 @@ else:
               </div>
             </div></div>""", unsafe_allow_html=True)
 
-        # ── Forecast engine header ──
+        # ── Forecast engine header — pre-compute ALL dynamic parts to avoid f-string HTML conflicts ──
         news_dir_color = "var(--red)" if "BULLISH_USDT" in qual_dir else "var(--green)" if "BEARISH_USDT" in qual_dir else "var(--amber)"
         news_dir_label = ("📉 NGN weakening pressure" if "BULLISH_USDT" in qual_dir
                           else "📈 NGN strengthening" if "BEARISH_USDT" in qual_dir
                           else "➡️ Neutral")
-        st.markdown(f"""<div class="card card-purple" style="margin-bottom:20px;">
-        <div class="sec-header">📈 MULTI-TIMEFRAME FORECAST ENGINE</div>
-        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;font-size:12px;color:var(--text2);">
-          <div>📌 <strong style="color:var(--text);">CBN Rate:</strong> <span style="font-family:var(--font-mono);color:var(--green);">₦{cbn_rate:,.0f}</span></div>
-          <div>🤖 <strong style="color:var(--text);">ML Points:</strong> <span style="font-family:var(--font-mono);color:var(--amber);">{n_pts}</span></div>
-          <div>📰 <strong style="color:var(--text);">Headlines:</strong> <span style="font-family:var(--font-mono);color:var(--blue);">{n_headlines}</span></div>
-          <div>📊 <strong style="color:var(--text);">Struct. depr.:</strong> <span style="font-family:var(--font-mono);color:var(--amber);">{annual_dep:.1f}%/yr</span></div>
-        </div>
-        <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:11px;">
-          <div style="background:var(--bg3);border-radius:6px;padding:8px 12px;">
-            <span style="color:var(--muted);">📰 News signal: </span>
-            <span style="color:{news_dir_color};font-weight:600;">{news_dir_label}</span>
-            <span style="color:var(--muted);"> · Gemini confidence: </span>
-            <span style="font-family:var(--font-mono);color:var(--text);">{qual_conf:.0f}%</span>
-            {"" if news_pop else ' <span style="color:var(--red);">(no news data — news layer zeroed)</span>'}
-          </div>
-          <div style="background:var(--bg3);border-radius:6px;padding:8px 12px;">
-            <span style="color:var(--muted);">Market mood: </span>
-            <span style="font-family:var(--font-mono);color:var(--text);">{mkt_mood}</span>
-            &nbsp;·&nbsp;
-            <span style="color:var(--muted);">Blend: </span>
-            <span style="font-size:10px;color:var(--cyan);">24H=ML60%+News35% &nbsp; 30D=Struct50%+News30% &nbsp; 12M=Struct70%</span>
-          </div>
-        </div>
-        <div style="margin-top:8px;font-size:10px;color:var(--muted);">
-          ℹ️ Three-layer blend: ML ensemble (data) + News/qualitative (events) + Structural macro (CBN/oil fundamentals).
-          Nigeria-specific: CBN policy announcements, oil revenue shocks, and political events apply direct rate adjustments.
-          Uncertainty widens with √time. Breaking news adds extra spike uncertainty.
-        </div>
-        </div>""", unsafe_allow_html=True)
+        no_news_warn   = "" if news_pop else '<span style="color:#ff4466;">(no news — news layer zeroed)</span>'
+        annual_dep_str = f"{annual_dep:.1f}"
+        qual_conf_str  = f"{qual_conf:.0f}"
+        cbn_rate_str   = f"{cbn_rate:,.0f}"
+
+        st.markdown(
+            '<div class="card card-purple" style="margin-bottom:20px;">'
+            '<div class="sec-header">📈 MULTI-TIMEFRAME FORECAST ENGINE</div>'
+            '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;font-size:12px;color:var(--text2);">'
+            f'<div>📌 <strong style="color:var(--text);">CBN Rate:</strong> <span style="font-family:var(--font-mono);color:var(--green);">₦{cbn_rate_str}</span></div>'
+            f'<div>🤖 <strong style="color:var(--text);">ML Points:</strong> <span style="font-family:var(--font-mono);color:var(--amber);">{n_pts}</span></div>'
+            f'<div>📰 <strong style="color:var(--text);">Headlines:</strong> <span style="font-family:var(--font-mono);color:var(--blue);">{n_headlines}</span></div>'
+            f'<div>📊 <strong style="color:var(--text);">Struct. depr.:</strong> <span style="font-family:var(--font-mono);color:var(--amber);">{annual_dep_str}%/yr</span></div>'
+            '</div>'
+            '<div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:11px;">'
+            '<div style="background:var(--bg3);border-radius:6px;padding:8px 12px;">'
+            '<span style="color:var(--muted);">📰 News signal: </span>'
+            f'<span style="color:{news_dir_color};font-weight:600;">{news_dir_label}</span>'
+            '<span style="color:var(--muted);"> · Gemini confidence: </span>'
+            f'<span style="font-family:var(--font-mono);color:var(--text);">{qual_conf_str}%</span>'
+            f' {no_news_warn}'
+            '</div>'
+            '<div style="background:var(--bg3);border-radius:6px;padding:8px 12px;">'
+            '<span style="color:var(--muted);">Market mood: </span>'
+            f'<span style="font-family:var(--font-mono);color:var(--text);">{mkt_mood}</span>'
+            ' &nbsp;·&nbsp; '
+            '<span style="color:var(--muted);">Blend: </span>'
+            '<span style="font-size:10px;color:var(--cyan);">24H=ML60%+News35% &nbsp; 30D=Struct50%+News30% &nbsp; 12M=Struct70%</span>'
+            '</div>'
+            '</div>'
+            '<div style="margin-top:8px;font-size:10px;color:var(--muted);">'
+            'ℹ️ Three-layer blend: ML ensemble (data) + News/qualitative (events) + Structural macro (CBN/oil fundamentals). '
+            'Nigeria-specific: CBN policy announcements, oil revenue shocks, and political events apply direct rate adjustments. '
+            'Uncertainty widens with √time. Breaking news adds extra spike uncertainty.'
+            '</div>'
+            '</div>',
+            unsafe_allow_html=True
+        )
 
         # ── 7 TIMEFRAME CARDS ──
         # Row 1: 24H + 7D + 30D

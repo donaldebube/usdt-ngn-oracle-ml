@@ -1342,19 +1342,113 @@ def collect_features() -> tuple:
 # ══════════════════════════════════════════════════════
 # ML TRAINING ENGINE
 # ══════════════════════════════════════════════════════
+def _synth_features_from_rate(hist: list, i: int) -> dict:
+    """
+    Build a minimal but valid feature dict for a history entry that has no features
+    (e.g. seeded rows loaded from an old JSON, or migrated P2P records).
+    Uses only the rate sequence itself: momentum, volatility, trend, temporal signals.
+    """
+    entry    = hist[i]
+    cbn      = float(entry.get("cbn_rate") or entry.get("p2p_mid") or 1620)
+
+    # Collect last N rates for momentum/volatility
+    rates = []
+    for j in range(max(0, i - 20), i + 1):
+        r = hist[j].get("cbn_rate") or hist[j].get("p2p_mid")
+        if r:
+            rates.append(float(r))
+
+    momentum_1   = (rates[-1] - rates[-2]) if len(rates) >= 2 else 0.0
+    momentum_avg = (rates[-1] - rates[0])  / max(len(rates) - 1, 1) if len(rates) >= 2 else 0.0
+    volatility   = float(np.std(rates)) if len(rates) >= 3 else abs(momentum_1) + cbn * 0.002
+    trend_slope  = momentum_avg
+
+    # Simple acceleration: change in momentum
+    if len(rates) >= 3:
+        m1 = rates[-1] - rates[-2]
+        m0 = rates[-2] - rates[-3]
+        trend_accel = m1 - m0
+    else:
+        trend_accel = 0.0
+
+    # MA5 deviation
+    ma5       = float(np.mean(rates[-5:])) if len(rates) >= 5 else cbn
+    rate_ma5_dev = cbn - ma5
+
+    # P2P premium: use stored value if available, else assume 5%
+    p2p_prem  = float(entry.get("features", {}).get("p2p_premium_pct", 5.0))
+
+    # Temporal (from timestamp)
+    try:
+        dt = datetime.datetime.fromisoformat(entry.get("timestamp", ""))
+    except Exception:
+        dt = datetime.datetime.now()
+    hour = dt.hour
+
+    return {
+        "p2p_premium_pct":    p2p_prem,
+        "btc_24h_change":     0.0, "eth_24h_change":    0.0,
+        "eurusd":             1.09, "dxy_proxy":         91.7,
+        "usd_zar":            18.5, "usd_ghs":           12.0,
+        "hour_sin":    float(np.sin(2 * np.pi * hour / 24)),
+        "hour_cos":    float(np.cos(2 * np.pi * hour / 24)),
+        "dow_sin":     float(np.sin(2 * np.pi * dt.weekday() / 7)),
+        "dow_cos":     float(np.cos(2 * np.pi * dt.weekday() / 7)),
+        "month_sin":   float(np.sin(2 * np.pi * dt.month / 12)),
+        "month_cos":   float(np.cos(2 * np.pi * dt.month / 12)),
+        "is_weekend":  int(dt.weekday() >= 5),
+        "is_business": int(dt.weekday() < 5),
+        "news_overall": 0.0, "news_nigeria": 0.0, "news_cbn": 0.0,
+        "news_oil":     0.0, "news_usd":     0.0, "news_crypto":       0.0,
+        "news_geopolitics": 0.0, "news_political_risk": 0.0,
+        "news_remittance":  0.0, "news_em_risk":        0.0,
+        "momentum_1":    momentum_1,
+        "momentum_avg":  momentum_avg,
+        "volatility":    volatility,
+        "trend_slope":   trend_slope,
+        "trend_accel":   trend_accel,
+        "rate_ma5_dev":  rate_ma5_dev,
+    }
+
+
 def build_training_data() -> tuple:
-    """Build training set: X = features at time t, y = CBN rate at time t+1."""
+    """
+    Build training set: X = features at time t, y = CBN rate at time t+1.
+
+    CRITICAL FIX: previously only rows WITH a features dict were used, silently
+    discarding all 1200+ seeded historical rows (which had no features on old
+    JSON loads). Now we synthesise features from the rate sequence for any row
+    that lacks them, so ALL history contributes to training.
+    """
     hist = st.session_state.rate_history
     if len(hist) < 5:
         return None, None, None
+
     X_rows, y_vals, times = [], [], []
+    feat_source_counts = {"live": 0, "synth": 0, "skipped": 0}
+
     for i in range(len(hist) - 1):
-        feat      = hist[i].get("features", {})
-        next_rate = hist[i + 1].get("cbn_rate")   # ← CBN official rate as target
-        if next_rate and float(next_rate) > 100 and feat:
-            X_rows.append(features_to_vector(feat))
-            y_vals.append(float(next_rate))
-            times.append(hist[i].get("timestamp", ""))
+        next_rate = hist[i + 1].get("cbn_rate") or hist[i + 1].get("p2p_mid")
+        if not next_rate or float(next_rate) <= 100:
+            feat_source_counts["skipped"] += 1
+            continue
+
+        feat = hist[i].get("features")
+        if feat and isinstance(feat, dict) and len(feat) >= 5:
+            # Good: live entry with full features
+            feat_source_counts["live"] += 1
+        else:
+            # Seeded or migrated entry: synthesise features from rate sequence
+            feat = _synth_features_from_rate(hist, i)
+            feat_source_counts["synth"] += 1
+
+        X_rows.append(features_to_vector(feat))
+        y_vals.append(float(next_rate))
+        times.append(hist[i].get("timestamp", ""))
+
+    # Store breakdown in session state for diagnostics display
+    st.session_state["_train_feat_sources"] = feat_source_counts
+
     if len(X_rows) < 4:
         return None, None, None
     return np.array(X_rows), np.array(y_vals), times
@@ -1394,12 +1488,25 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
     if len(Xc) < 4:
         Xc, yc = X, y   # don't filter if too aggressive
 
+    # ── SCALE DATASET: cap at 800 most recent points to balance speed vs coverage ──
+    # With 1200 points, training all of them is slow and adds diminishing returns.
+    # The most recent 800 points still cover 2+ years of CBN rate history.
+    MAX_TRAIN = 800
+    if len(Xc) > MAX_TRAIN:
+        Xc = Xc[-MAX_TRAIN:]
+        yc = yc[-MAX_TRAIN:]
+
     # RobustScaler: median/IQR — far more stable than StandardScaler with regime-change data
     scaler   = RobustScaler()
     X_scaled = scaler.fit_transform(Xc)
     x_pred   = scaler.transform(features_to_vector(current_feat).reshape(1, -1))
     n = len(X_scaled)
-    cv_k = min(5, n)
+    cv_k = min(5, n // 10) if n >= 50 else min(5, n)   # more conservative CV for large n
+
+    # Scale model complexity with dataset size
+    rf_depth      = 8  if n > 200 else 6
+    rf_leaves     = 5  if n > 200 else 3
+    gb_estimators = 200 if n > 200 else 150
 
     # Ridge (high alpha = strong regularisation = prevents extrapolation)
     ridge = Ridge(alpha=100.0)
@@ -1407,7 +1514,7 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
     ridge_raw  = float(ridge.predict(x_pred)[0])
     ridge_pred = _clip_pred(ridge_raw, current_rate)
     ridge_cv_mae = None
-    if n >= 5:
+    if n >= 10:
         try:
             ridge_cv_mae = float(-cross_val_score(
                 ridge, X_scaled, yc, cv=cv_k,
@@ -1415,13 +1522,13 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
         except Exception: pass
 
     # Random Forest
-    rf = RandomForestRegressor(n_estimators=200, max_depth=6,
-                               min_samples_leaf=3, random_state=42, n_jobs=-1)
+    rf = RandomForestRegressor(n_estimators=200, max_depth=rf_depth,
+                               min_samples_leaf=rf_leaves, random_state=42, n_jobs=-1)
     rf.fit(X_scaled, yc)
     rf_raw  = float(rf.predict(x_pred)[0])
     rf_pred = _clip_pred(rf_raw, current_rate)
     rf_cv_mae = None
-    if n >= 5:
+    if n >= 10:
         try:
             rf_cv_mae = float(-cross_val_score(
                 rf, X_scaled, yc, cv=cv_k,
@@ -1432,13 +1539,13 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
         key=lambda x: x[1], reverse=True)[:10])
 
     # Gradient Boosting
-    gb = GradientBoostingRegressor(n_estimators=150, learning_rate=0.05,
+    gb = GradientBoostingRegressor(n_estimators=gb_estimators, learning_rate=0.05,
                                    max_depth=4, subsample=0.8, random_state=42)
     gb.fit(X_scaled, yc)
     gb_raw  = float(gb.predict(x_pred)[0])
     gb_pred = _clip_pred(gb_raw, current_rate)
     gb_cv_mae = None
-    if n >= 5:
+    if n >= 10:
         try:
             gb_cv_mae = float(-cross_val_score(
                 gb, X_scaled, yc, cv=cv_k,
@@ -1456,7 +1563,7 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
     maes = [m for m in [ridge_cv_mae, rf_cv_mae, gb_cv_mae] if m is not None]
     mae_conf   = max(0.0, min(100.0,
         100.0 - (np.mean(maes) / max(current_rate, 1) * 500))) if maes else 50.0
-    size_bonus = min(15.0, n * 0.05)
+    size_bonus = min(15.0, n * 0.01)   # smaller bonus now that n is large
     confidence = int(min(92, max(30,
         round(agreement * 0.45 + mae_conf * 0.40 + size_bonus * 0.15))))
 
@@ -1469,23 +1576,48 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
                  else "BEARISH" if ensemble < current_rate * 0.9995
                  else "NEUTRAL")
 
+    # ── R²: walk-forward out-of-sample (NOT in-sample which always inflates to ~1.0) ──
+    # Use last 20% of data as hold-out, train on first 80%, evaluate on hold-out.
+    # This is the honest test: did the model generalise to unseen future data?
+    r2_oos = None
+    r2_label = "OOS"
     try:
-        y_hat = [float(gb.predict(X_scaled[i:i+1])[0]) for i in range(n)]
-        r2 = float(r2_score(yc, y_hat)) if n > 1 else None
+        if n >= 20:
+            split    = int(n * 0.80)
+            X_tr, X_te = X_scaled[:split], X_scaled[split:]
+            y_tr, y_te = yc[:split], yc[split:]
+            if len(y_te) >= 3:
+                _gb_oos = GradientBoostingRegressor(
+                    n_estimators=gb_estimators, learning_rate=0.05,
+                    max_depth=4, subsample=0.8, random_state=42)
+                _gb_oos.fit(X_tr, y_tr)
+                y_hat_oos = _gb_oos.predict(X_te)
+                r2_oos = float(r2_score(y_te, y_hat_oos))
+                r2_label = f"OOS (hold-out {n - split} pts)"
+        else:
+            # Too few points for hold-out: use cross-val R² as proxy
+            r2_oos = float(cross_val_score(gb, X_scaled, yc, cv=cv_k, scoring="r2").mean())
+            r2_label = "CV-avg"
     except Exception:
-        r2 = None
+        r2_oos = None
 
+
+    feat_sources = st.session_state.get("_train_feat_sources", {})
     clipped = []
     if abs(ridge_raw - ridge_pred) > 1: clipped.append(f"Ridge raw=₦{ridge_raw:,.0f}")
     if abs(rf_raw    - rf_pred)    > 1: clipped.append(f"RF raw=₦{rf_raw:,.0f}")
     if abs(gb_raw    - gb_pred)    > 1: clipped.append(f"GB raw=₦{gb_raw:,.0f}")
 
     st.session_state.ml_metrics = {
-        "n_training_points": n, "r2_in_sample": r2, "pred_std": pred_std,
+        "n_training_points": n, "r2_in_sample": r2_oos, "r2_label": r2_label,
+        "pred_std": pred_std,
         "ridge_cv_mae": ridge_cv_mae, "rf_cv_mae": rf_cv_mae, "gb_cv_mae": gb_cv_mae,
         "agreement_score": agreement, "mae_conf": mae_conf, "size_bonus": size_bonus,
         "rf_feature_importance": top_features,
         "clipped_models": clipped, "outliers_removed": int(np.sum(~mask)),
+        "feat_src_live":  feat_sources.get("live", 0),
+        "feat_src_synth": feat_sources.get("synth", 0),
+        "feat_src_skipped": feat_sources.get("skipped", 0),
     }
 
     return {
@@ -1496,10 +1628,13 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
         "confidence": confidence, "direction": direction,
         "model_agreement": round(agreement, 1),
         "ridge_cv_mae": ridge_cv_mae, "rf_cv_mae": rf_cv_mae, "gb_cv_mae": gb_cv_mae,
-        "r2_in_sample": r2, "rf_feature_importance": top_features,
+        "r2_in_sample": r2_oos, "r2_label": r2_label,
+        "rf_feature_importance": top_features,
         "clipped_models": clipped,
         "note": (f"Trained on {n} CBN-rate observations "
-                 f"({int(np.sum(~mask))} outliers removed). "
+                 f"(live features: {feat_sources.get('live',0)}, "
+                 f"synthesised: {feat_sources.get('synth',0)}, "
+                 f"outliers removed: {int(np.sum(~mask))}). "
                  + (f"Clipped: {', '.join(clipped)}." if clipped else "No clipping.")),
     }
 
@@ -1517,99 +1652,247 @@ TIMEFRAMES = [
     {"label": "2 YR",  "hours": 17520, "key": "2yr"},
 ]
 
+def _news_impact_on_rate(feat: dict, current_rate: float, raw: dict) -> dict:
+    """
+    Compute a structured news-driven rate adjustment from Gemini qualitative scores.
+    Returns a dict with adjustments at different timeframes and a breaking-event flag.
+
+    Score convention (−100 to +100):
+        positive = NGN weakens (USD/NGN rises, more naira per dollar)
+        negative = NGN strengthens (USD/NGN falls, fewer naira per dollar)
+
+    This is the ONLY place where news is translated to naira values, so it's
+    easy to audit, tune, and explain.
+    """
+    anal     = raw.get("analysis", {}) or {}
+    intel    = raw.get("news_intel", {}) or anal   # same dict in most code paths
+
+    news_overall   = float(feat.get("news_overall",   0))
+    news_cbn       = float(feat.get("news_cbn",       0))
+    news_oil       = float(feat.get("news_oil",       0))
+    news_nigeria   = float(feat.get("news_nigeria",   0))
+    news_geo       = float(feat.get("news_geopolitics",0))
+    news_pol_risk  = float(feat.get("news_political_risk", 0))
+    news_remit     = float(feat.get("news_remittance", 0))
+    news_em        = float(feat.get("news_em_risk",   0))
+    news_usd       = float(feat.get("news_usd",       0))
+    qual_conf      = float(anal.get("qualitative_confidence", 50)) / 100.0
+    qual_dir       = anal.get("overall_qualitative_direction", "NEUTRAL")
+    market_mood    = anal.get("market_mood", "NEUTRAL")
+    breaking       = intel.get("breaking_event") or anal.get("breaking_event")
+
+    # ── Directional sign from qualitative direction (overrides score sign if confident) ──
+    if qual_dir == "BULLISH_USDT" and qual_conf >= 0.5:
+        dir_multiplier = +1.0
+    elif qual_dir == "BEARISH_USDT" and qual_conf >= 0.5:
+        dir_multiplier = -1.0
+    else:
+        dir_multiplier = np.sign(news_overall) if news_overall != 0 else 0
+
+    # ── Breaking news: large immediate spike override ──
+    # E.g. "CBN devalues naira", "Nigeria suspends forex sales", "Oil price crash"
+    breaking_adj_24h = 0.0
+    breaking_flag    = False
+    if breaking and isinstance(breaking, str) and len(breaking) > 5:
+        breaking_flag = True
+        # Magnitude of breaking event: use news_cbn + news_overall combined
+        breaking_magnitude = (abs(news_cbn) * 0.6 + abs(news_overall) * 0.4) / 100.0
+        # Cap at ±4% immediate shock — CBN devaluations historically 5-30%
+        # but we cap conservatively since breaking_event is often minor
+        breaking_adj_24h = dir_multiplier * current_rate * min(breaking_magnitude * 0.08, 0.04)
+
+    # ── 24H news adjustment (short-term sentiment) ──
+    # CBN policy moves the rate immediately. Oil and USD move it within hours.
+    # Formula: each point of score = 0.025% of current rate, weighted by source
+    raw_24h = (
+        news_cbn     * 0.40 +    # CBN policy: biggest 24H mover
+        news_overall * 0.25 +    # combined sentiment
+        news_oil     * 0.15 +    # oil (Nigeria earns FX from oil)
+        news_usd     * 0.10 +    # USD strength
+        news_geo     * 0.10      # geopolitics (import disruption)
+    )
+    adj_24h = (raw_24h / 100.0) * current_rate * 0.025 + breaking_adj_24h
+
+    # ── 7D news adjustment ──
+    # CBN and Nigeria macro dominate the weekly outlook
+    raw_7d = (
+        news_cbn     * 0.35 +
+        news_nigeria * 0.30 +
+        news_overall * 0.20 +
+        news_oil     * 0.15
+    )
+    adj_7d = (raw_7d / 100.0) * current_rate * 0.045
+
+    # ── 30D news adjustment ──
+    # Structural and macro forces dominate; CBN policy sustained
+    raw_30d = (
+        news_nigeria * 0.30 +
+        news_cbn     * 0.25 +
+        news_pol_risk * 0.20 +
+        news_remit   * 0.15 +    # remittances = FX supply
+        news_em      * 0.10
+    )
+    adj_30d = (raw_30d / 100.0) * current_rate * 0.06
+
+    # ── Long-term annual depreciation adjustment ──
+    # Structural NGN baseline depreciation + news-driven delta
+    base_annual_depr = 0.09   # ~9% historical CBN official rate depreciation
+    if qual_dir == "BULLISH_USDT" and abs(news_overall) > 25:
+        base_annual_depr += abs(news_overall) * 0.0008
+    elif qual_dir == "BEARISH_USDT" and abs(news_overall) > 25:
+        base_annual_depr -= abs(news_overall) * 0.0006
+    if news_cbn > 40:      # strong CBN tightening = could slow depreciation
+        base_annual_depr -= 0.02
+    if news_pol_risk > 40: # political instability accelerates depreciation
+        base_annual_depr += 0.025
+    if news_oil < -40:     # oil price crash hits FX reserves hard
+        base_annual_depr += 0.02
+    annual_depr = float(np.clip(base_annual_depr, 0.02, 0.30))
+
+    # Scale all adjustments by Gemini confidence
+    # (if Gemini returned all zeros due to no API key, confidence is 0 → no news adjustment)
+    news_populated = any(abs(v) > 1 for v in [
+        news_overall, news_cbn, news_oil, news_nigeria, news_geo])
+    conf_weight = qual_conf if news_populated else 0.0
+
+    return {
+        "adj_24h":         adj_24h   * conf_weight,
+        "adj_7d":          adj_7d    * conf_weight,
+        "adj_30d":         adj_30d   * conf_weight,
+        "annual_depr":     annual_depr,
+        "breaking_flag":   breaking_flag,
+        "breaking_event":  breaking,
+        "breaking_adj":    breaking_adj_24h,
+        "qual_dir":        qual_dir,
+        "qual_conf":       qual_conf,
+        "market_mood":     market_mood,
+        "news_populated":  news_populated,
+        "raw_24h_score":   raw_24h,
+        "raw_30d_score":   raw_30d,
+    }
+
+
 def build_multi_timeframe_forecast(current_rate: float, ml: dict, feat: dict, raw: dict) -> dict:
     """
     Generate statistically-grounded multi-timeframe predictions.
-    Uses:
-    1. ML ensemble directional bias as the near-term anchor
-    2. Qualitative macro score for medium-term direction
-    3. Historical volatility scaling for uncertainty bounds
-    4. Confidence decays with √time (statistical law)
-    5. Structural NGN bias toward depreciation over long-term
+
+    ARCHITECTURE — three signal layers blended by confidence and horizon:
+    ① ML ensemble prediction  (data-driven, short-term anchor)
+    ② News/qualitative layer  (event-driven, Gemini-scored, Nigeria-specific)
+    ③ Structural macro model  (long-term CBN/oil/depreciation fundamentals)
+
+    Blend weights shift with horizon:
+        24H  →  ML: 60%   News: 35%   Structural:  5%
+        7D   →  ML: 40%   News: 35%   Structural: 25%
+        30D  →  ML: 20%   News: 30%   Structural: 50%
+        3M+  →  ML: 10%   News: 20%   Structural: 70%
+
+    Nigeria-specific overrides:
+    - Breaking CBN/oil/political news applies an immediate spike adjustment
+    - CBN policy score can flip the 24H direction even against ML momentum
+    - High P2P premium (>10%) signals structural pressure that compounds medium-term
     """
     ensemble      = ml.get("ensemble", current_rate)
     base_conf     = ml.get("confidence", 35)
-    direction     = ml.get("direction", "NEUTRAL")
     vol           = feat.get("volatility", current_rate * 0.005) or current_rate * 0.005
-    news_score    = feat.get("news_overall", 0)
-    premium_pct   = feat.get("premium_pct", 5)
-    trend_slope   = feat.get("trend_slope", 0)
-    btc_change    = feat.get("btc_24h_change", 0) or 0
-    oil_impact    = feat.get("news_oil", 0) or 0
-    cbn_score     = feat.get("news_cbn", 0) or 0
-    em_risk       = feat.get("news_em_risk", 0) or 0
+    trend_slope   = feat.get("trend_slope", 0) or 0
+    premium_pct   = feat.get("p2p_premium_pct", 5) or 5
 
-    # 24h: tight ML-anchored prediction
-    step_24h = (ensemble - current_rate)
+    # ── Compute the news layer ──
+    ni = _news_impact_on_rate(feat, current_rate, raw)
+    annual_depr   = ni["annual_depr"]
 
-    # Structural factors that compound over time
-    annual_depreciation_rate = 0.08   # Historical NGN long-term depreciation ~8-15%/yr
-    if abs(news_score) > 30:          # Strong qualitative signal
-        annual_depreciation_rate += news_score * 0.001
-    if premium_pct > 8:               # High black-market premium = structural pressure
-        annual_depreciation_rate += 0.02
-    if cbn_score > 20:                # CBN tightening bearish for parallel market
-        annual_depreciation_rate -= 0.02
-    annual_depreciation_rate = max(0.02, min(0.25, annual_depreciation_rate))
+    # ── Structural pressure from P2P premium ──
+    # A high black-market premium means CBN official rate is artificially suppressed
+    # and will eventually converge upward → NGN weakens on official market
+    premium_pressure = 0.0
+    if premium_pct > 8:
+        premium_pressure = min((premium_pct - 8) * 0.003, 0.02)   # up to +2% extra annual
+        annual_depr += premium_pressure
 
     forecasts = {}
     for tf in TIMEFRAMES:
-        hours   = tf["hours"]
-        years   = hours / 8760.0
-        days    = hours / 24.0
+        hours = tf["hours"]
+        years = hours / 8760.0
+        days  = hours / 24.0
 
-        # Central estimate
+        # ── Layer 1: ML step (24H ensemble - current) ──
+        ml_step = ensemble - current_rate
+
+        # ── Layer 2: Structural compounding ──
+        structural_central = current_rate * ((1 + annual_depr) ** years)
+
+        # ── Layer 3: Blend by horizon ──
         if hours <= 24:
-            # Near-term: ML-anchored
-            central = ensemble
-            trend_contrib = step_24h
-        elif hours <= 168:
-            # 7 days: blend ML direction with weekly trend
-            weekly_trend = trend_slope * days * 4   # extrapolate trend
-            central = current_rate + step_24h + weekly_trend
-        elif hours <= 720:
-            # 30 days: qualitative + trend
-            monthly_factor = (1 + annual_depreciation_rate) ** years
-            central = current_rate * monthly_factor
-            # Adjust for current news score
-            news_adj = (news_score / 100) * current_rate * 0.015
-            central += news_adj
-        else:
-            # 3m, 6m, 12m, 2yr: fundamental macro model
-            # Compound the depreciation rate
-            factor = (1 + annual_depreciation_rate) ** years
-            central = current_rate * factor
-            # Oil impact diminishes over time
-            oil_adj = (oil_impact / 100) * current_rate * 0.02 * (1 / (1 + years))
-            # EM risk premium
-            em_adj  = (em_risk / 100) * current_rate * 0.03 * min(years, 1)
-            central += oil_adj + em_adj
+            # 24H: ML dominates, news adjustment on top
+            ml_w, news_w, struct_w = 0.60, 0.35, 0.05
+            ml_central    = current_rate + ml_step
+            news_central  = current_rate + ni["adj_24h"]
+            central = (ml_central * ml_w
+                     + news_central * news_w
+                     + structural_central * struct_w)
 
-        # Uncertainty range: volatility scales with √time
-        base_vol = max(vol, current_rate * 0.003)
-        vol_scale = base_vol * np.sqrt(days) * 0.4
-        # Add structural uncertainty for longer horizons
-        structural_uncertainty = current_rate * years * 0.04
-        half_range = vol_scale + structural_uncertainty
-        # Ensure minimum meaningful range
-        min_range = current_rate * 0.005 * np.sqrt(days)
-        half_range = max(half_range, min_range)
+        elif hours <= 168:
+            # 7D: equal ML + news, structural starts
+            ml_w, news_w, struct_w = 0.40, 0.35, 0.25
+            weekly_ml     = current_rate + ml_step + trend_slope * days * 0.3
+            news_central  = current_rate + ni["adj_7d"]
+            central = (weekly_ml * ml_w
+                     + news_central * news_w
+                     + structural_central * struct_w)
+
+        elif hours <= 720:
+            # 30D: structural + news dominate
+            ml_w, news_w, struct_w = 0.20, 0.30, 0.50
+            news_central = current_rate + ni["adj_30d"]
+            ml_central   = current_rate + ml_step + trend_slope * days * 0.15
+            central = (ml_central * ml_w
+                     + news_central * news_w
+                     + structural_central * struct_w)
+
+        else:
+            # 3M, 6M, 12M, 2Y: fundamentals + news macro, ML nearly irrelevant
+            ml_w, news_w, struct_w = 0.10, 0.20, 0.70
+            oil_adj = (feat.get("news_oil", 0) / 100.0) * current_rate * 0.025 * (1 / (1 + years))
+            em_adj  = (feat.get("news_em_risk", 0) / 100.0) * current_rate * 0.03 * min(years, 1)
+            news_long = current_rate + ni["adj_30d"] + oil_adj + em_adj
+            central = (ensemble * ml_w
+                     + news_long * news_w
+                     + structural_central * struct_w)
+
+        central = round(float(central), 0)
+
+        # ── Uncertainty range: volatility scales with √time ──
+        base_vol        = max(vol, current_rate * 0.003)
+        vol_scale       = base_vol * np.sqrt(days) * 0.4
+        structural_unc  = current_rate * years * 0.04
+        # News uncertainty: when big news is present, widen the range
+        news_unc = 0.0
+        if ni["breaking_flag"]:
+            news_unc = current_rate * 0.015   # extra ±1.5% when breaking news
+        elif abs(feat.get("news_overall", 0)) > 40:
+            news_unc = current_rate * 0.008
+        half_range = max(vol_scale + structural_unc + news_unc,
+                         current_rate * 0.005 * np.sqrt(days))
 
         low    = round(central - half_range, 0)
         high   = round(central + half_range, 0)
-        central = round(central, 0)
 
-        # Confidence: decays with √time, anchored to base confidence
+        # ── Confidence: decays with √time, penalised when news conflicts with ML ──
         conf_decay = base_conf * (1 / (1 + np.sqrt(years) * 0.8))
-        # Floor: at 2yr, min confidence is 20 (non-trivial direction)
+        # If news direction conflicts with ML direction: reduce confidence
+        ml_bullish_usdt  = ensemble > current_rate
+        news_bullish_usdt = ni["adj_24h"] > 0
+        if ni["news_populated"] and (ml_bullish_usdt != news_bullish_usdt):
+            conf_decay *= 0.85   # signals disagree → less confident
         conf = int(max(20, min(base_conf, round(conf_decay))))
 
-        pct_change = round((central - current_rate) / current_rate * 100, 1)
-        direction_label = "▲ HIGHER" if central > current_rate * 1.002 else "▼ LOWER" if central < current_rate * 0.998 else "◆ STABLE"
-
-        # Bull/base/bear scenarios
-        bull_case = round(low * 0.95, 0)    # NGN strengthens (USDT falls)
-        bear_case = round(high * 1.12, 0)   # NGN weakens more (USDT rises)
+        pct_change    = round((central - current_rate) / current_rate * 100, 1)
+        direction_lbl = ("▲ HIGHER" if central > current_rate * 1.002
+                         else "▼ LOWER" if central < current_rate * 0.998
+                         else "◆ STABLE")
+        bull_case = round(low  * 0.95, 0)
+        bear_case = round(high * 1.12, 0)
 
         forecasts[tf["key"]] = {
             "label":         tf["label"],
@@ -1620,11 +1903,30 @@ def build_multi_timeframe_forecast(current_rate: float, ml: dict, feat: dict, ra
             "bull_case":     bull_case,
             "bear_case":     bear_case,
             "pct_change":    pct_change,
-            "direction":     direction_label,
+            "direction":     direction_lbl,
             "confidence":    conf,
+            # Store blend weights for transparency
+            "blend": {"ml": ml_w, "news": news_w, "structural": struct_w},
+            "news_adj": round(ni.get(f"adj_{tf['key']}", ni["adj_24h"]), 1),
+            "breaking": ni["breaking_flag"],
         }
 
+    # Attach news intelligence summary to forecasts for display
+    forecasts["_news_intel"] = {
+        "breaking_flag":  ni["breaking_flag"],
+        "breaking_event": ni["breaking_event"],
+        "breaking_adj":   round(ni["breaking_adj"], 1),
+        "qual_dir":       ni["qual_dir"],
+        "qual_conf":      round(ni["qual_conf"] * 100, 0),
+        "market_mood":    ni["market_mood"],
+        "annual_depr":    round(annual_depr * 100, 1),
+        "premium_pressure": round(premium_pressure * 100, 2),
+        "news_populated": ni["news_populated"],
+    }
+
     return forecasts
+
+
 
 
 def build_forecast_narratives(current_rate: float, forecasts: dict, ml: dict, feat: dict, raw: dict) -> dict:
@@ -2327,16 +2629,62 @@ else:
 
     # ══════ TAB 2: MULTI-TIMEFRAME FORECASTS ══════
     with tab2:
+        # ── News intelligence summary ──
+        ni_display = forecasts.get("_news_intel", {})
+        qual_dir   = ni_display.get("qual_dir", "NEUTRAL")
+        qual_conf  = ni_display.get("qual_conf", 0)
+        mkt_mood   = ni_display.get("market_mood", "NEUTRAL")
+        annual_dep = ni_display.get("annual_depr", 9.0)
+        news_pop   = ni_display.get("news_populated", False)
+
+        # ── BREAKING NEWS BANNER ──
+        if ni_display.get("breaking_flag") and ni_display.get("breaking_event"):
+            brk_adj = ni_display.get("breaking_adj", 0)
+            brk_dir = "↑ NGN weakens" if brk_adj > 0 else "↓ NGN strengthens"
+            st.markdown(f"""<div style="background:rgba(255,68,102,0.15);border:1px solid rgba(255,68,102,0.5);
+            border-radius:10px;padding:14px 18px;margin-bottom:16px;display:flex;align-items:center;gap:12px;">
+            <span style="font-size:20px;">🚨</span>
+            <div>
+              <div style="font-family:var(--font-mono);font-size:10px;color:var(--red);letter-spacing:2px;text-transform:uppercase;">BREAKING NEWS DETECTED — APPLIED TO 24H FORECAST</div>
+              <div style="font-size:13px;color:var(--text);margin-top:4px;">{ni_display['breaking_event']}</div>
+              <div style="font-size:11px;color:var(--red);margin-top:4px;font-family:var(--font-mono);">
+                Rate impact: {brk_dir} by ~₦{abs(brk_adj):,.0f} &nbsp;·&nbsp; Confidence-weighted by Gemini score
+              </div>
+            </div></div>""", unsafe_allow_html=True)
+
+        # ── Forecast engine header ──
+        news_dir_color = "var(--red)" if "BULLISH_USDT" in qual_dir else "var(--green)" if "BEARISH_USDT" in qual_dir else "var(--amber)"
+        news_dir_label = ("📉 NGN weakening pressure" if "BULLISH_USDT" in qual_dir
+                          else "📈 NGN strengthening" if "BEARISH_USDT" in qual_dir
+                          else "➡️ Neutral")
         st.markdown(f"""<div class="card card-purple" style="margin-bottom:20px;">
         <div class="sec-header">📈 MULTI-TIMEFRAME FORECAST ENGINE</div>
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;font-size:12px;color:var(--text2);">
-          <div>📌 <strong style="color:var(--text);">CBN Official Rate:</strong> <span style="font-family:var(--font-mono);color:var(--green);">₦{cbn_rate:,.0f}</span></div>
-          <div>🤖 <strong style="color:var(--text);">ML Training Points:</strong> <span style="font-family:var(--font-mono);color:var(--amber);">{n_pts}</span></div>
-          <div>📰 <strong style="color:var(--text);">Headlines Analysed:</strong> <span style="font-family:var(--font-mono);color:var(--blue);">{n_headlines}</span></div>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;font-size:12px;color:var(--text2);">
+          <div>📌 <strong style="color:var(--text);">CBN Rate:</strong> <span style="font-family:var(--font-mono);color:var(--green);">₦{cbn_rate:,.0f}</span></div>
+          <div>🤖 <strong style="color:var(--text);">ML Points:</strong> <span style="font-family:var(--font-mono);color:var(--amber);">{n_pts}</span></div>
+          <div>📰 <strong style="color:var(--text);">Headlines:</strong> <span style="font-family:var(--font-mono);color:var(--blue);">{n_headlines}</span></div>
+          <div>📊 <strong style="color:var(--text);">Struct. depr.:</strong> <span style="font-family:var(--font-mono);color:var(--amber);">{annual_dep:.1f}%/yr</span></div>
         </div>
-        <div style="margin-top:10px;font-size:11px;color:var(--muted);">
-          ℹ️ Confidence degrades with time horizon (statistical law: uncertainty ∝ √time).
-          Near-term forecasts are ML-anchored; medium/long-term use macro depreciation models + qualitative scores.
+        <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:11px;">
+          <div style="background:var(--bg3);border-radius:6px;padding:8px 12px;">
+            <span style="color:var(--muted);">📰 News signal: </span>
+            <span style="color:{news_dir_color};font-weight:600;">{news_dir_label}</span>
+            <span style="color:var(--muted);"> · Gemini confidence: </span>
+            <span style="font-family:var(--font-mono);color:var(--text);">{qual_conf:.0f}%</span>
+            {"" if news_pop else ' <span style="color:var(--red);">(no news data — news layer zeroed)</span>'}
+          </div>
+          <div style="background:var(--bg3);border-radius:6px;padding:8px 12px;">
+            <span style="color:var(--muted);">Market mood: </span>
+            <span style="font-family:var(--font-mono);color:var(--text);">{mkt_mood}</span>
+            &nbsp;·&nbsp;
+            <span style="color:var(--muted);">Blend: </span>
+            <span style="font-size:10px;color:var(--cyan);">24H=ML60%+News35% &nbsp; 30D=Struct50%+News30% &nbsp; 12M=Struct70%</span>
+          </div>
+        </div>
+        <div style="margin-top:8px;font-size:10px;color:var(--muted);">
+          ℹ️ Three-layer blend: ML ensemble (data) + News/qualitative (events) + Structural macro (CBN/oil fundamentals).
+          Nigeria-specific: CBN policy announcements, oil revenue shocks, and political events apply direct rate adjustments.
+          Uncertainty widens with √time. Breaking news adds extra spike uncertainty.
         </div>
         </div>""", unsafe_allow_html=True)
 
@@ -2361,6 +2709,10 @@ else:
                 bull_c = f.get("bull_case", 0)
                 bear_c = f.get("bear_case", 0)
                 fcolor = "var(--green)" if "HIGHER" in direction_lbl else "var(--red)" if "LOWER" in direction_lbl else "var(--amber)"
+                blend  = f.get("blend", {})
+                blend_str = f"ML{blend.get('ml',0)*100:.0f}%+News{blend.get('news',0)*100:.0f}%+Str{blend.get('structural',0)*100:.0f}%"
+                news_adj_val = f.get("news_adj", 0)
+                news_adj_str = f"₦{abs(news_adj_val):+.0f}" if abs(news_adj_val) > 1 else "~₦0"
                 col.markdown(f"""
                 <div class="tf-card">
                   <div class="tf-card-accent" style="background:{ac};"></div>
@@ -2370,12 +2722,14 @@ else:
                   <div class="tf-range">Range: ₦{flow:,.0f} – ₦{fhigh:,.0f}</div>
                   <div style="font-family:var(--font-mono);font-size:12px;color:{fcolor};margin-top:4px;">{pct:+.1f}% from now</div>
                   <div class="tf-conf">Confidence: {fconf}%</div>
+                  <div style="margin-top:6px;font-size:9px;color:var(--muted);font-family:var(--font-mono);">{blend_str}</div>
+                  <div style="margin-top:4px;font-size:9px;color:var(--cyan);font-family:var(--font-mono);">news adj: {news_adj_str}</div>
                   <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:10px;color:var(--muted);">
                     Bull ₦{bull_c:,.0f} &nbsp;|&nbsp; Bear ₦{bear_c:,.0f}
                   </div>
                 </div>""", unsafe_allow_html=True)
 
-        # ── NARRATIVE SECTION ──
+
         st.markdown('<div class="hdivider"></div>', unsafe_allow_html=True)
         st.markdown('<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--cyan);margin-bottom:16px;">💬 TIMEFRAME NARRATIVES</div>',
                     unsafe_allow_html=True)
@@ -3004,17 +3358,59 @@ else:
             st.markdown(f'<div class="alert-box alert-warn">⚠️ <strong>Cold Start Mode</strong> — {ml.get("note","")} Run analysis 5+ times to unlock full ML metrics.</div>',
                         unsafe_allow_html=True)
         else:
+            # Training data source breakdown
+            feat_live   = metrics.get("feat_src_live", 0)
+            feat_synth  = metrics.get("feat_src_synth", 0)
+            feat_skip   = metrics.get("feat_src_skipped", 0)
+            r2_val      = metrics.get("r2_in_sample")
+            r2_lbl      = metrics.get("r2_label", "OOS")
+            r2_display  = f"{r2_val:.4f}" if r2_val is not None else "N/A"
+
+            # Interpret OOS R² honestly
+            if r2_val is not None:
+                if r2_val >= 0.85:
+                    r2_color = "var(--green)"; r2_note = "✅ Strong generalisation"
+                elif r2_val >= 0.55:
+                    r2_color = "var(--amber)"; r2_note = "⚠️ Moderate — acceptable"
+                elif r2_val >= 0.0:
+                    r2_color = "var(--amber)"; r2_note = "⚠️ Weak — limited generalisation"
+                else:
+                    r2_color = "var(--red)"; r2_note = "❌ Model worse than mean baseline"
+            else:
+                r2_color = "var(--text2)"; r2_note = ""
+
             mm1, mm2, mm3, mm4 = st.columns(4)
-            for col, lbl, val, clr in [
-                (mm1, "Training Points", str(metrics.get("n_training_points",0)), "var(--amber)"),
-                (mm2, "R² In-Sample",    f"{metrics.get('r2_in_sample',0):.4f}" if metrics.get("r2_in_sample") else "N/A", "var(--blue)"),
-                (mm3, "Model Agreement", f"{metrics.get('agreement_score',0):.1f}%", "var(--green)"),
-                (mm4, "MAE Confidence",  f"{metrics.get('mae_conf',0):.1f}%", "var(--purple)"),
+            for col, lbl, val, clr, sub in [
+                (mm1, "Training Points",       str(metrics.get("n_training_points",0)), "var(--amber)",
+                 f"{feat_live} live · {feat_synth} synthesised"),
+                (mm2, f"R² ({r2_lbl})",        r2_display, r2_color, r2_note),
+                (mm3, "Model Agreement",       f"{metrics.get('agreement_score',0):.1f}%", "var(--green)", "3-model ensemble spread"),
+                (mm4, "MAE Confidence",        f"{metrics.get('mae_conf',0):.1f}%", "var(--purple)", "cross-val error quality"),
             ]:
                 col.markdown(f"""<div class="card">
                 <div class="card-label">{lbl}</div>
                 <div style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:{clr};">{val}</div>
+                <div style="font-size:10px;color:var(--muted);margin-top:4px;">{sub}</div>
                 </div>""", unsafe_allow_html=True)
+
+            # Explain what OOS R² means (no more R²=1.0 confusion)
+            st.markdown(f"""<div class="alert-box alert-info" style="margin:14px 0 6px;">
+            <strong>ℹ️ R² is out-of-sample (OOS)</strong> — the model trains on the first 80% of data,
+            then is tested on the remaining 20% it has <em>never seen</em>.
+            This is the honest measure of generalisation.
+            An in-sample R² of 1.0 (which we had before) just meant the model memorised the training data.
+            OOS R² = {r2_display} means the model {r2_note.replace("✅","").replace("⚠️","").replace("❌","").strip().lower()}.
+            </div>""", unsafe_allow_html=True)
+
+            # Training source info
+            st.markdown(f"""<div style="font-size:11px;color:var(--text2);padding:8px 14px;
+            background:var(--bg3);border-radius:8px;border:1px solid var(--border);margin-bottom:16px;">
+            📚 <strong style="color:var(--text);">Training composition:</strong>
+            &nbsp;<span style="color:var(--green);">⚡ {feat_live} live points</span> (full Gemini features)
+            &nbsp;+&nbsp;<span style="color:var(--cyan);">📅 {feat_synth} historical points</span> (rate-derived synthetic features)
+            &nbsp;+&nbsp;<span style="color:var(--muted);">⏭ {feat_skip} skipped</span> (missing rate).
+            &nbsp; Total used: <strong style="color:var(--amber);">{feat_live+feat_synth}</strong>
+            </div>""", unsafe_allow_html=True)
 
             st.markdown("<br>", unsafe_allow_html=True)
 

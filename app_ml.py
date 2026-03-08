@@ -512,6 +512,8 @@ def init():
         "global_signals_time": None,
         "history_loaded": False,
         "history_seeded": False,
+        "gemini_calls_today": 0,
+        "gemini_calls_date": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -717,14 +719,14 @@ GEMINI_MODELS = [
     "gemini-flash-latest",
 ]
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=86400)  # cache 24 hours — key doesn't change
 def check_gemini_key(key: str) -> tuple:
     for model in GEMINI_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         try:
             r = requests.post(url, json={
                 "contents": [{"parts": [{"text": "Reply: OK"}]}],
-                "generationConfig": {"maxOutputTokens": 5}
+                "generationConfig": {"maxOutputTokens": 2}
             }, timeout=12)
             if r.status_code == 200: return True, model, ""
             if r.status_code == 403: return False, "", "API key invalid or not authorised"
@@ -737,7 +739,19 @@ if not _key_ok:
     st.error(f"❌ Gemini key error: {_key_err}. Check aistudio.google.com")
     st.stop()
 
+GEMINI_DAILY_CAP = 80  # hard limit: if exceeded, skip Gemini calls and use cached data
+
 def gemini(prompt: str, system: str = "", temperature: float = 0.2, max_tokens: int = 4096) -> str:
+    # ── Daily usage guard ──────────────────────────────────────────────
+    today = datetime.date.today().isoformat()
+    if st.session_state.get("gemini_calls_date") != today:
+        st.session_state.gemini_calls_today = 0
+        st.session_state.gemini_calls_date  = today
+    calls_today = st.session_state.get("gemini_calls_today", 0)
+    if calls_today >= GEMINI_DAILY_CAP:
+        return f"❌ Daily Gemini cap ({GEMINI_DAILY_CAP} calls) reached. Resets at midnight. Using cached data."
+    st.session_state.gemini_calls_today = calls_today + 1
+    # ──────────────────────────────────────────────────────────────────
     parts = []
     if system:
         parts.append({"text": f"SYSTEM:\n{system}\n\n---\n\n"})
@@ -796,7 +810,7 @@ def _parse_json(raw: str) -> dict:
 # ══════════════════════════════════════════════════════
 # GLOBAL SIGNALS ENGINE
 # ══════════════════════════════════════════════════════
-SIGNALS_TTL = 300
+SIGNALS_TTL = 1800  # 30 min — macro conditions don't change in 5 min
 
 def _signals_stale() -> bool:
     t = st.session_state.global_signals_time
@@ -816,47 +830,12 @@ def fetch_global_signals() -> dict:
     }
     sig = {"fetched_at": datetime.datetime.now().isoformat(), "sources": [], "errors": []}
 
-    # ══ STEP 0: GEMINI KNOWLEDGE-BASED SCORING (runs FIRST, no network needed) ══
-    # This runs before any HTTP calls so Streamlit Cloud firewall cannot block it.
-    # Gemini uses its own training knowledge of current macro conditions.
-    # RSS/GNews headlines are injected later as a supplement if available.
-    try:
-        now_str_early = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M WAT")
-        early_prompt = f"""You are a senior FX strategist. Today is {now_str_early}.
-Score current market conditions for the USDT/NGN P2P exchange rate.
-Positive score = USDT rises / NGN weakens. Negative = NGN strengthens.
-
-Use your knowledge of: CBN policy, Nigeria oil earnings, USD/Fed stance,
-crypto market conditions, geopolitical risks, EM currency pressure, remittances.
-
-Return ONLY valid compact JSON — no markdown, no backticks, start immediately with {{:
-{{"overall_score":<int -100 to 100>,"nigeria_macro":<int>,"cbn_policy":<int>,"oil_impact":<int>,
-"usd_fed_impact":<int>,"crypto_sentiment":<int>,"geopolitical_risk":<int>,
-"political_risk_nigeria":<int>,"remittance_flow":<int>,"global_em_risk":<int>,
-"market_mood":"RISK_ON|RISK_OFF|NEUTRAL",
-"top_mover_today":"<key factor>","breaking_event":null,
-"oil_analysis":"<2 sentences>","geopolitical_analysis":"<2 sentences>",
-"cbn_analysis":"<2 sentences>","crypto_analysis":"<1 sentence>","em_analysis":"<1 sentence>",
-"top_bullish_catalyst":"<reason USDT/NGN rises>","top_bearish_catalyst":"<reason NGN strengthens>",
-"overall_qualitative_direction":"BULLISH_USDT|BEARISH_USDT|NEUTRAL",
-"qualitative_confidence":<0-100>,"30min_bias":"BUY|SELL|HOLD",
-"key_watch_items":["<item1>","<item2>","<item3>"],
-"medium_term_outlook":"<3 sentences 30-90 day>","long_term_outlook":"<2 sentences 6-12 month>",
-"structural_ngn_risks":["<risk1>","<risk2>","<risk3>"]}}"""
-        raw_early = gemini(early_prompt,
-            "You are a quantitative FX strategist. Return ONLY valid JSON. No markdown. Start with {.",
-            temperature=0.3, max_tokens=1500)
-        sig["gemini_raw_response"] = raw_early[:600]
-        parsed_early = _parse_json(raw_early)
-        if parsed_early and any(parsed_early.get(k,0) != 0
-                                for k in ["overall_score","nigeria_macro","oil_impact"]):
-            sig["analysis"] = parsed_early
-            sig["sources"].append("Gemini AI (knowledge-based, no headlines needed)")
-        else:
-            sig["errors"].append(f"Gemini early pass: parsed but all-zero. Raw: {raw_early[:150]}")
-    except Exception as e:
-        sig["errors"].append(f"Gemini early pass FAILED: {type(e).__name__}: {str(e)[:200]}")
-        sig["gemini_raw_error"] = f"{type(e).__name__}: {str(e)}"
+    # ══ STEP 0: REMOVED (cost saving) ══
+    # Previously ran a standalone Gemini knowledge-based pass before network calls.
+    # This was redundant — Step 6 (enhanced pass) runs after market data is collected
+    # and includes everything Step 0 did PLUS live BTC/FX/headlines context.
+    # Removing this saves ~1 Gemini call per refresh = ~50% of all Gemini API costs.
+    # Step 6 will fall back to knowledge-based if no market data is available.
 
     # 1. CRYPTO PRICES
     # Primary: CoinGecko v3 — fallback: Binance public ticker (no auth needed, very reliable on Streamlit Cloud)
@@ -1130,9 +1109,9 @@ Return ONLY valid compact JSON — no markdown, no backticks, start immediately 
         sig["sources"].append(rss_src)
 
     # 6. GEMINI ENHANCED PASS (only if live market data was fetched)
-    # If the early Gemini pass (Step 0) already succeeded AND we have live market data,
-    # run a richer pass that incorporates BTC prices, FX rates, and any headlines.
-    # If no market data was fetched, skip — Step 0 result is already in sig["analysis"].
+    # Run ONE Gemini pass with all available market data + headlines combined.
+    # If no market data was fetched, still run to get knowledge-based scoring.
+    # Step 0 has been removed to save cost — this is the only Gemini call per refresh.
     has_market_data = bool(sig.get("btc_usd") or sig.get("usd_ngn_official"))
     has_headlines   = bool(headlines_raw)
     already_scored  = bool(sig.get("analysis"))
@@ -1143,44 +1122,23 @@ Return ONLY valid compact JSON — no markdown, no backticks, start immediately 
         fng_str  = f"{sig.get('fear_greed_value','?')} — {sig.get('fear_greed_label','N/A')}"
         headlines_block = "\n".join(f"  {i+1}. {h['full']}" for i, h in enumerate(headlines_raw[:40]))
 
-        enhanced_prompt = f"""You are a senior FX strategist. Today: {now_str}
-Score USDT/NGN P2P market. Positive = USDT rises / NGN weakens.
-
-LIVE MARKET DATA:
-- BTC: {btc_str} | ETH: ${sig.get('eth_usd',0):,.0f} ({sig.get('eth_24h',0):+.1f}%)
-- Fear & Greed: {fng_str} | EUR/USD: {sig.get('eurusd','N/A')} | DXY: {sig.get('dxy_proxy','N/A')}
-- USD/NGN Official: {sig.get('usd_ngn_official','N/A')} | USD/ZAR: {sig.get('usd_zar','N/A')}
-
-HEADLINES ({len(headlines_raw)}):
-{headlines_block if has_headlines else "(none — use your knowledge)"}
-
-Return ONLY valid JSON starting with {{. No markdown. No preamble:
-{{"overall_score":<-100 to 100>,"nigeria_macro":<int>,"cbn_policy":<int>,"oil_impact":<int>,
-"usd_fed_impact":<int>,"crypto_sentiment":<int>,"geopolitical_risk":<int>,
-"political_risk_nigeria":<int>,"remittance_flow":<int>,"global_em_risk":<int>,
-"market_mood":"RISK_ON|RISK_OFF|NEUTRAL","top_mover_today":"<factor>","breaking_event":null,
-"oil_analysis":"<2 sentences>","geopolitical_analysis":"<2 sentences>",
-"cbn_analysis":"<2 sentences>","crypto_analysis":"<1 sentence>","em_analysis":"<1 sentence>",
-"top_bullish_catalyst":"<reason>","top_bearish_catalyst":"<reason>",
-"overall_qualitative_direction":"BULLISH_USDT|BEARISH_USDT|NEUTRAL",
-"qualitative_confidence":<0-100>,"30min_bias":"BUY|SELL|HOLD",
-"key_watch_items":["<i1>","<i2>","<i3>"],
-"medium_term_outlook":"<3 sentences>","long_term_outlook":"<2 sentences>",
-"structural_ngn_risks":["<r1>","<r2>","<r3>"]}}"""
+        enhanced_prompt = f"""FX analyst. Score USDT/NGN. {now_str}. +ve=USDT up/NGN weak, -ve=NGN strong.
+DATA: BTC {btc_str} | USD/NGN {sig.get('usd_ngn_official','N/A')} | F&G {fng_str} | EUR/USD {sig.get('eurusd','N/A')}
+HEADLINES: {headlines_block[:1200] if has_headlines else "use your knowledge"}
+Return ONLY compact JSON, start with {{:
+{{"overall_score":<-100 to 100>,"nigeria_macro":<int>,"cbn_policy":<int>,"oil_impact":<int>,"usd_fed_impact":<int>,"crypto_sentiment":<int>,"geopolitical_risk":<int>,"political_risk_nigeria":<int>,"remittance_flow":<int>,"global_em_risk":<int>,"market_mood":"RISK_ON|RISK_OFF|NEUTRAL","top_mover_today":"<factor>","breaking_event":null,"oil_analysis":"<1 sentence>","geopolitical_analysis":"<1 sentence>","cbn_analysis":"<1 sentence>","crypto_analysis":"<1 sentence>","em_analysis":"<1 sentence>","top_bullish_catalyst":"<reason>","top_bearish_catalyst":"<reason>","overall_qualitative_direction":"BULLISH_USDT|BEARISH_USDT|NEUTRAL","qualitative_confidence":<0-100>,"30min_bias":"BUY|SELL|HOLD","key_watch_items":["<i1>","<i2>","<i3>"],"medium_term_outlook":"<2 sentences>","long_term_outlook":"<1 sentence>","structural_ngn_risks":["<r1>","<r2>"]}}"""
 
         try:
             raw_q = gemini(enhanced_prompt,
                 "Quantitative FX strategist. Return ONLY valid JSON. Start with {.",
-                temperature=0.3, max_tokens=1800)
+                temperature=0.3, max_tokens=900)
             sig["gemini_raw_response"] = raw_q[:600]
             parsed = _parse_json(raw_q)
             if parsed and any(parsed.get(k,0) != 0 for k in ["overall_score","nigeria_macro","oil_impact"]):
-                sig["analysis"] = parsed   # overwrite early pass with richer version
+                sig["analysis"] = parsed   # overwrite with richer version
                 sig["sources"].append("Gemini AI (enhanced with live market data)")
-            elif already_scored:
-                sig["errors"].append("Gemini enhanced pass returned zeros — keeping Step 0 result")
             else:
-                sig["errors"].append(f"Gemini enhanced pass: empty parse. Raw: {raw_q[:150]}")
+                sig["errors"].append(f"Gemini enhanced pass: empty/zero parse. Raw: {raw_q[:150]}")
         except Exception as e:
             if not already_scored:
                 sig["gemini_raw_error"] = f"{type(e).__name__}: {str(e)}"
@@ -1713,80 +1671,16 @@ def build_forecast_narratives(current_rate: float, forecasts: dict, ml: dict, fe
     f12m = forecasts.get("12m", {})
     f2yr = forecasts.get("2yr", {})
 
-    prompt = f"""You are Nigeria's premier FX strategist at a tier-1 investment bank.
-Provide sharp, specific multi-timeframe narratives for USDT/NGN predictions.
-
-CURRENT LIVE DATA:
-- P2P Mid Rate: ₦{current_rate:,.0f}
-- ML Prediction (24h): ₦{f24.get('central',0):,.0f} ({f24.get('pct_change',0):+.1f}%) — Range: ₦{f24.get('low',0):,.0f}–₦{f24.get('high',0):,.0f}
-- ML Confidence: {ml.get('confidence',0)}% | Model Agreement: {ml.get('model_agreement',0):.1f}%
-- Training Points: {ml.get('n_training_points',0)}
-
-ML FEATURE IMPORTANCES (top):
-{json.dumps(dict(list(ml.get('rf_feature_importance',{}).items())[:5]), indent=2)}
-
-QUALITATIVE MACRO SCORES (-100=NGN strengthens, +100=NGN weakens):
-- Overall: {feat.get('news_overall',0):+.0f}
-- Nigeria Macro: {feat.get('news_nigeria',0):+.0f}
-- CBN Policy: {feat.get('news_cbn',0):+.0f}
-- Oil Markets: {feat.get('news_oil',0):+.0f}
-- USD/Fed: {feat.get('news_usd',0):+.0f}
-- Geopolitics: {feat.get('news_geopolitics',0):+.0f}
-- EM Risk: {feat.get('news_em_risk',0):+.0f}
-
-KEY INTEL:
-- Oil: {q_intel.get('oil_analysis','N/A')}
-- CBN: {q_intel.get('cbn_analysis','N/A')}
-- Top Bull Catalyst: {q_intel.get('top_bullish_catalyst','N/A')}
-- Top Bear Catalyst: {q_intel.get('top_bearish_catalyst','N/A')}
-- Medium-term outlook: {anal.get('medium_term_outlook','N/A')}
-- Long-term outlook: {anal.get('long_term_outlook','N/A')}
-- Structural NGN risks: {anal.get('structural_ngn_risks',[])}
-
-STATISTICAL FORECASTS:
-- 24H:  ₦{f24.get('central',0):,.0f} ({f24.get('pct_change',0):+.1f}%) | Conf: {f24.get('confidence',0)}%
-- 7D:   ₦{f7d.get('central',0):,.0f} ({f7d.get('pct_change',0):+.1f}%) | Conf: {f7d.get('confidence',0)}%
-- 30D:  ₦{f30d.get('central',0):,.0f} ({f30d.get('pct_change',0):+.1f}%) | Conf: {f30d.get('confidence',0)}%
-- 3M:   ₦{f3m.get('central',0):,.0f} ({f3m.get('pct_change',0):+.1f}%) | Conf: {f3m.get('confidence',0)}%
-- 6M:   ₦{f6m.get('central',0):,.0f} ({f6m.get('pct_change',0):+.1f}%) | Conf: {f6m.get('confidence',0)}%
-- 12M:  ₦{f12m.get('central',0):,.0f} ({f12m.get('pct_change',0):+.1f}%) | Conf: {f12m.get('confidence',0)}%
-- 2YR:  ₦{f2yr.get('central',0):,.0f} ({f2yr.get('pct_change',0):+.1f}%) | Conf: {f2yr.get('confidence',0)}%
-
-Return ONLY valid JSON (no markdown, no backticks):
-{{
-  "exec_summary": "<4-5 sentence executive summary combining ML + qualitative signals. What does everything say about USDT/NGN right now?>",
-  "trade_recommendation": "<Specific, actionable trading recommendation with timing>",
-  "best_convert_time": "<Best time window for NGN→USDT or USDT→NGN conversion based on signals>",
-
-  "n24h_narrative": "<2 sentences: 24h outlook driven by specific signals>",
-  "n24h_drivers": ["<driver 1>", "<driver 2>"],
-  "n24h_risk": "<Main risk to this 24h forecast>",
-
-  "n7d_narrative": "<2 sentences: 7-day outlook — what events this week drive it?>",
-  "n7d_drivers": ["<driver 1>", "<driver 2>"],
-  "n7d_risk": "<Main risk to 7d forecast>",
-
-  "n30d_narrative": "<2 sentences: 30-day outlook — macro factors>",
-  "n30d_bull_scenario": "<NGN strengthens scenario — what would cause it?>",
-  "n30d_bear_scenario": "<NGN weakens scenario — what would cause it?>",
-
-  "n3m_narrative": "<2 sentences: 3-month outlook — policy, oil, elections, IMF>",
-  "n6m_narrative": "<2 sentences: 6-month view — Fed rates, Nigeria growth, OPEC>",
-  "n12m_narrative": "<2 sentences: 12-month view — structural CBN policy trajectory>",
-  "n2yr_narrative": "<2 sentences: 2-year view — Nigeria economic reform trajectory>",
-
-  "key_risks": ["<risk 1>", "<risk 2>", "<risk 3>", "<risk 4>"],
-  "key_upside_catalysts": ["<catalyst 1>", "<catalyst 2>", "<catalyst 3>"],
-  "cbn_watch": "<What to watch from CBN in coming weeks>",
-  "oil_impact_summary": "<How oil movements feed through to NGN over each timeframe>",
-
-  "data_quality_note": "<Brief honest assessment: cold start or trained? How many data points? What would improve predictions?>",
-  "disclaimer_note": "<Brief risk disclaimer for each timeframe horizon>"
-}}"""
+    prompt = f"""Nigeria FX strategist. CBN Rate: ₦{current_rate:,.0f}. Conf:{ml.get('confidence',0)}% Pts:{ml.get('n_training_points',0)}
+Scores(+100=NGN weak): overall={feat.get('news_overall',0):+.0f} macro={feat.get('news_nigeria',0):+.0f} cbn={feat.get('news_cbn',0):+.0f} oil={feat.get('news_oil',0):+.0f} usd={feat.get('news_usd',0):+.0f}
+Bull:{q_intel.get('top_bullish_catalyst','?')[:80]} Bear:{q_intel.get('top_bearish_catalyst','?')[:80]}
+Forecasts: 24H=₦{f24.get('central',0):,.0f}({f24.get('pct_change',0):+.1f}%,{f24.get('confidence',0)}%) 7D=₦{f7d.get('central',0):,.0f}({f7d.get('pct_change',0):+.1f}%) 30D=₦{f30d.get('central',0):,.0f}({f30d.get('pct_change',0):+.1f}%) 3M=₦{f3m.get('central',0):,.0f} 6M=₦{f6m.get('central',0):,.0f} 12M=₦{f12m.get('central',0):,.0f} 2YR=₦{f2yr.get('central',0):,.0f}
+Return ONLY compact JSON starting with {{:
+{{"exec_summary":"<3 sentences>","trade_recommendation":"<1 sentence>","best_convert_time":"<timing>","n24h_narrative":"<2 sentences>","n24h_drivers":["<d1>","<d2>"],"n24h_risk":"<risk>","n7d_narrative":"<2 sentences>","n7d_drivers":["<d1>","<d2>"],"n7d_risk":"<risk>","n30d_narrative":"<2 sentences>","n30d_bull_scenario":"<scenario>","n30d_bear_scenario":"<scenario>","n3m_narrative":"<2 sentences>","n6m_narrative":"<1 sentence>","n12m_narrative":"<1 sentence>","n2yr_narrative":"<1 sentence>","key_risks":["<r1>","<r2>","<r3>"],"key_upside_catalysts":["<c1>","<c2>"],"cbn_watch":"<1 sentence>","oil_impact_summary":"<1 sentence>","data_quality_note":"<1 sentence>","disclaimer_note":"<1 sentence>"}}"""
 
     try:
         raw_out = gemini(prompt,
-            "You are Nigeria's most rigorous FX strategist. Be specific, cite real events, give real numbers. Return only valid JSON.")
+            "Nigeria FX strategist. Return only valid JSON. No preamble.", max_tokens=1200)
         return _parse_json(raw_out)
     except Exception as e:
         return {
@@ -1826,7 +1720,17 @@ def run_full_analysis() -> dict:
 
     ml = train_and_predict(feat, cbn_rate)
     forecasts = build_multi_timeframe_forecast(cbn_rate, ml, feat, raw)
-    narratives = build_forecast_narratives(cbn_rate, forecasts, ml, feat, raw)
+    # ── Narrative caching: skip expensive Gemini call if signals unchanged ──
+    cached_nar_key = st.session_state.get("last_narrative_sig_hash", "")
+    anal_for_hash  = str(sorted((st.session_state.global_signals or {}).get("analysis", {}).items()))
+    rate_bucket    = round(cbn_rate / 5) * 5   # bucket to nearest ₦5 to avoid regen on micro-moves
+    new_nar_key    = f"{anal_for_hash}_{rate_bucket}"
+    if cached_nar_key == new_nar_key and st.session_state.get("last_narratives"):
+        narratives = st.session_state.last_narratives  # reuse cached — no Gemini call
+    else:
+        narratives = build_forecast_narratives(cbn_rate, forecasts, ml, feat, raw)
+        st.session_state.last_narratives       = narratives
+        st.session_state.last_narrative_sig_hash = new_nar_key
 
     _save_history()
     return {
@@ -1881,7 +1785,7 @@ Be precise, cite specific data points, reference actual events. Never be vague.
 If a user asks about a specific timeframe, give them the specific numbers.
 Speak like a Bloomberg terminal analyst — direct, data-driven, no fluff."""
 
-    return gemini(f"{ctx}\n\nConversation:{hist}\n\nUser: {msg}\n\nOracle:", system, max_tokens=1500)
+    return gemini(f"{ctx}\n\nConversation:{hist}\n\nUser: {msg}\n\nOracle:", system, max_tokens=800)
 
 
 # ══════════════════════════════════════════════════════
@@ -2002,10 +1906,13 @@ with ab5:
     if st.session_state.last_time:
         el = int((datetime.datetime.now() - st.session_state.last_time).total_seconds() // 60)
         pts = len(st.session_state.rate_history)
+        calls_today = st.session_state.get("gemini_calls_today", 0)
+        cap_color = "var(--red)" if calls_today > 60 else "var(--amber)" if calls_today > 40 else "var(--green)"
         st.markdown(
             f'<p style="font-family:var(--font-mono);font-size:10px;color:var(--text2);'
             f'margin:10px 0 0 0;text-align:right;">'
-            f'<span class="live-dot"></span>Last run {el}m ago &nbsp;·&nbsp; {pts} training pts</p>',
+            f'<span class="live-dot"></span>Last run {el}m ago &nbsp;·&nbsp; {pts} pts &nbsp;·&nbsp; '
+            f'<span style="color:{cap_color};">🤖 Gemini: {calls_today}/{GEMINI_DAILY_CAP} calls today</span></p>',
             unsafe_allow_html=True)
 
 # ── HEADER ──

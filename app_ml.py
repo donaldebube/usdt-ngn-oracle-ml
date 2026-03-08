@@ -1,5 +1,5 @@
 """
-USDT/NGN Oracle — Unified Prediction Engine v3.0
+USD/NGN Oracle — CBN Official Rate Engine v5.0
 ═════════════════════════════════════════════════
 Combines ML + AI prediction with full multi-timeframe forecasts:
   24h · 7d · 30d · 3m · 6m · 12m · 2yr
@@ -48,7 +48,7 @@ from sklearn.model_selection import cross_val_score
 # PAGE CONFIG
 # ══════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="USDT/NGN Oracle · Unified",
+    page_title="USD/NGN Oracle · CBN Official",
     page_icon="₦",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -463,10 +463,10 @@ h1,h2,h3,h4 { font-family: var(--font-mono) !important; }
 # ══════════════════════════════════════════════════════
 # SESSION STATE + PERSISTENCE
 # ══════════════════════════════════════════════════════
-HISTORY_FILE       = "oracle_rate_history.json"
-HIST_SEED_FILE     = "oracle_hist_seed.json"   # daily historical NGN rates (seeded once)
-MAX_HISTORY        = 2000
-HIST_SEED_DAYS     = 730   # ~2 years of daily candles
+HISTORY_FILE   = "oracle_rate_history.json"
+HIST_SEED_FILE = "oracle_hist_seed.json"   # 2-yr daily CBN rates, fetched once
+MAX_HISTORY    = 2000
+HIST_SEED_DAYS = 730
 
 def _save_history():
     try:
@@ -482,251 +482,18 @@ def _load_history() -> list:
     try:
         with open(HISTORY_FILE, "r") as f:
             data = json.load(f)
-        valid = [d for d in data if isinstance(d, dict) and d.get("p2p_mid") and d.get("timestamp")]
+        valid = []
+        for d in data:
+            if not isinstance(d, dict) or not d.get("timestamp"):
+                continue
+            if d.get("cbn_rate"):
+                valid.append(d)
+            elif d.get("p2p_mid"):
+                d["cbn_rate"] = d["p2p_mid"]   # migrate old records
+                valid.append(d)
         return valid[-MAX_HISTORY:]
     except Exception:
         return []
-
-# ── Historical NGN rate seeding ──────────────────────────────────────
-# Called once on startup to back-fill 2 years of daily official NGN rates.
-# Uses open.er-api.com /timeseries (free, no key) or monthly date-range queries.
-# Stored in HIST_SEED_FILE so it only fetches once and stays offline after that.
-
-def _build_historical_seed_entry(date_str: str, ngn_rate: float,
-                                  prev_rate: float | None) -> dict:
-    """Convert a (date, rate) pair into a history entry with synthetic features."""
-    try:
-        dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
-    except Exception:
-        dt = datetime.datetime.now()
-    prem = 5.0   # assume ~5% black-market premium for historical points
-    p2p_mid = round(ngn_rate * (1 + prem / 100), 2)
-    momentum = float(p2p_mid - (prev_rate * (1 + prem / 100))) if prev_rate else 0.0
-    feat = {
-        "official_rate":    ngn_rate,
-        "premium_pct":      prem,
-        "premium_abs":      round(p2p_mid - ngn_rate, 2),
-        "p2p_spread_abs":   round(p2p_mid * 0.003, 2),
-        "p2p_spread_pct":   0.3,
-        "p2p_buy_std":      0.0,
-        "p2p_sell_std":     0.0,
-        "btc_24h_change":   0.0,
-        "eth_24h_change":   0.0,
-        "usdt_ngn_cg":      p2p_mid,
-        "chainlink_change": 0.0,
-        "uniswap_change":   0.0,
-        "eurusd":           1.09,
-        "dxy_proxy":        91.7,
-        "usd_zar":          18.5,
-        "usd_kes":          130.0,
-        "usd_ghs":          12.0,
-        "hour_sin":         float(np.sin(2 * np.pi * 12 / 24)),
-        "hour_cos":         float(np.cos(2 * np.pi * 12 / 24)),
-        "dow_sin":          float(np.sin(2 * np.pi * dt.weekday() / 7)),
-        "dow_cos":          float(np.cos(2 * np.pi * dt.weekday() / 7)),
-        "month_sin":        float(np.sin(2 * np.pi * dt.month / 12)),
-        "month_cos":        float(np.cos(2 * np.pi * dt.month / 12)),
-        "is_weekend":       int(dt.weekday() >= 5),
-        "is_business":      int(dt.weekday() < 5),
-        "news_overall":     0.0,
-        "news_nigeria":     0.0,
-        "news_cbn":         0.0,
-        "news_oil":         0.0,
-        "news_usd":         0.0,
-        "news_crypto":      0.0,
-        "news_geopolitics": 0.0,
-        "news_political_risk": 0.0,
-        "news_remittance":  0.0,
-        "news_em_risk":     0.0,
-        "momentum_1":       momentum,
-        "momentum_avg":     momentum,
-        "volatility":       abs(momentum) * 0.5 + ngn_rate * 0.003,
-        "trend_slope":      momentum,
-        "trend_accel":      0.0,
-        "rate_ma5_dev":     0.0,
-    }
-    return {
-        "timestamp": dt.isoformat(),
-        "p2p_mid":   p2p_mid,
-        "p2p_buy":   round(p2p_mid * 1.002, 2),
-        "p2p_sell":  round(p2p_mid * 0.998, 2),
-        "official":  ngn_rate,
-        "features":  feat,
-        "seeded":    True,   # mark as seeded so we can distinguish from live data
-    }
-
-def _fetch_historical_ngn_rates() -> list:
-    """
-    Fetch ~2 years of daily USD/NGN official rates.
-    Strategy:
-      1. Try open.er-api.com /timeseries endpoint (free, most reliable).
-      2. Fallback: query ExchangeRate-API by stepping through monthly periods.
-      3. Final fallback: use hard-coded quarterly anchors interpolated linearly.
-    Returns list of (date_str, ngn_rate) tuples, sorted oldest-first.
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-    }
-    end_date   = datetime.date.today()
-    start_date = end_date - datetime.timedelta(days=HIST_SEED_DAYS)
-    results    = {}   # date_str -> ngn_rate
-
-    # ── Method 1: open.er-api.com timeseries (completely free, no key) ──
-    try:
-        url = (f"https://open.er-api.com/v6/timeseries"
-               f"?start_date={start_date}&end_date={end_date}&base=USD&symbols=NGN")
-        r = requests.get(url, timeout=20, headers=headers)
-        if r.status_code == 200:
-            data = r.json()
-            for date_str, rates in data.get("rates", {}).items():
-                ngn = rates.get("NGN")
-                if ngn and float(ngn) > 100:
-                    results[date_str] = float(ngn)
-            if len(results) >= 200:
-                print(f"[Seed] open.er-api.com timeseries: {len(results)} days")
-    except Exception as e:
-        print(f"[Seed] Method 1 failed: {e}")
-
-    # ── Method 2: frankfurter.app timeseries (ECB data, free, reliable) ──
-    if len(results) < 200:
-        try:
-            url2 = (f"https://api.frankfurter.app/{start_date}..{end_date}"
-                    f"?from=USD&to=NGN")
-            r2 = requests.get(url2, timeout=20, headers=headers)
-            if r2.status_code == 200:
-                data2 = r2.json()
-                for date_str, rates in data2.get("rates", {}).items():
-                    ngn = rates.get("NGN")
-                    if ngn and float(ngn) > 100:
-                        results[date_str] = float(ngn)
-                print(f"[Seed] frankfurter.app: {len(results)} days total")
-        except Exception as e:
-            print(f"[Seed] Method 2 failed: {e}")
-
-    # ── Method 3: monthly queries to open.er-api.com historical ──
-    if len(results) < 100:
-        try:
-            d = end_date
-            attempts = 0
-            while d > start_date and attempts < 24:
-                date_str = d.strftime("%Y-%m-%d")
-                url3 = f"https://open.er-api.com/v6/latest/USD?date={date_str}"
-                r3 = requests.get(url3, timeout=10, headers=headers)
-                if r3.status_code == 200:
-                    ngn = r3.json().get("rates", {}).get("NGN")
-                    if ngn and float(ngn) > 100:
-                        results[date_str] = float(ngn)
-                d -= datetime.timedelta(days=30)
-                attempts += 1
-                time.sleep(0.3)
-        except Exception as e:
-            print(f"[Seed] Method 3 failed: {e}")
-
-    # ── Fallback: hard-coded quarterly NGN anchors (real historical values) ──
-    if len(results) < 10:
-        print("[Seed] Using hard-coded historical anchors")
-        # Actual approximate USD/NGN official rates at key dates
-        anchors = [
-            ("2023-01-01", 460.0),
-            ("2023-04-01", 461.0),
-            ("2023-06-15", 462.0),
-            ("2023-07-01", 770.0),   # CBN unification shock June 2023
-            ("2023-10-01", 780.0),
-            ("2024-01-01", 900.0),
-            ("2024-02-01", 1500.0),  # Jan/Feb 2024 further devaluation
-            ("2024-04-01", 1320.0),
-            ("2024-07-01", 1470.0),
-            ("2024-10-01", 1600.0),
-            ("2025-01-01", 1540.0),
-            ("2025-04-01", 1580.0),
-            ("2025-07-01", 1600.0),
-            ("2025-10-01", 1620.0),
-            ("2026-01-01", 1620.0),
-        ]
-        # Linear interpolation between anchors
-        import bisect
-        anchor_dates = [datetime.datetime.strptime(a[0], "%Y-%m-%d").date() for a in anchors]
-        anchor_rates = [a[1] for a in anchors]
-        d = start_date
-        while d <= end_date:
-            idx = bisect.bisect_right(anchor_dates, d) - 1
-            idx = max(0, min(idx, len(anchor_dates) - 2))
-            d1, d2 = anchor_dates[idx], anchor_dates[idx + 1]
-            r1, r2 = anchor_rates[idx], anchor_rates[idx + 1]
-            total_days = (d2 - d1).days or 1
-            elapsed    = (d - d1).days
-            interp_rate = r1 + (r2 - r1) * (elapsed / total_days)
-            results[d.strftime("%Y-%m-%d")] = round(interp_rate, 2)
-            d += datetime.timedelta(days=1)
-
-    return sorted(results.items())  # [(date_str, rate), ...] oldest-first
-
-
-def _seed_historical_history():
-    """
-    Called once on app startup. Loads or fetches 2 years of daily NGN rates
-    and injects them into rate_history as seeded entries (before live data).
-    """
-    # Check if we already seeded this session
-    if st.session_state.get("history_seeded"):
-        return
-
-    # Check if seed file exists and is fresh (< 24h old)
-    seed_data = []
-    seed_file_fresh = False
-    if os.path.exists(HIST_SEED_FILE):
-        try:
-            with open(HIST_SEED_FILE, "r") as f:
-                seed_data = json.load(f)
-            if seed_data:
-                # Check if last entry is from yesterday or newer
-                last_date_str = seed_data[-1].get("timestamp", "")[:10]
-                last_date = datetime.datetime.strptime(last_date_str, "%Y-%m-%d").date()
-                days_old  = (datetime.date.today() - last_date).days
-                seed_file_fresh = (days_old <= 1)
-        except Exception:
-            seed_data = []
-
-    if not seed_file_fresh:
-        # Fetch fresh historical data
-        with st.spinner("📊 Loading 2 years of historical NGN rate data… (one-time, takes ~15s)"):
-            try:
-                raw_pairs = _fetch_historical_ngn_rates()
-                if raw_pairs:
-                    entries = []
-                    prev_rate = None
-                    for date_str, ngn_rate in raw_pairs:
-                        entry = _build_historical_seed_entry(date_str, ngn_rate, prev_rate)
-                        entries.append(entry)
-                        prev_rate = ngn_rate
-                    seed_data = entries
-                    with open(HIST_SEED_FILE, "w") as f:
-                        json.dump(seed_data, f, default=str)
-            except Exception as e:
-                st.warning(f"⚠️ Historical seed fetch failed: {e}. Will use session data only.")
-                st.session_state.history_seeded = True
-                return
-
-    if seed_data:
-        # Merge seed data with existing history (seed = oldest, live = newest)
-        # Avoid duplicates by timestamp date prefix
-        existing_dates = {
-            d.get("timestamp", "")[:10]
-            for d in st.session_state.rate_history
-        }
-        new_seed = [
-            e for e in seed_data
-            if e.get("timestamp", "")[:10] not in existing_dates
-        ]
-        # Prepend seed data (oldest first), live data at the end
-        st.session_state.rate_history = new_seed + st.session_state.rate_history
-        # Cap total history
-        if len(st.session_state.rate_history) > MAX_HISTORY:
-            st.session_state.rate_history = st.session_state.rate_history[-MAX_HISTORY:]
-
-    st.session_state.history_seeded = True
-
 
 def init():
     defaults = {
@@ -758,7 +525,165 @@ def init():
         st.session_state.history_loaded = True
 
 init()
-_seed_historical_history()
+
+
+# ══════════════════════════════════════════════════════
+# HISTORICAL CBN RATE SEEDING  (2 years of daily data)
+# Runs once on startup; cached in oracle_hist_seed.json
+# ══════════════════════════════════════════════════════
+def _build_seed_entry(date_str: str, cbn: float, prev: float | None) -> dict:
+    """Convert a daily CBN rate into a history entry with minimal synthetic features."""
+    try:
+        dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+    except Exception:
+        dt = datetime.datetime.now()
+    momentum = float(cbn - prev) if prev else 0.0
+    feat = {
+        "p2p_premium_pct":       5.0,
+        "btc_24h_change":        0.0,  "eth_24h_change":       0.0,
+        "eurusd":                1.09, "dxy_proxy":            91.7,
+        "usd_zar":               18.5, "usd_ghs":              12.0,
+        "hour_sin":  float(np.sin(2*np.pi*12/24)),
+        "hour_cos":  float(np.cos(2*np.pi*12/24)),
+        "dow_sin":   float(np.sin(2*np.pi*dt.weekday()/7)),
+        "dow_cos":   float(np.cos(2*np.pi*dt.weekday()/7)),
+        "month_sin": float(np.sin(2*np.pi*dt.month/12)),
+        "month_cos": float(np.cos(2*np.pi*dt.month/12)),
+        "is_weekend":  int(dt.weekday() >= 5),
+        "is_business": int(dt.weekday() < 5),
+        "news_overall": 0.0, "news_nigeria": 0.0, "news_cbn": 0.0,
+        "news_oil":     0.0, "news_usd":     0.0, "news_crypto":        0.0,
+        "news_geopolitics": 0.0, "news_political_risk": 0.0,
+        "news_remittance":  0.0, "news_em_risk":        0.0,
+        "momentum_1":   momentum,
+        "momentum_avg": momentum,
+        "volatility":   abs(momentum)*0.5 + cbn*0.003,
+        "trend_slope":  momentum,
+        "trend_accel":  0.0,
+        "rate_ma5_dev": 0.0,
+    }
+    return {
+        "timestamp":   dt.isoformat(),
+        "cbn_rate":    cbn,
+        "p2p_mid":     round(cbn * 1.05, 2),   # synthetic P2P for legacy compat
+        "rate_source": "historical seed",
+        "rate_status": "historical",
+        "features":    feat,
+        "seeded":      True,
+    }
+
+
+def _fetch_historical_ngn_rates() -> list:
+    """
+    Fetch ~2 years of daily USD/NGN official CBN rates.
+    Returns list of (date_str, rate) sorted oldest-first.
+    """
+    hdrs = {"User-Agent": "Mozilla/5.0 (compatible)", "Accept": "application/json"}
+    end   = datetime.date.today()
+    start = end - datetime.timedelta(days=HIST_SEED_DAYS)
+    results = {}
+
+    # Method 1: open.er-api.com timeseries (free, no key, most complete)
+    try:
+        r = requests.get(
+            f"https://open.er-api.com/v6/timeseries"
+            f"?start_date={start}&end_date={end}&base=USD&symbols=NGN",
+            timeout=25, headers=hdrs)
+        if r.status_code == 200:
+            for ds, rates in r.json().get("rates", {}).items():
+                ngn = rates.get("NGN")
+                if ngn and float(ngn) > 100:
+                    results[ds] = float(ngn)
+    except Exception:
+        pass
+
+    # Method 2: frankfurter.app (ECB data, free, no key)
+    if len(results) < 100:
+        try:
+            r2 = requests.get(
+                f"https://api.frankfurter.app/{start}..{end}?from=USD&to=NGN",
+                timeout=25, headers=hdrs)
+            if r2.status_code == 200:
+                for ds, rates in r2.json().get("rates", {}).items():
+                    ngn = rates.get("NGN")
+                    if ngn and float(ngn) > 100 and ds not in results:
+                        results[ds] = float(ngn)
+        except Exception:
+            pass
+
+    # Hard-coded fallback: real CBN rate anchors + linear interpolation
+    if len(results) < 30:
+        import bisect
+        anchors = [
+            ("2023-01-01", 460.0),  ("2023-06-14", 461.0),
+            ("2023-06-15", 770.0),  # CBN FX unification shock
+            ("2023-09-01", 775.0),  ("2024-01-15", 900.0),
+            ("2024-02-01", 1480.0), # further devaluation
+            ("2024-03-01", 1600.0), ("2024-05-01", 1380.0),
+            ("2024-08-01", 1570.0), ("2024-11-01", 1680.0),
+            ("2025-01-01", 1545.0), ("2025-04-01", 1580.0),
+            ("2025-07-01", 1600.0), ("2025-10-01", 1615.0),
+            ("2026-01-01", 1620.0), ("2026-06-01", 1635.0),
+        ]
+        adates = [datetime.datetime.strptime(a[0], "%Y-%m-%d").date() for a in anchors]
+        arates = [a[1] for a in anchors]
+        d = start
+        while d <= end:
+            ds = d.strftime("%Y-%m-%d")
+            if ds not in results:
+                idx = max(0, min(bisect.bisect_right(adates, d) - 1, len(adates) - 2))
+                span = (adates[idx+1] - adates[idx]).days or 1
+                frac = (d - adates[idx]).days / span
+                results[ds] = round(arates[idx] + (arates[idx+1] - arates[idx]) * frac, 2)
+            d += datetime.timedelta(days=1)
+
+    return sorted(results.items())
+
+
+def _seed_historical_history():
+    """Populate session rate_history with 2 years of daily CBN rates on first run."""
+    if st.session_state.get("history_seeded"):
+        return
+
+    seed_data = []
+    fresh = False
+    if os.path.exists(HIST_SEED_FILE):
+        try:
+            with open(HIST_SEED_FILE) as f:
+                seed_data = json.load(f)
+            if seed_data:
+                last_d = seed_data[-1].get("timestamp", "")[:10]
+                days_old = (datetime.date.today() -
+                            datetime.datetime.strptime(last_d, "%Y-%m-%d").date()).days
+                fresh = (days_old <= 1)
+        except Exception:
+            seed_data = []
+
+    if not fresh:
+        with st.spinner("📊 Loading 2 years of CBN official rate history… (first run only, ~15s)"):
+            try:
+                pairs = _fetch_historical_ngn_rates()
+                prev  = None
+                seed_data = []
+                for ds, rate in pairs:
+                    seed_data.append(_build_seed_entry(ds, rate, prev))
+                    prev = rate
+                with open(HIST_SEED_FILE, "w") as f:
+                    json.dump(seed_data, f, default=str)
+            except Exception as e:
+                st.warning(f"⚠️ Historical seed failed: {e}. Using session data only.")
+                st.session_state.history_seeded = True
+                return
+
+    if seed_data:
+        existing_dates = {d.get("timestamp", "")[:10] for d in st.session_state.rate_history}
+        new_pts = [e for e in seed_data if e.get("timestamp", "")[:10] not in existing_dates]
+        st.session_state.rate_history = new_pts + st.session_state.rate_history
+        if len(st.session_state.rate_history) > MAX_HISTORY:
+            st.session_state.rate_history = st.session_state.rate_history[-MAX_HISTORY:]
+
+    st.session_state.history_seeded = True
+
 
 
 # ══════════════════════════════════════════════════════
@@ -841,34 +766,28 @@ def gemini(prompt: str, system: str = "", temperature: float = 0.2, max_tokens: 
     return f"❌ All Gemini models failed: {' | '.join(errors)}"
 
 def _parse_json(raw: str) -> dict:
-    """Robust JSON parser that handles Gemini markdown wrapping. Returns {} on failure."""
+    """Robust JSON parser — handles markdown fences, trailing commas, placeholders."""
     if not raw or raw.startswith("❌"):
         return {}
     clean = raw.strip()
-    # Strip markdown code fences
     if "```" in clean:
         for p in clean.split("```"):
             p = p.strip()
             if p.startswith("json"): p = p[4:].strip()
             if p.startswith("{"): clean = p; break
-    # Find JSON object start
     if not clean.startswith("{"):
         idx = clean.find("{")
         if idx >= 0: clean = clean[idx:]
         else: return {}
-    # Find JSON object end
     last = clean.rfind("}")
     if last >= 0: clean = clean[:last+1]
-    else: return {}
-    # Try direct parse
     try:
         return json.loads(clean)
-    except json.JSONDecodeError:
+    except Exception:
         pass
-    # Try fixing common Gemini JSON mistakes: trailing commas, single quotes
     try:
-        fixed = re.sub(r",\s*([}\]])", r"", clean)   # remove trailing commas
-        fixed = re.sub(r":\s*<[^>]+>", ': null', fixed) # replace <placeholder> with null
+        fixed = re.sub(r",\s*([}\]])", r"", clean)
+        fixed = re.sub(r":\s*<[^>]+>", ": null", fixed)
         return json.loads(fixed)
     except Exception:
         return {}
@@ -903,55 +822,38 @@ def fetch_global_signals() -> dict:
     # RSS/GNews headlines are injected later as a supplement if available.
     try:
         now_str_early = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M WAT")
-        early_prompt = (
-            f"You are a senior FX strategist specialising in Nigeria/NGN. Today is {now_str_early}.\n"
-            "Score CURRENT market conditions for USDT/NGN P2P rate prediction.\n"
-            "Positive score = USDT rises / NGN weakens. Negative = NGN strengthens.\n\n"
-            "Use your knowledge of CBN policy, Nigeria oil, USD/Fed, crypto, geopolitics, EM FX, remittances.\n"
-            "NEVER return 0 unless genuinely neutral. Return honest non-zero scores.\n\n"
-            "Return ONLY valid JSON. No markdown. No backticks. No preamble. Start with {\n"
-            '{"overall_score":15,"nigeria_macro":20,"cbn_policy":-10,"oil_impact":5,'
-            '"usd_fed_impact":10,"crypto_sentiment":8,"geopolitical_risk":12,'
-            '"political_risk_nigeria":15,"remittance_flow":-5,"global_em_risk":10,'
-            '"market_mood":"RISK_ON",'
-            '"top_mover_today":"USD strength and CBN policy stance",'
-            '"breaking_event":null,'
-            '"oil_analysis":"Oil prices remain rangebound affecting Nigeria FX earnings. OPEC cuts provide floor.",'
-            '"geopolitical_analysis":"Middle East tensions sustain risk premium on oil. USD safe-haven demand elevated.",'
-            '"cbn_analysis":"CBN maintaining managed float with periodic interventions. Reserves stable.",'
-            '"crypto_analysis":"Crypto risk-on sentiment supports USDT premium in P2P markets.",'
-            '"em_analysis":"EM currencies under pressure from strong USD and Fed hold signals.",'
-            '"top_bullish_catalyst":"USD strength and Nigeria FX demand outpacing supply",'
-            '"top_bearish_catalyst":"CBN intervention or oil price surge boosting NGN",'
-            '"overall_qualitative_direction":"BULLISH_USDT",'
-            '"qualitative_confidence":65,'
-            '"30min_bias":"HOLD",'
-            '"key_watch_items":["CBN intervention frequency","Brent crude price","US jobs data"],'
-            '"medium_term_outlook":"NGN faces structural depreciation pressure over 30-90 days.",'
-            '"long_term_outlook":"Long-term NGN trajectory depends on Nigeria reform path.",'
-            '"structural_ngn_risks":["Oil dependence","CBN reserve adequacy","political risk"]}\n\n'
-            "ABOVE WAS AN EXAMPLE FORMAT ONLY. Now return YOUR OWN real scored JSON for today's actual conditions. "
-            "Start with { immediately:"
-        )
+        early_prompt = f"""You are a senior FX strategist. Today is {now_str_early}.
+Score current market conditions for the USDT/NGN P2P exchange rate.
+Positive score = USDT rises / NGN weakens. Negative = NGN strengthens.
+
+Use your knowledge of: CBN policy, Nigeria oil earnings, USD/Fed stance,
+crypto market conditions, geopolitical risks, EM currency pressure, remittances.
+
+Return ONLY valid compact JSON — no markdown, no backticks, start immediately with {{:
+{{"overall_score":<int -100 to 100>,"nigeria_macro":<int>,"cbn_policy":<int>,"oil_impact":<int>,
+"usd_fed_impact":<int>,"crypto_sentiment":<int>,"geopolitical_risk":<int>,
+"political_risk_nigeria":<int>,"remittance_flow":<int>,"global_em_risk":<int>,
+"market_mood":"RISK_ON|RISK_OFF|NEUTRAL",
+"top_mover_today":"<key factor>","breaking_event":null,
+"oil_analysis":"<2 sentences>","geopolitical_analysis":"<2 sentences>",
+"cbn_analysis":"<2 sentences>","crypto_analysis":"<1 sentence>","em_analysis":"<1 sentence>",
+"top_bullish_catalyst":"<reason USDT/NGN rises>","top_bearish_catalyst":"<reason NGN strengthens>",
+"overall_qualitative_direction":"BULLISH_USDT|BEARISH_USDT|NEUTRAL",
+"qualitative_confidence":<0-100>,"30min_bias":"BUY|SELL|HOLD",
+"key_watch_items":["<item1>","<item2>","<item3>"],
+"medium_term_outlook":"<3 sentences 30-90 day>","long_term_outlook":"<2 sentences 6-12 month>",
+"structural_ngn_risks":["<risk1>","<risk2>","<risk3>"]}}"""
         raw_early = gemini(early_prompt,
             "You are a quantitative FX strategist. Return ONLY valid JSON. No markdown. Start with {.",
             temperature=0.3, max_tokens=1500)
         sig["gemini_raw_response"] = raw_early[:600]
-        # Detect if Gemini returned an error string instead of JSON
-        if raw_early.startswith("❌"):
-            sig["errors"].append(f"Gemini early pass: API error: {raw_early[:200]}")
-            sig["gemini_raw_error"] = raw_early[:300]
+        parsed_early = _parse_json(raw_early)
+        if parsed_early and any(parsed_early.get(k,0) != 0
+                                for k in ["overall_score","nigeria_macro","oil_impact"]):
+            sig["analysis"] = parsed_early
+            sig["sources"].append("Gemini AI (knowledge-based, no headlines needed)")
         else:
-            parsed_early = _parse_json(raw_early)
-            if parsed_early and "overall_score" in parsed_early:
-                # Accept even if some scores are zero — partial data is better than nothing
-                sig["analysis"] = parsed_early
-                sig["sources"].append("Gemini AI (knowledge-based)")
-                # Log if all zeros for debugging
-                if all(parsed_early.get(k,0) == 0 for k in ["overall_score","nigeria_macro","oil_impact"]):
-                    sig["errors"].append("⚠️ Gemini returned all-zero scores — may reflect genuinely neutral market or prompt issue")
-            else:
-                sig["errors"].append(f"Gemini early pass: JSON parse failed or missing fields. Raw[:200]: {raw_early[:200]}")
+            sig["errors"].append(f"Gemini early pass: parsed but all-zero. Raw: {raw_early[:150]}")
     except Exception as e:
         sig["errors"].append(f"Gemini early pass FAILED: {type(e).__name__}: {str(e)[:200]}")
         sig["gemini_raw_error"] = f"{type(e).__name__}: {str(e)}"
@@ -1195,19 +1097,12 @@ def fetch_global_signals() -> dict:
                     sig["errors"].append("GNews: rate limit hit (100 req/day free tier)")
                     break
                 elif r.status_code == 403:
-                    sig["errors"].append(f"GNews 403: invalid key or quota exceeded. Response: {r.text[:100]}")
+                    sig["errors"].append(f"GNews: invalid API key or quota exceeded")
                     break
-                elif r.status_code == 401:
-                    sig["errors"].append(f"GNews 401: unauthorized. Check GNEWS_KEY in secrets.toml")
-                    break
-                else:
-                    sig["errors"].append(f"GNews HTTP {r.status_code}: {r.text[:100]}")
             except Exception as e:
                 sig["errors"].append(f"GNews '{q[:20]}': {type(e).__name__}: {str(e)[:120]}")
         if gnews_count > 0:
             sig["sources"].append(f"GNews API ({gnews_count} headlines)")
-        else:
-            sig["errors"].append(f"GNews: 0 headlines returned across all queries. Key={GNEWS_KEY[:8]}...")
     sig["gnews_count"] = gnews_count
 
     # NewsAPI — optional secondary supplement
@@ -1259,43 +1154,39 @@ LIVE MARKET DATA:
 HEADLINES ({len(headlines_raw)}):
 {headlines_block if has_headlines else "(none — use your knowledge)"}
 
-Return ONLY valid JSON. No markdown. No backticks. Start immediately with {{"overall_score":
-The JSON must have ALL these fields with REAL non-zero integer scores:
-overall_score, nigeria_macro, cbn_policy, oil_impact, usd_fed_impact, crypto_sentiment,
-geopolitical_risk, political_risk_nigeria, remittance_flow, global_em_risk (all integers -100 to 100),
-market_mood (RISK_ON/RISK_OFF/NEUTRAL), top_mover_today (string), breaking_event (string or null),
-oil_analysis (2 sentences), geopolitical_analysis (2 sentences), cbn_analysis (2 sentences),
-crypto_analysis (1 sentence), em_analysis (1 sentence),
-top_bullish_catalyst (string), top_bearish_catalyst (string),
-overall_qualitative_direction (BULLISH_USDT/BEARISH_USDT/NEUTRAL),
-qualitative_confidence (0-100 integer), 30min_bias (BUY/SELL/HOLD),
-key_watch_items (array of 3 strings), medium_term_outlook (3 sentences), 
-long_term_outlook (2 sentences), structural_ngn_risks (array of 3 strings).
-START NOW with {{"""
+Return ONLY valid JSON starting with {{. No markdown. No preamble:
+{{"overall_score":<-100 to 100>,"nigeria_macro":<int>,"cbn_policy":<int>,"oil_impact":<int>,
+"usd_fed_impact":<int>,"crypto_sentiment":<int>,"geopolitical_risk":<int>,
+"political_risk_nigeria":<int>,"remittance_flow":<int>,"global_em_risk":<int>,
+"market_mood":"RISK_ON|RISK_OFF|NEUTRAL","top_mover_today":"<factor>","breaking_event":null,
+"oil_analysis":"<2 sentences>","geopolitical_analysis":"<2 sentences>",
+"cbn_analysis":"<2 sentences>","crypto_analysis":"<1 sentence>","em_analysis":"<1 sentence>",
+"top_bullish_catalyst":"<reason>","top_bearish_catalyst":"<reason>",
+"overall_qualitative_direction":"BULLISH_USDT|BEARISH_USDT|NEUTRAL",
+"qualitative_confidence":<0-100>,"30min_bias":"BUY|SELL|HOLD",
+"key_watch_items":["<i1>","<i2>","<i3>"],
+"medium_term_outlook":"<3 sentences>","long_term_outlook":"<2 sentences>",
+"structural_ngn_risks":["<r1>","<r2>","<r3>"]}}"""
 
         try:
             raw_q = gemini(enhanced_prompt,
                 "Quantitative FX strategist. Return ONLY valid JSON. Start with {.",
                 temperature=0.3, max_tokens=1800)
             sig["gemini_raw_response"] = raw_q[:600]
-            if raw_q.startswith("❌"):
-                sig["errors"].append(f"Gemini enhanced: API error: {raw_q[:150]}")
+            parsed = _parse_json(raw_q)
+            if parsed and any(parsed.get(k,0) != 0 for k in ["overall_score","nigeria_macro","oil_impact"]):
+                sig["analysis"] = parsed   # overwrite early pass with richer version
+                sig["sources"].append("Gemini AI (enhanced with live market data)")
+            elif already_scored:
+                sig["errors"].append("Gemini enhanced pass returned zeros — keeping Step 0 result")
             else:
-                parsed = _parse_json(raw_q)
-                if parsed and "overall_score" in parsed:
-                    sig["analysis"] = parsed   # overwrite early pass with richer version
-                    sig["sources"].append("Gemini AI (enhanced with live data)")
-                elif already_scored:
-                    sig["errors"].append(f"Gemini enhanced: bad parse, keeping Step 0 result. Raw: {raw_q[:100]}")
-                else:
-                    sig["errors"].append(f"Gemini enhanced: empty parse. Raw: {raw_q[:150]}")
+                sig["errors"].append(f"Gemini enhanced pass: empty parse. Raw: {raw_q[:150]}")
         except Exception as e:
             if not already_scored:
                 sig["gemini_raw_error"] = f"{type(e).__name__}: {str(e)}"
             sig["errors"].append(f"Gemini enhanced: {type(e).__name__}: {str(e)[:150]}")
 
-    # Always return sig regardless of what succeeded or failed
-    return sig
+    return sig  # CRITICAL — always return the dict
 
 
 def maybe_refresh_signals(force: bool = False):
@@ -1323,16 +1214,20 @@ def maybe_refresh_signals(force: bool = False):
 # FEATURE ENGINEERING
 # ══════════════════════════════════════════════════════
 FEATURE_COLS = [
-    "p2p_spread_abs", "p2p_spread_pct", "p2p_buy_std", "p2p_sell_std",
-    "premium_pct", "premium_abs", "official_rate",
-    "btc_24h_change", "eth_24h_change", "usdt_ngn_cg",
-    "chainlink_change", "uniswap_change",
-    "eurusd", "dxy_proxy", "usd_zar", "usd_kes", "usd_ghs",
+    # P2P premium = parallel market pressure signal (feature only, not target)
+    "p2p_premium_pct",
+    # Crypto
+    "btc_24h_change", "eth_24h_change",
+    # FX
+    "eurusd", "dxy_proxy", "usd_zar", "usd_ghs",
+    # Temporal
     "hour_sin", "hour_cos", "dow_sin", "dow_cos", "month_sin", "month_cos",
     "is_weekend", "is_business",
+    # Qualitative Gemini scores (10 dimensions)
     "news_overall", "news_nigeria", "news_cbn", "news_oil", "news_usd",
     "news_crypto", "news_geopolitics", "news_political_risk",
     "news_remittance", "news_em_risk",
+    # CBN rate momentum/volatility (computed from CBN history)
     "momentum_1", "momentum_avg", "volatility", "trend_slope", "trend_accel",
     "rate_ma5_dev",
 ]
@@ -1341,226 +1236,174 @@ def features_to_vector(feat: dict) -> np.ndarray:
     return np.array([float(feat.get(c, 0.0)) for c in FEATURE_COLS], dtype=float)
 
 def collect_features() -> tuple:
+    """
+    Fetch the CBN official USD/NGN rate as the PRIMARY rate.
+    P2P rate is retained only as a spread/black-market-pressure FEATURE.
+    Returns (raw_dict, features_dict).
+    """
     feat = {}
-    raw  = {}
-    raw["rate_source"] = "unknown"
-    raw["rate_status"] = "fetching"
+    raw  = {"rate_source": "unknown", "rate_status": "fetching"}
 
-    # P2P RATES
-    try:
-        headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "Accept": "application/json, */*", "Accept-Language": "en-US,en;q=0.9"}
-        for side, key in [("BUY", "p2p_buy"), ("SELL", "p2p_sell")]:
-            payload = {"asset": "USDT", "fiat": "NGN", "merchantCheck": False,
-                       "page": 1, "payTypes": [], "publisherType": None, "rows": 10, "tradeType": side}
-            r = requests.post("https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
-                              json=payload, headers=headers, timeout=15)
+    _BH_LOCAL = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # ── PRIMARY: CBN Official Rate ───────────────────────────────────
+    cbn_rate = None
+    for url in [
+        "https://open.er-api.com/v6/latest/USD",
+        "https://api.frankfurter.app/latest?from=USD",
+        "https://api.exchangerate-api.com/v4/latest/USD",
+    ]:
+        try:
+            r = requests.get(url, timeout=10, headers=_BH_LOCAL)
             if r.status_code == 200:
-                prices = [float(item["adv"]["price"]) for item in r.json().get("data", [])
-                          if float(item.get("adv", {}).get("price", 0)) > 100]
-                if prices:
-                    raw[key] = round(sum(prices) / len(prices), 2)
-                    if side == "BUY":
-                        feat["p2p_buy_min"] = min(prices)
-                        feat["p2p_buy_max"] = max(prices)
-                        feat["p2p_buy_std"] = float(np.std(prices))
-                    else:
-                        feat["p2p_sell_min"] = min(prices)
-                        feat["p2p_sell_max"] = max(prices)
-                        feat["p2p_sell_std"] = float(np.std(prices))
-        if raw.get("p2p_buy") or raw.get("p2p_sell"):
-            raw["rate_source"] = "Binance P2P"
-            raw["rate_status"] = "live"
-    except Exception as e:
-        raw["binance_error"] = str(e)[:100]
+                rates = r.json().get("rates", {})
+                ngn   = rates.get("NGN")
+                if ngn and float(ngn) > 100:
+                    cbn_rate = float(ngn)
+                    raw["cbn_rate"]   = cbn_rate
+                    raw["rate_source"] = f"ExchangeRate-API ({url.split('/')[2]})"
+                    raw["rate_status"] = "live"
+                    # FX features from same response
+                    eur = rates.get("EUR")
+                    if eur:
+                        feat["eurusd"]    = round(1 / eur, 6)
+                        feat["dxy_proxy"] = round(eur * 100, 4)
+                    if rates.get("ZAR"): feat["usd_zar"] = float(rates["ZAR"])
+                    if rates.get("GHS"): feat["usd_ghs"] = float(rates["GHS"])
+                    break
+        except Exception:
+            continue
 
-    if not (raw.get("p2p_buy") and raw.get("p2p_sell")):
+    if cbn_rate is None:
+        # Last fallback: CoinGecko USDT/NGN ≈ parallel market (not official, warn user)
         try:
             r = requests.get(
-                "https://api2.bybit.com/fiat/otc/item/list?userId=&tokenId=USDT&currencyId=NGN"
-                "&payment=&side=1&size=10&page=1&amount=&authMaker=false&canTrade=false",
-headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "Accept": "application/json, */*", "Accept-Language": "en-US,en;q=0.9"}, timeout=12
-            )
+                "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=ngn",
+                timeout=10, headers=_BH_LOCAL)
             if r.status_code == 200:
-                prices = [float(i.get("price", 0)) for i in r.json().get("result", {}).get("items", [])
-                          if float(i.get("price", 0)) > 100]
-                if prices:
-                    avg = round(sum(prices) / len(prices), 2)
-                    if not raw.get("p2p_buy"):  raw["p2p_buy"]  = avg
-                    if not raw.get("p2p_sell"): raw["p2p_sell"] = round(avg * 0.998, 2)
-                    feat["p2p_buy_std"]  = float(np.std(prices)) if len(prices) > 1 else 0.0
-                    feat["p2p_sell_std"] = 0.0
-                    raw["rate_source"] = "Bybit P2P"
-                    raw["rate_status"] = "live"
-        except: pass
+                val = r.json().get("tether", {}).get("ngn")
+                if val and float(val) > 100:
+                    cbn_rate = float(val)
+                    raw["cbn_rate"]    = cbn_rate
+                    raw["rate_source"] = "CoinGecko USDT/NGN ⚠️ (not official CBN)"
+                    raw["rate_status"] = "proxy"
+        except Exception:
+            pass
 
-    if not raw.get("p2p_buy"):
-        try:
-            r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=ngn",
-                             timeout=10, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "Accept": "application/json, */*", "Accept-Language": "en-US,en;q=0.9"})
-            if r.status_code == 200:
-                ngn_val = r.json().get("tether", {}).get("ngn")
-                if ngn_val and float(ngn_val) > 100:
-                    raw["p2p_buy"]  = float(ngn_val)
-                    raw["p2p_sell"] = round(float(ngn_val) * 0.997, 2)
-                    feat["p2p_buy_std"] = feat["p2p_sell_std"] = 0.0
-                    raw["rate_source"] = "CoinGecko"
-                    raw["rate_status"] = "live"
-        except: pass
-
-    if not raw.get("p2p_buy"):
-        raw["p2p_buy"]   = 1620.0
-        raw["p2p_sell"]  = 1615.0
-        raw["rate_source"] = "⚠️ Fallback estimate"
+    if cbn_rate is None:
+        cbn_rate = 1620.0
+        raw["cbn_rate"]    = cbn_rate
+        raw["rate_source"] = "⚠️ Fallback estimate — all APIs failed"
         raw["rate_status"] = "estimated"
-        feat["p2p_buy_std"] = feat["p2p_sell_std"] = 0.0
 
-    if raw.get("p2p_buy") and raw.get("p2p_sell"):
-        raw["p2p_mid"]    = round((raw["p2p_buy"] + raw["p2p_sell"]) / 2, 2)
-        raw["p2p_spread"] = round(raw["p2p_buy"] - raw["p2p_sell"], 2)
-        feat["p2p_spread_abs"] = raw["p2p_spread"]
-        feat["p2p_spread_pct"] = round(raw["p2p_spread"] / max(raw["p2p_sell"], 1) * 100, 4)
+    # ── SECONDARY: P2P rate as a feature (parallel market pressure) ──
+    p2p_mid = None
+    try:
+        r = requests.post(
+            "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+            json={"asset": "USDT", "fiat": "NGN", "merchantCheck": False,
+                  "page": 1, "payTypes": [], "publisherType": None,
+                  "rows": 10, "tradeType": "BUY"},
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+            timeout=12)
+        if r.status_code == 200:
+            prices = [float(i["adv"]["price"]) for i in r.json().get("data", [])
+                      if float(i.get("adv", {}).get("price", 0)) > 100]
+            if prices:
+                p2p_mid = round(sum(prices) / len(prices), 2)
+    except Exception:
+        pass
+
+    raw["p2p_mid"] = p2p_mid
+    if p2p_mid and cbn_rate:
+        feat["p2p_premium_pct"] = round((p2p_mid - cbn_rate) / cbn_rate * 100, 4)
     else:
-        raw["p2p_mid"] = raw.get("p2p_buy", 1620.0)
-        raw["p2p_spread"] = 0.0
-        feat["p2p_spread_abs"] = feat["p2p_spread_pct"] = 0.0
+        feat["p2p_premium_pct"] = 0.0
 
-    # OFFICIAL RATE
-    official = None
-    for url in ["https://open.er-api.com/v6/latest/USD", "https://api.exchangerate-api.com/v4/latest/USD"]:
-        try:
-            r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"})
-            if r.status_code == 200:
-                rates_obj = r.json().get("rates", {})
-                ngn = rates_obj.get("NGN")
-                if ngn:
-                    official = float(ngn)
-                    for ccy in ["EUR", "GBP", "ZAR", "KES", "GHS", "EGP", "XOF"]:
-                        v = rates_obj.get(ccy)
-                        if v: feat[f"usd_{ccy.lower()}"] = float(v)
-                    break
-        except: pass
-    raw["official"] = official
-    if official and raw.get("p2p_mid"):
-        raw["premium_pct"] = round((raw["p2p_mid"] - official) / official * 100, 4)
-        feat["official_rate"] = official
-        feat["premium_pct"]   = raw["premium_pct"]
-        feat["premium_abs"]   = round(raw["p2p_mid"] - official, 2)
-
-    # CRYPTO FEATURES
+    # ── Crypto features ──
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price"
-            "?ids=bitcoin,ethereum,tether&vs_currencies=usd,ngn&include_24hr_change=true",
-            timeout=12, headers={"User-Agent": "Mozilla/5.0"}
-        )
+            "?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true",
+            timeout=10, headers=_BH_LOCAL)
         if r.status_code == 200:
             d = r.json()
-            feat["btc_24h_change"] = d.get("bitcoin", {}).get("usd_24h_change", np.nan)
-            feat["eth_24h_change"] = d.get("ethereum", {}).get("usd_24h_change", np.nan)
-            feat["usdt_ngn_cg"]    = d.get("tether", {}).get("ngn", np.nan)
+            feat["btc_24h_change"] = d.get("bitcoin",  {}).get("usd_24h_change", 0.0) or 0.0
+            feat["eth_24h_change"] = d.get("ethereum", {}).get("usd_24h_change", 0.0) or 0.0
             raw["btc_change"]      = feat["btc_24h_change"]
-    except: pass
+    except Exception:
+        feat["btc_24h_change"] = feat["eth_24h_change"] = 0.0
 
-    try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price"
-            "?ids=chainlink,uniswap&vs_currencies=usd&include_24hr_change=true",
-            timeout=10, headers={"User-Agent": "Mozilla/5.0"}
-        )
-        if r.status_code == 200:
-            d = r.json()
-            feat["chainlink_change"] = d.get("chainlink", {}).get("usd_24h_change", np.nan)
-            feat["uniswap_change"]   = d.get("uniswap", {}).get("usd_24h_change", np.nan)
-    except: pass
-
-    # USD STRENGTH
-    eur = feat.get("usd_eur")
-    if eur:
-        feat["eurusd"]     = round(1 / eur, 6)
-        feat["dxy_proxy"]  = round(eur * 100, 4)
-        feat["usd_strong"] = 1 if feat["eurusd"] < 1.05 else 0
-
-    # TEMPORAL FEATURES
+    # ── Temporal features ──
     now = datetime.datetime.now()
-    feat["hour"]        = now.hour
-    feat["dow"]         = now.weekday()
     feat["is_weekend"]  = int(now.weekday() >= 5)
     feat["is_business"] = int(8 <= now.hour <= 17 and now.weekday() < 5)
-    feat["month"]       = now.month
-    feat["hour_sin"]    = float(np.sin(2 * np.pi * now.hour / 24))
-    feat["hour_cos"]    = float(np.cos(2 * np.pi * now.hour / 24))
-    feat["dow_sin"]     = float(np.sin(2 * np.pi * now.weekday() / 7))
-    feat["dow_cos"]     = float(np.cos(2 * np.pi * now.weekday() / 7))
-    feat["month_sin"]   = float(np.sin(2 * np.pi * now.month / 12))
-    feat["month_cos"]   = float(np.cos(2 * np.pi * now.month / 12))
+    feat["hour_sin"]    = float(np.sin(2*np.pi*now.hour/24))
+    feat["hour_cos"]    = float(np.cos(2*np.pi*now.hour/24))
+    feat["dow_sin"]     = float(np.sin(2*np.pi*now.weekday()/7))
+    feat["dow_cos"]     = float(np.cos(2*np.pi*now.weekday()/7))
+    feat["month_sin"]   = float(np.sin(2*np.pi*now.month/12))
+    feat["month_cos"]   = float(np.cos(2*np.pi*now.month/12))
 
-    # QUALITATIVE INTELLIGENCE
+    # ── Qualitative intelligence from Gemini ──
     cached_sig  = st.session_state.global_signals or {}
     cached_anal = cached_sig.get("analysis", {})
-    headlines_all = [h.get("full", "") for h in cached_sig.get("headlines", [])]
-
     if cached_anal and not _signals_stale():
-        feat["news_overall"]        = float(cached_anal.get("overall_score", 0))
-        feat["news_nigeria"]        = float(cached_anal.get("nigeria_macro", 0))
-        feat["news_cbn"]            = float(cached_anal.get("cbn_policy", 0))
-        feat["news_oil"]            = float(cached_anal.get("oil_impact", 0))
-        feat["news_usd"]            = float(cached_anal.get("usd_fed_impact", 0))
-        feat["news_crypto"]         = float(cached_anal.get("crypto_sentiment", 0))
-        feat["news_geopolitics"]    = float(cached_anal.get("geopolitical_risk", 0))
-        feat["news_political_risk"] = float(cached_anal.get("political_risk_nigeria", 0))
-        feat["news_remittance"]     = float(cached_anal.get("remittance_flow", 0))
-        feat["news_em_risk"]        = float(cached_anal.get("global_em_risk", 0))
-        raw["news_intel"]           = cached_anal
-        raw["news_headlines"]       = headlines_all[:40]
-        raw["news_headlines_count"] = len(headlines_all)
+        anal = cached_anal
     else:
         maybe_refresh_signals(force=True)
-        fresh_sig  = st.session_state.global_signals or {}
-        fresh_anal = fresh_sig.get("analysis", {})
-        fresh_hl   = [h.get("full", "") for h in fresh_sig.get("headlines", [])]
-        if fresh_anal:
-            feat["news_overall"]        = float(fresh_anal.get("overall_score", 0))
-            feat["news_nigeria"]        = float(fresh_anal.get("nigeria_macro", 0))
-            feat["news_cbn"]            = float(fresh_anal.get("cbn_policy", 0))
-            feat["news_oil"]            = float(fresh_anal.get("oil_impact", 0))
-            feat["news_usd"]            = float(fresh_anal.get("usd_fed_impact", 0))
-            feat["news_crypto"]         = float(fresh_anal.get("crypto_sentiment", 0))
-            feat["news_geopolitics"]    = float(fresh_anal.get("geopolitical_risk", 0))
-            feat["news_political_risk"] = float(fresh_anal.get("political_risk_nigeria", 0))
-            feat["news_remittance"]     = float(fresh_anal.get("remittance_flow", 0))
-            feat["news_em_risk"]        = float(fresh_anal.get("global_em_risk", 0))
-            raw["news_intel"]           = fresh_anal
-            raw["news_headlines"]       = fresh_hl[:40]
-            raw["news_headlines_count"] = len(fresh_hl)
-        else:
-            for k in ["news_overall","news_nigeria","news_cbn","news_oil","news_usd",
-                      "news_crypto","news_geopolitics","news_political_risk","news_remittance","news_em_risk"]:
-                feat[k] = 0.0
-            raw["news_intel"] = {}
-            raw["news_headlines"] = []
-            raw["news_headlines_count"] = 0
+        anal = (st.session_state.global_signals or {}).get("analysis", {})
 
-    # HISTORICAL MOMENTUM
+    if anal:
+        feat["news_overall"]        = float(anal.get("overall_score",         0))
+        feat["news_nigeria"]        = float(anal.get("nigeria_macro",         0))
+        feat["news_cbn"]            = float(anal.get("cbn_policy",            0))
+        feat["news_oil"]            = float(anal.get("oil_impact",            0))
+        feat["news_usd"]            = float(anal.get("usd_fed_impact",        0))
+        feat["news_crypto"]         = float(anal.get("crypto_sentiment",      0))
+        feat["news_geopolitics"]    = float(anal.get("geopolitical_risk",     0))
+        feat["news_political_risk"] = float(anal.get("political_risk_nigeria",0))
+        feat["news_remittance"]     = float(anal.get("remittance_flow",       0))
+        feat["news_em_risk"]        = float(anal.get("global_em_risk",        0))
+        raw["news_intel"]           = anal
+        raw["news_headlines"]       = [h.get("full","") for h in cached_sig.get("headlines",[])[:40]]
+        raw["news_headlines_count"] = len(raw["news_headlines"])
+    else:
+        for k in ["news_overall","news_nigeria","news_cbn","news_oil","news_usd",
+                  "news_crypto","news_geopolitics","news_political_risk",
+                  "news_remittance","news_em_risk"]:
+            feat[k] = 0.0
+        raw["news_intel"] = {}
+        raw["news_headlines"] = []
+        raw["news_headlines_count"] = 0
+
+    # ── CBN rate momentum (from CBN rate history) ──
     hist = st.session_state.rate_history
-    if len(hist) >= 2:
-        recent_rates = [h["p2p_mid"] for h in hist[-10:] if h.get("p2p_mid")]
-        if len(recent_rates) >= 2:
-            feat["momentum_1"]   = recent_rates[-1] - recent_rates[-2]
-            feat["momentum_avg"] = recent_rates[-1] - np.mean(recent_rates[:-1])
-            feat["volatility"]   = float(np.std(recent_rates))
-            x = np.arange(len(recent_rates))
-            slope = float(np.polyfit(x, recent_rates, 1)[0])
-            feat["trend_slope"]  = slope
-            feat["trend_accel"]  = feat["momentum_1"] - (recent_rates[-2] - recent_rates[-3]) if len(recent_rates) >= 3 else 0.0
-        if len(recent_rates) >= 5:
-            feat["rate_ma5"]     = float(np.mean(recent_rates[-5:]))
-            feat["rate_ma5_dev"] = recent_rates[-1] - feat["rate_ma5"]
+    recent = [h["cbn_rate"] for h in hist[-10:] if h.get("cbn_rate")]
+    if len(recent) >= 2:
+        feat["momentum_1"]   = recent[-1] - recent[-2]
+        feat["momentum_avg"] = recent[-1] - float(np.mean(recent[:-1]))
+        feat["volatility"]   = float(np.std(recent))
+        x = np.arange(len(recent))
+        feat["trend_slope"]  = float(np.polyfit(x, recent, 1)[0])
+        feat["trend_accel"]  = (feat["momentum_1"] - (recent[-2] - recent[-3])
+                                if len(recent) >= 3 else 0.0)
     else:
         for k in ["momentum_1","momentum_avg","volatility","trend_slope","trend_accel"]:
             feat[k] = 0.0
+    if len(recent) >= 5:
+        feat["rate_ma5_dev"] = recent[-1] - float(np.mean(recent[-5:]))
+    else:
+        feat["rate_ma5_dev"] = 0.0
 
+    # Sanitise
     for k, v in feat.items():
-        if isinstance(v, float) and np.isnan(v):
+        if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
             feat[k] = 0.0
 
     raw["timestamp"] = datetime.datetime.now().isoformat()
@@ -1572,14 +1415,15 @@ headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/53
 # ML TRAINING ENGINE
 # ══════════════════════════════════════════════════════
 def build_training_data() -> tuple:
+    """Build training set: X = features at time t, y = CBN rate at time t+1."""
     hist = st.session_state.rate_history
     if len(hist) < 5:
         return None, None, None
     X_rows, y_vals, times = [], [], []
     for i in range(len(hist) - 1):
-        feat = hist[i].get("features", {})
-        next_rate = hist[i + 1].get("p2p_mid")
-        if next_rate and feat:
+        feat      = hist[i].get("features", {})
+        next_rate = hist[i + 1].get("cbn_rate")   # ← CBN official rate as target
+        if next_rate and float(next_rate) > 100 and feat:
             X_rows.append(features_to_vector(feat))
             y_vals.append(float(next_rate))
             times.append(hist[i].get("timestamp", ""))
@@ -1587,134 +1431,108 @@ def build_training_data() -> tuple:
         return None, None, None
     return np.array(X_rows), np.array(y_vals), times
 
-def _clip_prediction(pred: float, current_rate: float,
-                     max_pct: float = 0.15) -> float:
-    """
-    Hard-clip a model prediction to ±max_pct of current rate.
-    Prevents Ridge/linear models from exploding when feature matrix
-    has low variance (few unique training points) or outlier leverage.
-    15% cap = very generous for a 24h NGN forecast.
-    """
-    lo = current_rate * (1 - max_pct)
-    hi = current_rate * (1 + max_pct)
-    return float(np.clip(pred, lo, hi))
+def _clip_pred(pred: float, current: float, pct: float = 0.12) -> float:
+    """Clip model prediction to ±pct of current rate. Prevents Ridge explosion."""
+    return float(np.clip(pred, current * (1 - pct), current * (1 + pct)))
 
 
 def train_and_predict(current_feat: dict, current_rate: float) -> dict:
+    """Train on CBN official rate history and predict next CBN rate."""
     X, y, times = build_training_data()
-    cold_start = (X is None)
+    cold_start  = (X is None)
 
     if cold_start:
-        # Simple heuristic forecast when history is thin
-        score = 0.0
-        score += current_feat.get("btc_24h_change", 0) * 0.3
-        score += current_feat.get("news_overall", 0) * 0.5
-        score += current_feat.get("momentum_1", 0) * 0.8
-        direction_factor = 1 + max(-0.008, min(0.008, score / 5000.0))
-        est = round(current_rate * direction_factor, 2)
+        score  = current_feat.get("news_overall", 0) * 0.5
+        score += current_feat.get("momentum_1",   0) * 0.8
+        score += current_feat.get("btc_24h_change",0) * 0.2
+        est = round(current_rate * (1 + max(-0.006, min(0.006, score / 5000.0))), 2)
         return {
-            "cold_start": True,
-            "n_training_points": 0,
+            "cold_start": True, "n_training_points": 0,
             "ridge_pred": est, "rf_pred": est, "gb_pred": est, "ensemble": est,
-            "pred_low": round(current_rate * 0.992, 2),
-            "pred_high": round(current_rate * 1.008, 2),
-            "confidence": 35,
-            "direction": "BULLISH" if est > current_rate else "BEARISH" if est < current_rate else "NEUTRAL",
+            "pred_low": round(current_rate * 0.993, 2),
+            "pred_high": round(current_rate * 1.007, 2),
+            "confidence": 35, "direction": "BULLISH" if est > current_rate else "BEARISH" if est < current_rate else "NEUTRAL",
             "model_agreement": 100.0,
             "ridge_cv_mae": None, "rf_cv_mae": None, "gb_cv_mae": None,
-            "rf_feature_importance": {},
-            "note": "COLD START — fewer than 5 data points. Confidence capped at 35%.",
+            "rf_feature_importance": {}, "clipped_models": [],
+            "note": "COLD START — fewer than 5 CBN-rate observations.",
         }
 
-    # ── Remove outlier rows (y values > 3σ from median) ──
-    # These cause Ridge to wildly extrapolate on small datasets
-    y_median  = float(np.median(y))
-    y_std_    = float(np.std(y)) or 1.0
-    mask      = np.abs(y - y_median) < 4 * y_std_
-    X_clean, y_clean = X[mask], y[mask]
-    if len(X_clean) < 4:
-        X_clean, y_clean = X, y   # fall back to all data if too aggressive
+    # Remove outlier rows (> 4σ from median) to prevent Ridge explosion
+    y_med  = float(np.median(y))
+    y_std  = float(np.std(y)) or 1.0
+    mask   = np.abs(y - y_med) < 4 * y_std
+    Xc, yc = X[mask], y[mask]
+    if len(Xc) < 4:
+        Xc, yc = X, y   # don't filter if too aggressive
 
-    # ── Use RobustScaler (median/IQR) — much more stable than StandardScaler
-    # when training set has outliers or regime-change jumps ──
+    # RobustScaler: median/IQR — far more stable than StandardScaler with regime-change data
     scaler   = RobustScaler()
-    X_scaled = scaler.fit_transform(X_clean)
+    X_scaled = scaler.fit_transform(Xc)
     x_pred   = scaler.transform(features_to_vector(current_feat).reshape(1, -1))
-
     n = len(X_scaled)
+    cv_k = min(5, n)
 
-    # ── Ridge with higher alpha to suppress extreme extrapolation ──
-    ridge = Ridge(alpha=50.0)   # was 10.0 — higher = more regularised = smaller predictions
-    ridge.fit(X_scaled, y_clean)
-    ridge_pred_raw = float(ridge.predict(x_pred)[0])
-    ridge_pred = _clip_prediction(ridge_pred_raw, current_rate, max_pct=0.12)
+    # Ridge (high alpha = strong regularisation = prevents extrapolation)
+    ridge = Ridge(alpha=100.0)
+    ridge.fit(X_scaled, yc)
+    ridge_raw  = float(ridge.predict(x_pred)[0])
+    ridge_pred = _clip_pred(ridge_raw, current_rate)
     ridge_cv_mae = None
     if n >= 5:
         try:
-            cv = cross_val_score(ridge, X_scaled, y_clean,
-                                 cv=min(5, n), scoring="neg_mean_absolute_error")
-            ridge_cv_mae = float(-cv.mean())
-        except Exception:
-            pass
+            ridge_cv_mae = float(-cross_val_score(
+                ridge, X_scaled, yc, cv=cv_k,
+                scoring="neg_mean_absolute_error").mean())
+        except Exception: pass
 
-    # ── Random Forest ──
-    rf = RandomForestRegressor(
-        n_estimators=200, max_depth=6, min_samples_leaf=3,
-        random_state=42, n_jobs=-1
-    )
-    rf.fit(X_scaled, y_clean)
-    rf_pred_raw = float(rf.predict(x_pred)[0])
-    rf_pred = _clip_prediction(rf_pred_raw, current_rate, max_pct=0.12)
+    # Random Forest
+    rf = RandomForestRegressor(n_estimators=200, max_depth=6,
+                               min_samples_leaf=3, random_state=42, n_jobs=-1)
+    rf.fit(X_scaled, yc)
+    rf_raw  = float(rf.predict(x_pred)[0])
+    rf_pred = _clip_pred(rf_raw, current_rate)
     rf_cv_mae = None
     if n >= 5:
         try:
-            cv = cross_val_score(rf, X_scaled, y_clean,
-                                 cv=min(5, n), scoring="neg_mean_absolute_error")
-            rf_cv_mae = float(-cv.mean())
-        except Exception:
-            pass
-    imp = dict(zip(FEATURE_COLS, rf.feature_importances_))
-    top_features = dict(sorted(imp.items(), key=lambda x: x[1], reverse=True)[:10])
+            rf_cv_mae = float(-cross_val_score(
+                rf, X_scaled, yc, cv=cv_k,
+                scoring="neg_mean_absolute_error").mean())
+        except Exception: pass
+    top_features = dict(sorted(
+        dict(zip(FEATURE_COLS, rf.feature_importances_)).items(),
+        key=lambda x: x[1], reverse=True)[:10])
 
-    # ── Gradient Boosting ──
-    gb = GradientBoostingRegressor(
-        n_estimators=150, learning_rate=0.05, max_depth=4,
-        subsample=0.8, random_state=42
-    )
-    gb.fit(X_scaled, y_clean)
-    gb_pred_raw = float(gb.predict(x_pred)[0])
-    gb_pred = _clip_prediction(gb_pred_raw, current_rate, max_pct=0.12)
+    # Gradient Boosting
+    gb = GradientBoostingRegressor(n_estimators=150, learning_rate=0.05,
+                                   max_depth=4, subsample=0.8, random_state=42)
+    gb.fit(X_scaled, yc)
+    gb_raw  = float(gb.predict(x_pred)[0])
+    gb_pred = _clip_pred(gb_raw, current_rate)
     gb_cv_mae = None
     if n >= 5:
         try:
-            cv = cross_val_score(gb, X_scaled, y_clean,
-                                 cv=min(5, n), scoring="neg_mean_absolute_error")
-            gb_cv_mae = float(-cv.mean())
-        except Exception:
-            pass
+            gb_cv_mae = float(-cross_val_score(
+                gb, X_scaled, yc, cv=cv_k,
+                scoring="neg_mean_absolute_error").mean())
+        except Exception: pass
 
-    # ── Weighted Ensemble ──
-    weights  = np.array([0.25, 0.35, 0.40])
+    # Weighted ensemble
     preds    = np.array([ridge_pred, rf_pred, gb_pred])
-    ensemble_raw = float(np.dot(weights, preds))
-    ensemble = _clip_prediction(ensemble_raw, current_rate, max_pct=0.12)
+    ensemble = _clip_pred(float(np.dot([0.25, 0.35, 0.40], preds)), current_rate)
+    pred_std = float(np.std(preds))
 
-    # ── Confidence score ──
-    pred_std        = float(np.std(preds))
-    pred_mean       = float(np.mean(preds))
-    agreement_score = max(0.0, 1.0 - (pred_std / max(pred_mean * 0.01, 1.0))) * 100
-    # Normalise agreement to 100 when all models agree within 0.5%
-    agreement_score = min(100.0, agreement_score)
+    # Confidence
+    agreement = max(0.0, min(100.0,
+        (1.0 - pred_std / max(float(np.mean(preds)) * 0.01, 1.0)) * 100))
     maes = [m for m in [ridge_cv_mae, rf_cv_mae, gb_cv_mae] if m is not None]
-    mae_conf = max(0.0, min(100.0, 100.0 - (np.mean(maes) / max(current_rate, 1.0) * 100 * 5))) if maes else 50.0
-    size_bonus = min(20.0, n * 0.1)   # was 0.4 — slower to max out
-    raw_conf   = agreement_score * 0.45 + mae_conf * 0.40 + size_bonus * 0.15
-    confidence = int(min(92, max(30, round(raw_conf))))
+    mae_conf   = max(0.0, min(100.0,
+        100.0 - (np.mean(maes) / max(current_rate, 1) * 500))) if maes else 50.0
+    size_bonus = min(15.0, n * 0.05)
+    confidence = int(min(92, max(30,
+        round(agreement * 0.45 + mae_conf * 0.40 + size_bonus * 0.15))))
 
-    # ── Prediction interval ──
-    # Use actual NGN volatility from recent history, scaled to 24h
-    vol = current_feat.get("volatility", current_rate * 0.003) or current_rate * 0.003
-    # Don't let pred_std from model drive interval — use vol-based range
+    vol        = current_feat.get("volatility", current_rate * 0.003) or current_rate * 0.003
     half_range = max(vol * 2.0, current_rate * 0.004, pred_std)
     pred_low   = round(ensemble - half_range, 2)
     pred_high  = round(ensemble + half_range, 2)
@@ -1723,45 +1541,38 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
                  else "BEARISH" if ensemble < current_rate * 0.9995
                  else "NEUTRAL")
 
-    # ── R² in-sample ──
     try:
-        y_in_sample = [float(gb.predict(X_scaled[i:i+1])[0]) for i in range(n)]
-        r2 = float(r2_score(y_clean, y_in_sample)) if n > 1 else None
+        y_hat = [float(gb.predict(X_scaled[i:i+1])[0]) for i in range(n)]
+        r2 = float(r2_score(yc, y_hat)) if n > 1 else None
     except Exception:
         r2 = None
 
-    # ── Log if any model was clipped (useful for diagnostics) ──
-    clipped_models = []
-    if abs(ridge_pred_raw - ridge_pred) > 1.0: clipped_models.append(f"Ridge raw={ridge_pred_raw:,.0f}")
-    if abs(rf_pred_raw - rf_pred) > 1.0:       clipped_models.append(f"RF raw={rf_pred_raw:,.0f}")
-    if abs(gb_pred_raw - gb_pred) > 1.0:       clipped_models.append(f"GB raw={gb_pred_raw:,.0f}")
+    clipped = []
+    if abs(ridge_raw - ridge_pred) > 1: clipped.append(f"Ridge raw=₦{ridge_raw:,.0f}")
+    if abs(rf_raw    - rf_pred)    > 1: clipped.append(f"RF raw=₦{rf_raw:,.0f}")
+    if abs(gb_raw    - gb_pred)    > 1: clipped.append(f"GB raw=₦{gb_raw:,.0f}")
 
-    metrics = {
-        "n_training_points": n,
+    st.session_state.ml_metrics = {
+        "n_training_points": n, "r2_in_sample": r2, "pred_std": pred_std,
         "ridge_cv_mae": ridge_cv_mae, "rf_cv_mae": rf_cv_mae, "gb_cv_mae": gb_cv_mae,
-        "r2_in_sample": r2, "pred_std": pred_std,
-        "agreement_score": agreement_score, "mae_conf": mae_conf, "size_bonus": size_bonus,
+        "agreement_score": agreement, "mae_conf": mae_conf, "size_bonus": size_bonus,
         "rf_feature_importance": top_features,
-        "clipped_models": clipped_models,
-        "outliers_removed": int(np.sum(~mask)),
+        "clipped_models": clipped, "outliers_removed": int(np.sum(~mask)),
     }
-    st.session_state.ml_metrics = metrics
 
     return {
-        "cold_start": False,
-        "n_training_points": n,
+        "cold_start": False, "n_training_points": n,
         "ridge_pred": round(ridge_pred, 2), "rf_pred": round(rf_pred, 2),
         "gb_pred": round(gb_pred, 2), "ensemble": round(ensemble, 2),
         "pred_low": pred_low, "pred_high": pred_high,
         "confidence": confidence, "direction": direction,
-        "model_agreement": round(agreement_score, 1),
+        "model_agreement": round(agreement, 1),
         "ridge_cv_mae": ridge_cv_mae, "rf_cv_mae": rf_cv_mae, "gb_cv_mae": gb_cv_mae,
         "r2_in_sample": r2, "rf_feature_importance": top_features,
-        "clipped_models": clipped_models,
-        "note": (
-            f"Trained on {n} observations ({int(np.sum(~mask))} outliers removed). "
-            + (f"Clipped: {', '.join(clipped_models)}." if clipped_models else "No clipping needed.")
-        ),
+        "clipped_models": clipped,
+        "note": (f"Trained on {n} CBN-rate observations "
+                 f"({int(np.sum(~mask))} outliers removed). "
+                 + (f"Clipped: {', '.join(clipped)}." if clipped else "No clipping.")),
     }
 
 
@@ -2000,23 +1811,24 @@ Return ONLY valid JSON (no markdown, no backticks):
 
 def run_full_analysis() -> dict:
     raw, feat = collect_features()
-    p2p_mid = raw.get("p2p_mid") or raw.get("p2p_buy") or 1620.0
-    raw["p2p_mid"] = p2p_mid
+    cbn_rate = raw.get("cbn_rate", 1620.0)
+    p2p_mid  = raw.get("p2p_mid")   # supplementary signal only
 
     st.session_state.rate_history.append({
-        "timestamp": raw.get("timestamp"),
-        "p2p_mid":   p2p_mid,
-        "p2p_buy":   raw.get("p2p_buy"),
-        "p2p_sell":  raw.get("p2p_sell"),
-        "official":  raw.get("official"),
-        "features":  feat,
+        "timestamp":   raw.get("timestamp"),
+        "cbn_rate":    cbn_rate,     # PRIMARY — used as ML target
+        "p2p_mid":     p2p_mid,      # secondary signal
+        "rate_source": raw.get("rate_source",""),
+        "rate_status": raw.get("rate_status",""),
+        "features":    feat,
     })
     _save_history()
 
-    ml = train_and_predict(feat, p2p_mid)
-    forecasts = build_multi_timeframe_forecast(p2p_mid, ml, feat, raw)
-    narratives = build_forecast_narratives(p2p_mid, forecasts, ml, feat, raw)
+    ml = train_and_predict(feat, cbn_rate)
+    forecasts = build_multi_timeframe_forecast(cbn_rate, ml, feat, raw)
+    narratives = build_forecast_narratives(cbn_rate, forecasts, ml, feat, raw)
 
+    _save_history()
     return {
         "success": True, "raw": raw, "features": feat,
         "ml": ml, "forecasts": forecasts, "narratives": narratives,
@@ -2036,7 +1848,7 @@ def chat_response(msg: str, result: dict) -> str:
     narratives = result.get("narratives", {})
 
     ctx = f"""USDT/NGN ORACLE — FULL CONTEXT:
-Current P2P Rate: ₦{raw.get("p2p_mid", 0):,.2f}
+CBN Official Rate: ₦{raw.get("cbn_rate", 0):,.2f}
 ML Ensemble: ₦{ml.get("ensemble", 0):,.2f} | Direction: {ml.get("direction","N/A")} | Confidence: {ml.get("confidence",0)}%
 Training Points: {ml.get("n_training_points",0)} | Cold Start: {ml.get("cold_start",True)}
 
@@ -2254,12 +2066,10 @@ if auto_ref and st.session_state.last_time and GEMINI_KEY:
 if not st.session_state.result:
     pts    = len(st.session_state.rate_history)
     needed = max(0, 5 - pts)
-    seed_count_ui = sum(1 for h in st.session_state.rate_history if h.get("seeded"))
-    live_count_ui  = sum(1 for h in st.session_state.rate_history if not h.get("seeded"))
     persisted = (
-        f'<div class="alert-box alert-bull" style="max-width:540px;margin:0 auto 12px;">'
-        f'📅 <strong>{seed_count_ui}</strong> historical daily pts + <strong>{live_count_ui}</strong> live pts loaded. '
-        f'{"✅ ML engine ready with full 2-year context!" if pts >= 30 else f"Run analysis to start collecting live data."}'
+        f'<div class="alert-box alert-bull" style="max-width:440px;margin:0 auto 12px;">'
+        f'📂 Loaded <strong>{pts}</strong> data points from previous sessions. '
+        f'{"✅ ML engine is ready!" if pts >= 5 else f"Need {needed} more run(s) for full ML."}'
         f'</div>'
     ) if pts > 0 else ""
 
@@ -2303,19 +2113,16 @@ else:
     narratives = r.get("narratives", {})
     metrics    = st.session_state.ml_metrics
 
-    p2p_mid  = raw.get("p2p_mid", 0)
-    official = raw.get("official", 0) or 0
-    ensemble = ml.get("ensemble", 0)
-    direction= ml.get("direction", "NEUTRAL")
-    conf     = ml.get("confidence", 0)
-    pred_low = ml.get("pred_low", 0)
-    pred_high= ml.get("pred_high", 0)
-    n_pts    = ml.get("n_training_points", 0)
-    cold     = ml.get("cold_start", True)
-    prem     = feat.get("premium_pct", 0) or 0
-    p2p_buy  = raw.get("p2p_buy", 0) or 0
-    p2p_sell = raw.get("p2p_sell", 0) or 0
-    spread   = (p2p_buy - p2p_sell) if p2p_buy and p2p_sell else 0
+    cbn_rate  = raw.get("cbn_rate", 0) or 0   # PRIMARY — CBN official USD/NGN
+    p2p_mid   = raw.get("p2p_mid")             # secondary parallel-market signal
+    ensemble  = ml.get("ensemble", 0)
+    direction = ml.get("direction", "NEUTRAL")
+    conf      = ml.get("confidence", 0)
+    pred_low  = ml.get("pred_low", 0)
+    pred_high = ml.get("pred_high", 0)
+    n_pts     = ml.get("n_training_points", 0)
+    cold      = ml.get("cold_start", True)
+    prem      = feat.get("p2p_premium_pct", 0) or 0  # P2P premium as % above CBN
 
     _sig  = st.session_state.global_signals or {}
     _anal = _sig.get("analysis", {})
@@ -2345,8 +2152,8 @@ else:
         return f'<span class="ticker-item">{label} <span class="val">{v_str}</span>{ch_str}</span><span class="ticker-sep">·</span>'
 
     ticker_items = "".join([
-        ticker_item("USDT/NGN P2P", p2p_mid, None, "₦"),
-        ticker_item("Official", official, None, "₦"),
+        ticker_item("CBN Official", cbn_rate, None, "₦"),
+        ticker_item("P2P (parallel)", p2p_mid, None, "₦") if p2p_mid else "",
         ticker_item("BTC", btc_u, btc_c, "$"),
         ticker_item("ETH", eth_u, eth_c, "$"),
         ticker_item("EUR/USD", eur, None),
@@ -2373,11 +2180,11 @@ else:
         </div>""", unsafe_allow_html=True)
 
     with c1:
-        metric_card(c1, "green", "P2P Live Rate", f"₦{p2p_mid:,.0f}",
-                    f"Buy ₦{p2p_buy:,.0f} · Sell ₦{p2p_sell:,.0f}", "var(--green)")
+        metric_card(c1, "green", "CBN Official Rate", f"₦{cbn_rate:,.0f}",
+                    f"{raw.get('rate_source','')[:30]}", "var(--green)")
     with c2:
         metric_card(c2, "amber", "B.M. Premium",
-                    f"{prem:+.2f}%", f"vs CBN ₦{official:,.0f}", prem_col)
+                    f"{prem:+.2f}%", f"P2P vs CBN premium", prem_col)
     with c3:
         metric_card(c3, "green" if direction=="BULLISH" else "red" if direction=="BEARISH" else "amber",
                     "ML Prediction 24H", f"{da} ₦{ensemble:,.0f}",
@@ -2395,7 +2202,7 @@ else:
     with c7:
         f7d_val = forecasts.get("7d", {}).get("central", 0)
         f7d_pct = forecasts.get("7d", {}).get("pct_change", 0)
-        c7_color = "var(--green)" if f7d_val > p2p_mid else "var(--red)" if f7d_val < p2p_mid else "var(--amber)"
+        c7_color = "var(--green)" if f7d_val > cbn_rate else "var(--red)" if f7d_val < cbn_rate else "var(--amber)"
         metric_card(c7, "cyan", "7-Day Forecast",
                     f"₦{f7d_val:,.0f}", f"{f7d_pct:+.1f}% from now", c7_color)
 
@@ -2404,7 +2211,7 @@ else:
                     unsafe_allow_html=True)
 
     # ── TRIGGERED ALERTS ──
-    triggered_alerts = check_and_trigger_alerts(p2p_mid, ml, narratives)
+    triggered_alerts = check_and_trigger_alerts(cbn_rate, ml, narratives)
     for _, msg in triggered_alerts:
         st.markdown(f'<div class="alert-box alert-warn">{msg}</div>', unsafe_allow_html=True)
 
@@ -2416,7 +2223,7 @@ else:
     st.markdown(
         f'<p style="font-size:10px;font-family:var(--font-mono);color:{src_col};margin-bottom:0;">'
         f'<span class="live-dot" style="background:{src_col};"></span>'
-        f'Source: {src} &nbsp;·&nbsp; Buy ₦{p2p_buy:,.0f} &nbsp;|&nbsp; Sell ₦{p2p_sell:,.0f}'
+        f'Source: {raw.get("rate_source","")} &nbsp;·&nbsp; Status: {raw.get("rate_status","")} &nbsp;|&nbsp; P2P: {("₦{:,.0f}".format(p2p_mid)) if p2p_mid else "N/A"}'
         f' &nbsp;·&nbsp; <span style="color:var(--muted);">Updated {ts}</span></p>',
         unsafe_allow_html=True)
 
@@ -2469,10 +2276,10 @@ else:
                 ("badge-gb",    "Gradient Boosting",    ml.get("gb_pred", 0),    "Sequential error-correction — best for time-series."),
                 ("badge-ens",   "Weighted Ensemble",    ml.get("ensemble", 0),   "Ridge×0.25 + RF×0.35 + GB×0.40 — final prediction."),
             ]:
-                diff  = pred - p2p_mid
+                diff  = pred - cbn_rate
                 color = "var(--green)" if diff >= 0 else "var(--red)"
                 arr   = "▲" if diff >= 0 else "▼"
-                pct   = diff / max(p2p_mid, 1) * 100
+                pct   = diff / max(cbn_rate, 1) * 100
                 st.markdown(f"""
                 <div style="padding:12px 0;border-bottom:1px solid var(--border);">
                   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;">
@@ -2524,8 +2331,8 @@ else:
             <table class="spread-table">
             <tr><th>Metric</th><th>Value</th></tr>""", unsafe_allow_html=True)
             for lbl, val, clr in [
-                ("P2P Live Rate",   f"₦{p2p_mid:,.2f}",              "var(--green)"),
-                ("Official (CBN)",  f"₦{official:,.2f}",             "var(--blue)"),
+                ("CBN Official",    f"₦{cbn_rate:,.2f}",             "var(--green)"),
+                ("P2P (parallel)",  f"₦{p2p_mid:,.2f}" if p2p_mid else "N/A", "var(--blue)"),
                 ("B.M. Premium",    f"{prem:+.2f}%",                  "var(--amber)"),
                 ("P2P Spread",      f"₦{spread:.0f}",                 "var(--text2)"),
                 ("Ridge Target",    f"₦{ml.get('ridge_pred',0):,.0f}","var(--blue)"),
@@ -2646,7 +2453,7 @@ else:
         st.markdown(f"""<div class="card card-purple" style="margin-bottom:20px;">
         <div class="sec-header">📈 MULTI-TIMEFRAME FORECAST ENGINE</div>
         <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;font-size:12px;color:var(--text2);">
-          <div>📌 <strong style="color:var(--text);">Current Rate:</strong> <span style="font-family:var(--font-mono);color:var(--green);">₦{p2p_mid:,.0f}</span></div>
+          <div>📌 <strong style="color:var(--text);">CBN Official Rate:</strong> <span style="font-family:var(--font-mono);color:var(--green);">₦{cbn_rate:,.0f}</span></div>
           <div>🤖 <strong style="color:var(--text);">ML Training Points:</strong> <span style="font-family:var(--font-mono);color:var(--amber);">{n_pts}</span></div>
           <div>📰 <strong style="color:var(--text);">Headlines Analysed:</strong> <span style="font-family:var(--font-mono);color:var(--blue);">{n_headlines}</span></div>
         </div>
@@ -2964,10 +2771,10 @@ else:
         with cc1:
             usdt_in = st.number_input("USDT Amount", min_value=0.0, value=100.0, step=10.0)
             rates_for_conv = {
-                "P2P Sell (you receive)": p2p_sell or p2p_mid,
-                "P2P Mid": p2p_mid,
-                "P2P Buy (you pay)": p2p_buy or p2p_mid,
-                "Official (CBN)": official or p2p_mid,
+                "CBN Official": cbn_rate,
+                "P2P Mid (parallel)": p2p_mid or cbn_rate,
+                "P2P Buy est.": round((p2p_mid or cbn_rate) * 1.002, 2),
+                "P2P Sell est.": round((p2p_mid or cbn_rate) * 0.998, 2),
                 "ML Prediction (24H)": ensemble,
                 "7D Forecast": forecasts.get("7d",{}).get("central", p2p_mid),
                 "30D Forecast": forecasts.get("30d",{}).get("central", p2p_mid),
@@ -3005,16 +2812,15 @@ else:
                         unsafe_allow_html=True)
             df = pd.DataFrame([{
                 "Time":     d.get("timestamp","")[:16].replace("T"," "),
+                "CBN Rate": d.get("cbn_rate"),
                 "P2P Mid":  d.get("p2p_mid"),
-                "P2P Buy":  d.get("p2p_buy"),
-                "P2P Sell": d.get("p2p_sell"),
-                "Official": d.get("official"),
+                "Source":   d.get("rate_source",""),
             } for d in hist_data[-50:]])
             df = df.dropna(subset=["P2P Mid"])
 
             import json as _json
             # Chart data
-            chart_vals = [d.get("p2p_mid") for d in hist_data[-50:] if d.get("p2p_mid")]
+            chart_vals = [d.get("cbn_rate") or d.get("p2p_mid") for d in hist_data[-50:] if d.get("cbn_rate") or d.get("p2p_mid")]
             if len(chart_vals) >= 2:
                 chart_min = min(chart_vals) * 0.998
                 chart_max = max(chart_vals) * 1.002
@@ -3136,7 +2942,7 @@ else:
                     rk = RESEND_KEY
                     if rk:
                         test_html = build_email_html("Test — Oracle email is connected!",
-                                                     p2p_mid, direction, conf, pred_low, pred_high,
+                                                     cbn_rate, direction, conf, pred_low, pred_high,
                                                      narratives.get("trade_recommendation","See Oracle for full analysis."))
                         ok = send_email_alert(user_email, "✅ USDT/NGN Oracle — Test Alert", test_html, rk)
                         if ok: st.success("✅ Test email sent!")
@@ -3157,7 +2963,7 @@ else:
             </div>""", unsafe_allow_html=True)
 
             a_level = st.number_input("Alert price (₦)", min_value=100.0, max_value=9999.0,
-                                       value=float(round(p2p_mid * 1.01)), step=10.0, key="alert_price_input")
+                                       value=float(round(cbn_rate * 1.01)), step=10.0, key="alert_price_input")
             a_type  = st.selectbox("Alert when rate goes:", ["above", "below"], key="alert_type_select")
             if st.button("+ Add Alert", use_container_width=True, key="add_alert_btn"):
                 st.session_state.alerts.append({"level": a_level, "type": a_type})
@@ -3167,7 +2973,7 @@ else:
             st.markdown(f"""<div style="background:var(--bg2);border:1px solid var(--border);
             border-radius:var(--r-sm);padding:12px 14px;margin-top:8px;text-align:center;">
             <div style="font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-family:var(--font-mono);">Current P2P Rate</div>
-            <div style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:var(--green);margin-top:4px;">₦{p2p_mid:,.2f}</div>
+            <div style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:var(--green);margin-top:4px;">₦{cbn_rate:,.2f}</div>
             <div style="font-size:10px;color:var(--muted2);">{raw.get("rate_source","—")}</div>
             </div>""", unsafe_allow_html=True)
 
@@ -3185,7 +2991,7 @@ else:
                     st.markdown(f'<span style="font-size:13px;">{em} {arrow} ₦{a["level"]:,} ({a["type"]})</span> {status_badge}',
                                 unsafe_allow_html=True)
                 with acol2:
-                    dist = a["level"] - p2p_mid
+                    dist = a["level"] - cbn_rate
                     dc2 = "var(--green)" if ((a["type"]=="above" and dist>0) or (a["type"]=="below" and dist<0)) else "var(--red)"
                     st.markdown(f'<span style="font-family:var(--font-mono);font-size:11px;color:{dc2};">{dist:+,.0f} from now</span>',
                                 unsafe_allow_html=True)
@@ -3237,7 +3043,7 @@ else:
                     ("Gradient Boosting",  "badge-gb",    metrics.get("gb_cv_mae")),
                 ]:
                     val_s = f"₦{mae_val:.2f}" if mae_val else "N/A"
-                    pct_s = f"({mae_val/max(p2p_mid,1)*100:.3f}% of rate)" if mae_val else ""
+                    pct_s = f"({mae_val/max(cbn_rate,1)*100:.3f}% of rate)" if mae_val else ""
                     st.markdown(f"""<div style="padding:10px 0;border-bottom:1px solid var(--border);
                     display:flex;align-items:center;justify-content:space-between;">
                     <span class="model-badge {m_badge}">{m_lbl}</span>
@@ -3265,38 +3071,6 @@ else:
                         <div class="prog-track"><div class="prog-fill" style="width:{pct}%;background:var(--blue);"></div></div>
                         </div>""", unsafe_allow_html=True)
                     st.markdown("</div>", unsafe_allow_html=True)
-
-            # Clipping / outlier warning
-            clipped = ml.get("clipped_models", [])
-            outliers_removed = metrics.get("outliers_removed", 0)
-            if clipped:
-                st.markdown(
-                    f'<div class="alert-box alert-warn" style="font-size:11px;margin-top:8px;">'
-                    f'✂️ <strong>Model clipping applied</strong> — Ridge regression produced extreme values '
-                    f'that were clipped to ±12% of current rate.<br>'
-                    f'Raw values: {" | ".join(clipped)}<br>'
-                    f'<em>This is normal with fewer than ~50 training points. Clipping ensures safe predictions.</em>'
-                    f'</div>', unsafe_allow_html=True)
-            else:
-                st.markdown(
-                    '<div style="font-size:11px;color:var(--green);margin-top:8px;font-family:var(--font-mono);">'
-                    '✅ No prediction clipping needed — all models within safe range</div>',
-                    unsafe_allow_html=True)
-            if outliers_removed > 0:
-                st.markdown(
-                    f'<div style="font-size:11px;color:var(--amber);font-family:var(--font-mono);">'
-                    f'🧹 {outliers_removed} training outlier row(s) removed (>4σ from median)</div>',
-                    unsafe_allow_html=True)
-
-            # Historical seed status
-            seed_count = sum(1 for h in st.session_state.rate_history if h.get("seeded"))
-            live_count  = sum(1 for h in st.session_state.rate_history if not h.get("seeded"))
-            st.markdown(
-                f'<div style="font-size:11px;color:var(--text2);font-family:var(--font-mono);margin-top:6px;">'
-                f'📅 Training data: <span style="color:var(--cyan);">{seed_count}</span> historical daily pts + '
-                f'<span style="color:var(--green);">{live_count}</span> live session pts = '
-                f'<span style="color:var(--amber);">{seed_count + live_count}</span> total</div>',
-                unsafe_allow_html=True)
 
             # Methodology explainer
             st.markdown(f"""<div class="card" style="margin-top:14px;">

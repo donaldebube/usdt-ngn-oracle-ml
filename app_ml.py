@@ -1456,6 +1456,24 @@ def build_training_data() -> tuple:
     X_rows, y_vals, times = [], [], []
     feat_source_counts = {"live": 0, "synth": 0, "skipped": 0}
 
+    # ── DIAGNOSTIC: sample first 3 and last 3 entries to verify structure ──
+    _diag = {
+        "hist_len": len(hist),
+        "first3": [{
+            "ts":       h.get("timestamp","")[:10],
+            "cbn_rate": h.get("cbn_rate"),
+            "seeded":   h.get("seeded", False),
+            "has_feat": bool(h.get("features")),
+        } for h in hist[:3]],
+        "last3": [{
+            "ts":       h.get("timestamp","")[:10],
+            "cbn_rate": h.get("cbn_rate"),
+            "seeded":   h.get("seeded", False),
+            "has_feat": bool(h.get("features")),
+        } for h in hist[-3:]],
+    }
+    st.session_state["_build_training_diag"] = _diag
+
     for i in range(len(hist) - 1):
         next_rate = hist[i + 1].get("cbn_rate") or hist[i + 1].get("p2p_mid")
         if not next_rate or float(next_rate) <= 100:
@@ -3510,6 +3528,19 @@ else:
         </div>''', unsafe_allow_html=True)
 
         sig_diag = st.session_state.global_signals or {}
+
+        # ── TRAINING DATA DIAGNOSTIC ──
+        _td = st.session_state.get("_build_training_diag", {})
+        if _td:
+            st.markdown(f"""<div class="card" style="margin-bottom:14px;border:1px solid var(--amber);">
+            <div class="sec-header" style="color:var(--amber);">🔍 BUILD_TRAINING_DATA PROBE (run analysis to update)</div>
+            <div style="font-family:var(--font-mono);font-size:11px;line-height:1.8;">
+            hist_len = <strong style="color:var(--text);">{_td.get('hist_len',0)}</strong><br>
+            <strong>First 3 entries:</strong><br>
+            {"".join(f"  [{e['ts']}] cbn_rate={e['cbn_rate']} seeded={e['seeded']} has_feat={e['has_feat']}<br>" for e in _td.get('first3',[]))}
+            <strong>Last 3 entries:</strong><br>
+            {"".join(f"  [{e['ts']}] cbn_rate={e['cbn_rate']} seeded={e['seeded']} has_feat={e['has_feat']}<br>" for e in _td.get('last3',[]))}
+            </div></div>""", unsafe_allow_html=True)
 
         # ── DATA MANAGEMENT ──
         st.markdown('<div class="card" style="margin-bottom:18px;">'

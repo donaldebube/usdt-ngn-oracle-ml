@@ -2241,7 +2241,7 @@ else:
                 ("CBN Official",    f"₦{cbn_rate:,.2f}",             "var(--green)"),
                 ("P2P (parallel)",  f"₦{p2p_mid:,.2f}" if p2p_mid else "N/A", "var(--blue)"),
                 ("B.M. Premium",    f"{prem:+.2f}%",                  "var(--amber)"),
-                ("P2P Spread",      f"₦{spread:.0f}",                 "var(--text2)"),
+                ("P2P vs CBN (₦)",  f"₦{(p2p_mid - cbn_rate):+.0f}" if p2p_mid else "N/A", "var(--text2)"),
                 ("Ridge Target",    f"₦{ml.get('ridge_pred',0):,.0f}","var(--blue)"),
                 ("RF Target",       f"₦{ml.get('rf_pred',0):,.0f}",   "var(--green)"),
                 ("GB Target",       f"₦{ml.get('gb_pred',0):,.0f}",   "var(--purple)"),
@@ -2920,6 +2920,81 @@ else:
     with tab8:
         st.markdown('<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--purple);margin-bottom:16px;">🔬 ML MODEL DIAGNOSTICS</div>',
                     unsafe_allow_html=True)
+
+        # ── TRAINING DATA BREAKDOWN (answers "what is the model trained on?") ──
+        hist_all   = st.session_state.rate_history
+        seed_pts   = [h for h in hist_all if h.get("seeded")]
+        live_pts   = [h for h in hist_all if not h.get("seeded")]
+        total_pts  = len(hist_all)
+        seed_count = len(seed_pts)
+        live_count = len(live_pts)
+
+        seed_start = seed_pts[0].get("timestamp","")[:10]  if seed_pts else "—"
+        seed_end   = seed_pts[-1].get("timestamp","")[:10] if seed_pts else "—"
+        live_start = live_pts[0].get("timestamp","")[:16].replace("T"," ")  if live_pts else "—"
+
+        seed_rates = [h["cbn_rate"] for h in seed_pts if h.get("cbn_rate")]
+        live_rates = [h["cbn_rate"] for h in live_pts if h.get("cbn_rate")]
+
+        seed_min = f"₦{min(seed_rates):,.0f}" if seed_rates else "—"
+        seed_max = f"₦{max(seed_rates):,.0f}" if seed_rates else "—"
+        live_min = f"₦{min(live_rates):,.0f}" if live_rates else "—"
+        live_max = f"₦{max(live_rates):,.0f}" if live_rates else "—"
+
+        st.markdown(f"""<div class="card card-blue" style="margin-bottom:18px;">
+        <div class="sec-header">📚 TRAINING DATA COMPOSITION — What the ML model is trained on</div>
+        <div style="font-size:12px;color:var(--text2);line-height:1.7;margin-bottom:14px;">
+        The ML models train on <strong style="color:var(--text);">{total_pts} data points</strong> of real USD/NGN CBN official rates.
+        Each data point stores the CBN rate at time T plus 27 features (crypto, FX, news scores, momentum).
+        The model learns: <em>"given these features, what was the CBN rate at time T+1?"</em>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;">
+          <div style="background:var(--bg3);border:1px solid var(--border2);border-radius:10px;padding:14px;">
+            <div style="font-size:9px;color:var(--cyan);font-family:var(--font-mono);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">📅 Historical Seed</div>
+            <div style="font-family:var(--font-mono);font-size:22px;font-weight:700;color:var(--cyan);">{seed_count:,}</div>
+            <div style="font-size:10px;color:var(--text2);margin-top:5px;">Daily CBN rates</div>
+            <div style="font-size:10px;color:var(--muted);margin-top:4px;">{seed_start} → {seed_end}</div>
+            <div style="font-size:10px;color:var(--muted);margin-top:2px;">Range: {seed_min} – {seed_max}</div>
+            <div style="font-size:10px;color:var(--text2);margin-top:6px;border-top:1px solid var(--border);padding-top:6px;">
+              Fetched from ExchangeRate-API or Frankfurter on first startup.
+              Covers CBN unification (Jun 2023), devaluations, full 2-year history.
+              <strong style="color:var(--cyan);">These are real CBN official rates.</strong>
+            </div>
+          </div>
+          <div style="background:var(--bg3);border:1px solid var(--border2);border-radius:10px;padding:14px;">
+            <div style="font-size:9px;color:var(--green);font-family:var(--font-mono);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">⚡ Live Session Points</div>
+            <div style="font-family:var(--font-mono);font-size:22px;font-weight:700;color:var(--green);">{live_count:,}</div>
+            <div style="font-size:10px;color:var(--text2);margin-top:5px;">Each "Run Analysis" adds 1</div>
+            <div style="font-size:10px;color:var(--muted);margin-top:4px;">First: {live_start}</div>
+            <div style="font-size:10px;color:var(--muted);margin-top:2px;">Range: {live_min} – {live_max}</div>
+            <div style="font-size:10px;color:var(--text2);margin-top:6px;border-top:1px solid var(--border);padding-top:6px;">
+              Live points include full Gemini scores and real-time features.
+              These are the highest-quality training points because they have
+              <strong style="color:var(--green);">all 27 features populated.</strong>
+            </div>
+          </div>
+          <div style="background:var(--bg3);border:1px solid var(--border2);border-radius:10px;padding:14px;">
+            <div style="font-size:9px;color:var(--amber);font-family:var(--font-mono);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">🎯 What the Model Predicts</div>
+            <div style="font-family:var(--font-mono);font-size:13px;font-weight:700;color:var(--amber);margin-bottom:6px;">CBN Official Rate</div>
+            <div style="font-size:10px;color:var(--text2);line-height:1.6;">
+              Target variable: <code style="color:var(--cyan);">cbn_rate</code> at T+1<br>
+              NOT P2P rate. NOT USDT price.<br><br>
+              Features: p2p_premium_pct, BTC/ETH 24h change, EUR/USD, DXY, USD/ZAR, USD/GHS,
+              temporal (hour/day/month sin-cos), 10 Gemini macro scores,
+              momentum, volatility, trend slope.<br><br>
+              <strong style="color:var(--amber);">Seed data uses synthetic features</strong>
+              (zero news scores, avg temporal). Live data uses real scores.
+            </div>
+          </div>
+        </div>
+        <div style="margin-top:12px;padding:10px 14px;background:rgba(0,229,160,0.06);border:1px solid rgba(0,229,160,0.2);border-radius:8px;font-size:11px;color:var(--text2);">
+          ✅ <strong style="color:var(--green);">Yes — the model IS trained on historical CBN USD/NGN data.</strong>
+          {seed_count} real daily rates from the past 2 years are seeded on startup.
+          The ML models see the full rate history including the Jun 2023 unification shock (₦462→₦770),
+          the Feb 2024 devaluation (₦900→₦1,480), and recent stabilisation.
+          Live runs add richer feature-complete points on top.
+        </div>
+        </div>""", unsafe_allow_html=True)
 
         if cold:
             st.markdown(f'<div class="alert-box alert-warn">⚠️ <strong>Cold Start Mode</strong> — {ml.get("note","")} Run analysis 5+ times to unlock full ML metrics.</div>',

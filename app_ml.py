@@ -750,28 +750,47 @@ def gemini(prompt: str, system: str = "", temperature: float = 0.2, max_tokens: 
     return f"❌ All Gemini models failed: {' | '.join(errors)}"
 
 def _parse_json(raw: str) -> dict:
-    """Robust JSON parser — handles markdown fences, trailing commas, placeholders."""
+    """
+    Robust JSON parser — handles markdown fences, trailing commas, placeholders,
+    and TRUNCATED responses (Gemini hits max_tokens mid-key).
+    """
     if not raw or raw.startswith("❌"):
         return {}
     clean = raw.strip()
+
+    # Strip markdown fences
     if "```" in clean:
         for p in clean.split("```"):
             p = p.strip()
             if p.startswith("json"): p = p[4:].strip()
             if p.startswith("{"): clean = p; break
+
+    # Find opening brace
     if not clean.startswith("{"):
         idx = clean.find("{")
         if idx >= 0: clean = clean[idx:]
         else: return {}
+
+    # Find last closing brace — if absent, JSON was truncated by token limit
     last = clean.rfind("}")
-    if last >= 0: clean = clean[:last+1]
+    if last >= 0:
+        clean = clean[:last+1]
+    else:
+        # Truncated: strip the dangling incomplete token, then close the object
+        clean = re.sub(r',\s*"[^"]*$', '', clean)                      # dangling "key
+        clean = re.sub(r',\s*"[^"]+"\s*:\s*[^,}\]]*$', '', clean)  # dangling "k":v
+        clean = clean.rstrip().rstrip(',') + '}'
+
+    # Standard parse
     try:
         return json.loads(clean)
     except Exception:
         pass
+
+    # Repair: trailing commas + placeholder values
     try:
-        fixed = re.sub(r",\s*([}\]])", r"", clean)
-        fixed = re.sub(r":\s*<[^>]+>", ": null", fixed)
+        fixed = re.sub(r",\s*([}\]])", r"\1", clean)
+        fixed = re.sub(r':\s*<[^>]+>', ': null', fixed)
         return json.loads(fixed)
     except Exception:
         return {}
@@ -1003,55 +1022,61 @@ def fetch_global_signals() -> dict:
     sig["rss_errors"]   = rss_errors
     sig["rss_first_response"] = rss_first_response_snippet
 
-    # GNews API — primary paid supplement (always active when key is present)
+    # GNews API — supplement (free tier: 100 req/day — use sparingly)
+    # We cache results in session_state with a 6-hour TTL to avoid burning the daily quota
     gnews_count = 0
     if GNEWS_KEY:
-        gnews_queries = [
-            ("Nigeria naira exchange rate",     "🇳🇬 GNews"),
-            ("CBN central bank forex Nigeria",  "🏦 GNews"),
-            ("Nigeria economy inflation",        "📉 GNews"),
-            ("crude oil price OPEC Brent",      "🛢️ GNews"),
-            ("Bitcoin crypto market",           "₿ GNews"),
-            ("US Federal Reserve dollar",       "🇺🇸 GNews"),
-            ("Nigeria USDT P2P crypto",         "💱 GNews"),
-            ("emerging markets currency",       "📊 GNews"),
-        ]
-        for q, tag in gnews_queries:
-            try:
-                r = requests.get(
-                    "https://gnews.io/api/v4/search",
-                    params={
-                        "q":        q,
-                        "lang":     "en",
-                        "max":      3,
-                        "sortby":   "publishedAt",
-                        "apikey":   GNEWS_KEY,
-                    },
-                    timeout=8,
-                    headers={"User-Agent": "Mozilla/5.0"}
-                )
-                if r.status_code == 200:
-                    for a in r.json().get("articles", [])[:2]:
-                        t = (a.get("title") or "").strip()
-                        d = (a.get("description") or "")[:150].strip()
-                        if t and len(t) > 8:
-                            headlines_raw.append({
-                                "tag":  tag,
-                                "title": t,
-                                "desc":  d,
-                                "full":  f"{tag} | {t}",
-                            })
-                            gnews_count += 1
-                elif r.status_code == 429:
-                    sig["errors"].append("GNews: rate limit hit (100 req/day free tier)")
-                    break
-                elif r.status_code == 403:
-                    sig["errors"].append(f"GNews: invalid API key or quota exceeded")
-                    break
-            except Exception as e:
-                sig["errors"].append(f"GNews '{q[:20]}': {type(e).__name__}: {str(e)[:120]}")
-        if gnews_count > 0:
-            sig["sources"].append(f"GNews API ({gnews_count} headlines)")
+        _gnews_last = st.session_state.get("_gnews_last_fetch")
+        _gnews_age  = (datetime.datetime.now() - _gnews_last).total_seconds() if _gnews_last else 99999
+        _gnews_cache = st.session_state.get("_gnews_headlines_cache", [])
+
+        if _gnews_cache and _gnews_age < 21600:   # 6 hours — free tier has 100 req/day
+            # Use cached GNews headlines, no API call
+            headlines_raw.extend(_gnews_cache)
+            gnews_count = len(_gnews_cache)
+            sig["sources"].append(f"GNews API cached ({gnews_count} headlines, {int(_gnews_age/3600)}h old)")
+        else:
+            # Only 4 queries — most important for NGN FX; saves ~50% of daily quota vs 8
+            gnews_queries = [
+                ("Nigeria naira CBN exchange rate",   "🇳🇬 GNews"),
+                ("Nigeria economy inflation oil",      "📉 GNews"),
+                ("crude oil price OPEC Brent",         "🛢️ GNews"),
+                ("US Federal Reserve dollar emerging", "🇺🇸 GNews"),
+            ]
+            fresh_headlines = []
+            for q, tag in gnews_queries:
+                try:
+                    r = requests.get(
+                        "https://gnews.io/api/v4/search",
+                        params={"q": q, "lang": "en", "max": 3,
+                                "sortby": "publishedAt", "apikey": GNEWS_KEY},
+                        timeout=8,
+                        headers={"User-Agent": "Mozilla/5.0"}
+                    )
+                    if r.status_code == 200:
+                        for a in r.json().get("articles", [])[:2]:
+                            t = (a.get("title") or "").strip()
+                            d = (a.get("description") or "")[:150].strip()
+                            if t and len(t) > 8:
+                                entry = {"tag": tag, "title": t, "desc": d,
+                                         "full": f"{tag} | {t}"}
+                                fresh_headlines.append(entry)
+                                gnews_count += 1
+                    elif r.status_code == 429:
+                        sig["errors"].append("GNews: rate limit hit — results cached for 6h next time")
+                        break
+                    elif r.status_code == 403:
+                        sig["errors"].append("GNews: invalid API key or quota exceeded")
+                        break
+                except Exception as e:
+                    sig["errors"].append(f"GNews '{q[:20]}': {type(e).__name__}: {str(e)[:80]}")
+
+            if fresh_headlines:
+                headlines_raw.extend(fresh_headlines)
+                st.session_state["_gnews_headlines_cache"] = fresh_headlines
+                st.session_state["_gnews_last_fetch"] = datetime.datetime.now()
+                sig["sources"].append(f"GNews API ({gnews_count} headlines, freshly fetched)")
+
     sig["gnews_count"] = gnews_count
 
     # NewsAPI — optional secondary supplement
@@ -1095,13 +1120,14 @@ def fetch_global_signals() -> dict:
         enhanced_prompt = f"""FX analyst. Score USDT/NGN. {now_str}. +ve=USDT up/NGN weak, -ve=NGN strong.
 DATA: BTC {btc_str} | USD/NGN {sig.get('usd_ngn_official','N/A')} | F&G {fng_str} | EUR/USD {sig.get('eurusd','N/A')}
 HEADLINES: {headlines_block[:1200] if has_headlines else "use your knowledge"}
-Return ONLY compact JSON, start with {{:
-{{"overall_score":<-100 to 100>,"nigeria_macro":<int>,"cbn_policy":<int>,"oil_impact":<int>,"usd_fed_impact":<int>,"crypto_sentiment":<int>,"geopolitical_risk":<int>,"political_risk_nigeria":<int>,"remittance_flow":<int>,"global_em_risk":<int>,"market_mood":"RISK_ON|RISK_OFF|NEUTRAL","top_mover_today":"<factor>","breaking_event":null,"oil_analysis":"<1 sentence>","geopolitical_analysis":"<1 sentence>","cbn_analysis":"<1 sentence>","crypto_analysis":"<1 sentence>","em_analysis":"<1 sentence>","top_bullish_catalyst":"<reason>","top_bearish_catalyst":"<reason>","overall_qualitative_direction":"BULLISH_USDT|BEARISH_USDT|NEUTRAL","qualitative_confidence":<0-100>,"30min_bias":"BUY|SELL|HOLD","key_watch_items":["<i1>","<i2>","<i3>"],"medium_term_outlook":"<2 sentences>","long_term_outlook":"<1 sentence>","structural_ngn_risks":["<r1>","<r2>"]}}"""
+Return ONLY valid JSON (no markdown, no extra text). Start response with {{:
+{{"overall_score":0,"nigeria_macro":0,"cbn_policy":0,"oil_impact":0,"usd_fed_impact":0,"crypto_sentiment":0,"geopolitical_risk":0,"political_risk_nigeria":0,"remittance_flow":0,"global_em_risk":0,"market_mood":"NEUTRAL","top_mover_today":"","breaking_event":null,"oil_analysis":"","geopolitical_analysis":"","cbn_analysis":"","crypto_analysis":"","em_analysis":"","top_bullish_catalyst":"","top_bearish_catalyst":"","overall_qualitative_direction":"NEUTRAL","qualitative_confidence":50,"30min_bias":"HOLD","key_watch_items":["","",""],"medium_term_outlook":"","long_term_outlook":"","structural_ngn_risks":["",""]}}
+Fill in real values. Scores: +100=NGN very weak, -100=NGN very strong."""
 
         try:
             raw_q = gemini(enhanced_prompt,
                 "Quantitative FX strategist. Return ONLY valid JSON. Start with {.",
-                temperature=0.3, max_tokens=900)
+                temperature=0.3, max_tokens=1400)
             sig["gemini_raw_response"] = raw_q[:600]
             parsed = _parse_json(raw_q)
             if parsed and any(parsed.get(k,0) != 0 for k in ["overall_score","nigeria_macro","oil_impact"]):

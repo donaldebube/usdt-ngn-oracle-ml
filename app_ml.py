@@ -2685,33 +2685,59 @@ else:
             st.markdown('<div class="card" style="text-align:center;padding:40px;"><p style="color:var(--text2);">Run the analysis at least twice to see history.</p></div>',
                         unsafe_allow_html=True)
         else:
-            st.markdown(f'<div style="font-size:10px;font-family:var(--font-mono);color:var(--text2);margin-bottom:16px;"><span class="live-dot"></span>{len(hist_data)} data points in history</div>',
-                        unsafe_allow_html=True)
-            df = pd.DataFrame([{
-                "Time":     d.get("timestamp","")[:16].replace("T"," "),
-                "CBN Rate": d.get("cbn_rate"),
-                "P2P Mid":  d.get("p2p_mid"),
-                "Source":   d.get("rate_source",""),
-            } for d in hist_data[-50:]])
-            df = df.dropna(subset=["P2P Mid"])
+            seed_ct = sum(1 for h in hist_data if h.get("seeded"))
+            live_ct = sum(1 for h in hist_data if not h.get("seeded"))
+            st.markdown(
+                f'<div style="font-size:10px;font-family:var(--font-mono);color:var(--text2);margin-bottom:16px;">'
+                f'<span class="live-dot"></span>{len(hist_data)} total points &nbsp;·&nbsp; '
+                f'<span style="color:var(--cyan);">{seed_ct} seeded (historical)</span> &nbsp;·&nbsp; '
+                f'<span style="color:var(--green);">{live_ct} live (session)</span></div>',
+                unsafe_allow_html=True)
 
-            import json as _json
-            # Chart data
-            chart_vals = [d.get("cbn_rate") or d.get("p2p_mid") for d in hist_data[-50:] if d.get("cbn_rate") or d.get("p2p_mid")]
+            # ── FIX 1: use cbn_rate as primary, fallback to p2p_mid for legacy rows ──
+            # ── FIX 2: show ALL 50 most recent points (not filtered by P2P Mid) ──
+            # ── FIX 3: show correct source label ──
+            def _rate(d):
+                return d.get("cbn_rate") or d.get("p2p_mid")
+
+            def _source_label(d):
+                src = d.get("rate_source") or d.get("rate_status") or ""
+                if d.get("seeded"):
+                    return "📅 Historical seed"
+                if src:
+                    return src[:40]
+                return "—"
+
+            # Chart: use all available points (up to 200 for seeded, all live)
+            # Show recent 90 days of seed + all live for a useful chart
+            chart_pts = [h for h in hist_data if _rate(h)]
+            # For chart: last 90 of seed, all live
+            seed_chart = [h for h in chart_pts if h.get("seeded")][-90:]
+            live_chart = [h for h in chart_pts if not h.get("seeded")]
+            chart_pts_display = seed_chart + live_chart
+            chart_vals = [_rate(h) for h in chart_pts_display]
+
             if len(chart_vals) >= 2:
                 chart_min = min(chart_vals) * 0.998
                 chart_max = max(chart_vals) * 1.002
                 n_pts_chart = len(chart_vals)
                 path_d = " ".join(
-                    f"{'M' if i==0 else 'L'} {i*(560/(n_pts_chart-1)):.1f} {((chart_max - v)/(chart_max-chart_min)*80):.1f}"
+                    f"{'M' if i==0 else 'L'} {i*(560/max(n_pts_chart-1,1)):.1f} {((chart_max - v)/max(chart_max-chart_min,1)*80):.1f}"
                     for i, v in enumerate(chart_vals)
                 )
-                latest_v = chart_vals[-1]
-                trend_up = chart_vals[-1] >= chart_vals[0]
-                line_color = "#00e5a0" if trend_up else "#ff4466"
+                latest_v  = chart_vals[-1]
+                trend_up  = chart_vals[-1] >= chart_vals[0]
+                line_color= "#00e5a0" if trend_up else "#ff4466"
+
+                # Mark where live data starts
+                live_start_idx = len(seed_chart)
+                live_marker = ""
+                if live_ct > 0 and live_start_idx < n_pts_chart:
+                    lx = live_start_idx * (560 / max(n_pts_chart-1, 1))
+                    live_marker = f'<line x1="{lx:.1f}" y1="0" x2="{lx:.1f}" y2="80" stroke="#00e5a0" stroke-width="1" stroke-dasharray="3,3" opacity="0.5"/><text x="{lx+3:.1f}" y="12" fill="#00e5a0" font-size="8" font-family="JetBrains Mono">LIVE</text>'
 
                 st.markdown(f"""<div class="card" style="margin-bottom:16px;">
-                <div class="sec-header">📉 P2P RATE CHART (last {n_pts_chart} observations)</div>
+                <div class="sec-header">📉 CBN USD/NGN RATE CHART — {n_pts_chart} points (last 90 seed days + {live_ct} live)</div>
                 <svg width="100%" viewBox="0 0 600 100" style="overflow:visible;">
                   <defs>
                     <linearGradient id="cg" x1="0" y1="0" x2="0" y2="1">
@@ -2721,33 +2747,41 @@ else:
                   </defs>
                   <path d="{path_d} L {560:.1f} 80 L 0 80 Z" fill="url(#cg)"/>
                   <path d="{path_d}" fill="none" stroke="{line_color}" stroke-width="2"/>
+                  {live_marker}
                   <text x="0" y="90" fill="var(--muted)" font-size="9" font-family="JetBrains Mono">₦{chart_min:,.0f}</text>
                   <text x="0" y="8" fill="var(--muted)" font-size="9" font-family="JetBrains Mono">₦{chart_max:,.0f}</text>
                   <text x="480" y="90" fill="{line_color}" font-size="9" font-family="JetBrains Mono">₦{latest_v:,.0f}</text>
                 </svg></div>""", unsafe_allow_html=True)
 
-            # Table
-            st.markdown('<div class="card"><div class="sec-header">DATA TABLE</div>', unsafe_allow_html=True)
-            st.dataframe(
-                df.tail(30).sort_values("Time", ascending=False),
-                use_container_width=True,
-                hide_index=True
-            )
+            # ── TABLE: last 50 points, sorted newest first, no P2P filter ──
+            table_pts = sorted(hist_data, key=lambda h: h.get("timestamp",""), reverse=True)[:50]
+            df = pd.DataFrame([{
+                "Time":         h.get("timestamp","")[:16].replace("T"," "),
+                "CBN Rate (₦)": f"₦{_rate(h):,.2f}" if _rate(h) else "—",
+                "P2P Mid (₦)":  f"₦{h['p2p_mid']:,.2f}" if h.get("p2p_mid") else "—",
+                "B.M. Premium": f"{h.get('features',{}).get('p2p_premium_pct',0):+.2f}%" if h.get("features") else "—",
+                "Type":         "📅 Seed" if h.get("seeded") else "⚡ Live",
+                "Source":       _source_label(h),
+            } for h in table_pts])
+
+            st.markdown('<div class="card"><div class="sec-header">DATA TABLE — 50 most recent points</div>', unsafe_allow_html=True)
+            st.dataframe(df, use_container_width=True, hide_index=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
-            # Stats
+            # Stats — use all chart vals
             if len(chart_vals) >= 3:
                 s1, s2, s3, s4 = st.columns(4)
                 for col, lbl, val, clr in [
-                    (s1, "Avg Rate", f"₦{np.mean(chart_vals):,.0f}", "var(--text)"),
-                    (s2, "Volatility (σ)", f"₦{np.std(chart_vals):,.0f}", "var(--amber)"),
-                    (s3, "Session High", f"₦{max(chart_vals):,.0f}", "var(--green)"),
-                    (s4, "Session Low", f"₦{min(chart_vals):,.0f}", "var(--red)"),
+                    (s1, "Avg CBN Rate",   f"₦{np.mean(chart_vals):,.0f}", "var(--text)"),
+                    (s2, "Volatility (σ)", f"₦{np.std(chart_vals):,.0f}",  "var(--amber)"),
+                    (s3, "Period High",    f"₦{max(chart_vals):,.0f}",      "var(--green)"),
+                    (s4, "Period Low",     f"₦{min(chart_vals):,.0f}",      "var(--red)"),
                 ]:
                     col.markdown(f"""<div class="card" style="margin-top:12px;padding:14px 16px;">
                     <div class="card-label">{lbl}</div>
                     <div style="font-family:var(--font-mono);font-size:18px;font-weight:700;color:{clr};">{val}</div>
                     </div>""", unsafe_allow_html=True)
+
 
 
     # ══════ TAB 6: CHAT ══════
@@ -3048,6 +3082,64 @@ else:
         </div>''', unsafe_allow_html=True)
 
         sig_diag = st.session_state.global_signals or {}
+
+        # ── DATA MANAGEMENT ──
+        st.markdown('<div class="card" style="margin-bottom:18px;">'
+                    '<div class="sec-header">🗄️ DATA MANAGEMENT</div>', unsafe_allow_html=True)
+
+        hist_all   = st.session_state.rate_history
+        seed_pts   = [h for h in hist_all if h.get("seeded")]
+        live_pts   = [h for h in hist_all if not h.get("seeded")]
+        bad_pts    = [h for h in hist_all if not h.get("cbn_rate") and not h.get("seeded")]
+
+        dm1, dm2, dm3, dm4 = st.columns(4)
+        dm1.markdown(f'<div style="font-size:11px;color:var(--text2);">Total points</div>'
+                     f'<div style="font-family:var(--font-mono);font-size:18px;color:var(--text);">{len(hist_all)}</div>',
+                     unsafe_allow_html=True)
+        dm2.markdown(f'<div style="font-size:11px;color:var(--text2);">Seeded (historical)</div>'
+                     f'<div style="font-family:var(--font-mono);font-size:18px;color:var(--cyan);">{len(seed_pts)}</div>',
+                     unsafe_allow_html=True)
+        dm3.markdown(f'<div style="font-size:11px;color:var(--text2);">Live (session)</div>'
+                     f'<div style="font-family:var(--font-mono);font-size:18px;color:var(--green);">{len(live_pts)}</div>',
+                     unsafe_allow_html=True)
+        dm4.markdown(f'<div style="font-size:11px;color:var(--text2);">Legacy P2P-only rows<br><span style="font-size:9px;">(no CBN rate, old data)</span></div>'
+                     f'<div style="font-family:var(--font-mono);font-size:18px;color:{"var(--red)" if bad_pts else "var(--green)"};">{len(bad_pts)}</div>',
+                     unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        bc1, bc2, bc3 = st.columns(3)
+
+        with bc1:
+            if bad_pts:
+                if st.button(f"🧹 Remove {len(bad_pts)} legacy P2P rows", key="clear_bad",
+                             help="Removes old rows that have no CBN rate (migrated from old P2P version)"):
+                    st.session_state.rate_history = [h for h in hist_all if h.get("cbn_rate") or h.get("seeded")]
+                    save_history()
+                    st.success(f"✅ Removed {len(bad_pts)} legacy rows.")
+                    st.rerun()
+            else:
+                st.markdown('<div style="font-size:11px;color:var(--green);padding-top:8px;">✅ No legacy rows — data is clean</div>',
+                            unsafe_allow_html=True)
+
+        with bc2:
+            if st.button("🗑️ Clear live session points only", key="clear_live",
+                         help="Keeps all 1200+ historical seeded points, removes only your live session runs"):
+                st.session_state.rate_history = seed_pts
+                save_history()
+                st.success(f"✅ Cleared {len(live_pts)} live points. Seed data intact.")
+                st.rerun()
+
+        with bc3:
+            if st.button("⚠️ Full reset (re-seed from scratch)", key="full_reset",
+                         help="Clears ALL history and re-seeds from hardcoded data. Use if data is badly corrupted."):
+                st.session_state.rate_history = []
+                st.session_state.history_seeded = False
+                save_history()
+                _seed_historical_history()
+                st.success("✅ Full reset done. History re-seeded from hardcoded CBN rates.")
+                st.rerun()
+
+        st.markdown('</div>', unsafe_allow_html=True)
 
         # ── FORCE REFRESH BUTTON ──
         col_btn1, col_btn2 = st.columns([1,3])

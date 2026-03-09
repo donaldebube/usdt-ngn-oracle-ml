@@ -465,6 +465,7 @@ h1,h2,h3,h4 { font-family: var(--font-mono) !important; }
 # ══════════════════════════════════════════════════════
 HISTORY_FILE   = "oracle_rate_history.json"
 HIST_SEED_FILE = "oracle_hist_seed.json"   # 2-yr daily CBN rates, fetched once
+ALERTS_FILE    = "oracle_alerts.json"       # persisted price alerts survive refresh
 MAX_HISTORY    = 2000
 HIST_SEED_DAYS = 730
 
@@ -494,6 +495,31 @@ def _load_history() -> list:
         return valid[-MAX_HISTORY:]
     except Exception:
         return []
+
+def _save_alerts():
+    """Persist alerts + email to disk so they survive Streamlit refreshes."""
+    try:
+        data = {
+            "alerts": st.session_state.get("alerts", []),
+            "user_email": st.session_state.get("user_email", ""),
+        }
+        with open(ALERTS_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+def _load_alerts() -> dict:
+    """Load persisted alerts from disk. Returns dict with 'alerts' and 'user_email'."""
+    if not os.path.exists(ALERTS_FILE):
+        return {"alerts": [], "user_email": ""}
+    try:
+        with open(ALERTS_FILE, "r") as f:
+            data = json.load(f)
+        alerts = [a for a in data.get("alerts", []) if isinstance(a, dict)
+                  and "level" in a and "type" in a]
+        return {"alerts": alerts, "user_email": data.get("user_email", "")}
+    except Exception:
+        return {"alerts": [], "user_email": ""}
 
 def init():
     defaults = {
@@ -525,6 +551,12 @@ def init():
             new_pts = [d for d in saved if d.get("timestamp") not in existing_times]
             st.session_state.rate_history = new_pts + st.session_state.rate_history
         st.session_state.history_loaded = True
+        # Also restore alerts and email from disk (only on first load, not on rerun)
+        saved_alerts = _load_alerts()
+        if saved_alerts["alerts"] and not st.session_state.alerts:
+            st.session_state.alerts = saved_alerts["alerts"]
+        if saved_alerts["user_email"] and not st.session_state.user_email:
+            st.session_state.user_email = saved_alerts["user_email"]
 
 init()
 
@@ -3338,7 +3370,11 @@ else:
 
             user_email = st.text_input("Your Email Address", value=st.session_state.user_email,
                                        placeholder="yourname@gmail.com", key="alert_email_input")
-            st.session_state.user_email = user_email
+            if user_email != st.session_state.user_email:
+                st.session_state.user_email = user_email
+                _save_alerts()
+            else:
+                st.session_state.user_email = user_email
 
             if user_email:
                 if st.button("🧪 Send Test Email", use_container_width=True):
@@ -3370,12 +3406,13 @@ else:
             a_type  = st.selectbox("Alert when rate goes:", ["above", "below"], key="alert_type_select")
             if st.button("+ Add Alert", use_container_width=True, key="add_alert_btn"):
                 st.session_state.alerts.append({"level": a_level, "type": a_type})
+                _save_alerts()
                 em = "📧" if user_email else "🔕"
                 st.success(f"Alert set: {em} notify when rate goes {a_type} ₦{a_level:,.0f}")
 
             st.markdown(f"""<div style="background:var(--bg2);border:1px solid var(--border);
             border-radius:var(--r-sm);padding:12px 14px;margin-top:8px;text-align:center;">
-            <div style="font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-family:var(--font-mono);">Current CBN Rate</div>
+            <div style="font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-family:var(--font-mono);">Current P2P Rate</div>
             <div style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:var(--green);margin-top:4px;">₦{cbn_rate:,.2f}</div>
             <div style="font-size:10px;color:var(--muted2);">{raw.get("rate_source","—")}</div>
             </div>""", unsafe_allow_html=True)
@@ -3403,6 +3440,7 @@ else:
                         st.session_state.alerts.pop(i)
                         if i in st.session_state.alert_triggered:
                             st.session_state.alert_triggered.remove(i)
+                        _save_alerts()
                         st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
         else:

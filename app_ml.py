@@ -2466,7 +2466,7 @@ else:
     # so KPI card and breakdown card are ALWAYS in sync.
     f24h_conf = conf
     f24h_da   = "▲" if f24h_val > cbn_rate else "▼" if f24h_val < cbn_rate else "◆"
-    f24h_dc   = "var(--green)" if f24h_val > cbn_rate else "var(--red)" if f24h_val < cbn_rate else "var(--amber)"
+    f24h_dc   = "var(--red)" if f24h_val > cbn_rate else "var(--green)" if f24h_val < cbn_rate else "var(--amber)"
     f24h_cc   = cc   # same colour as the ring
 
     # ── LIVE TICKER ──
@@ -2515,7 +2515,7 @@ else:
                     f"{raw.get('rate_source','')[:30]}", "var(--green)")
     with c2:
         # Shows the final 3-layer blended 24H forecast — same value as the Forecasts tab card
-        metric_card(c2, "green" if f24h_val > cbn_rate else "red" if f24h_val < cbn_rate else "amber",
+        metric_card(c2, "red" if f24h_val > cbn_rate else "green" if f24h_val < cbn_rate else "amber",
                     "24H Forecast (CBN)", f"{f24h_da} ₦{f24h_val:,.0f}",
                     f"₦{f24h_low:,.0f} – ₦{f24h_high:,.0f}  ({f24h_pct:+.1f}%)", f24h_dc)
     with c3:
@@ -2535,7 +2535,7 @@ else:
         f7d_val = forecasts.get("7d", {}).get("central", 0)
         f7d_pct = forecasts.get("7d", {}).get("pct_change", 0)
         f7d_da  = "▲" if f7d_val > cbn_rate else "▼" if f7d_val < cbn_rate else "◆"
-        c5_color = "var(--green)" if f7d_val > cbn_rate else "var(--red)" if f7d_val < cbn_rate else "var(--amber)"
+        c5_color = "var(--red)" if f7d_val > cbn_rate else "var(--green)" if f7d_val < cbn_rate else "var(--amber)"
         metric_card(c5, "cyan", "7-Day Forecast",
                     f"{f7d_da} ₦{f7d_val:,.0f}", f"{f7d_pct:+.1f}% from now", c5_color)
 
@@ -2594,7 +2594,7 @@ else:
             best_time = narratives.get("best_convert_time", "")
             if trade_rec:
                 dir_badge = f'<span class="badge badge-{"bull" if direction=="BULLISH" else "bear" if direction=="BEARISH" else "neu"}">{da} {direction}</span>'
-                st.markdown(f"""<div class="card card-{'green' if direction=='BULLISH' else 'red' if direction=='BEARISH' else 'amber'}" style="margin-bottom:16px;">
+                st.markdown(f"""<div class="card card-{'red' if direction=='BULLISH' else 'green' if direction=='BEARISH' else 'amber'}" style="margin-bottom:16px;">
                 <div class="sec-header">⚡ TRADE RECOMMENDATION &nbsp;&nbsp; {dir_badge}</div>
                 <p style="font-size:13px;color:var(--text);line-height:1.7;margin:0 0 10px;">{trade_rec}</p>
                 {f'<div style="font-size:11px;color:var(--text2);border-top:1px solid var(--border);padding-top:8px;margin-top:8px;">⏰ Best time: {best_time}</div>' if best_time else ""}
@@ -2610,7 +2610,7 @@ else:
                 ("badge-ens",   "Weighted Ensemble",    ml.get("ensemble", 0),   "Ridge×0.25 + RF×0.35 + GB×0.40 — final prediction."),
             ]:
                 diff  = pred - cbn_rate
-                color = "var(--green)" if diff >= 0 else "var(--red)"
+                color = "var(--red)" if diff >= 0 else "var(--green)"
                 arr   = "▲" if diff >= 0 else "▼"
                 pct   = diff / max(cbn_rate, 1) * 100
                 st.markdown(f"""

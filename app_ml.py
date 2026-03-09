@@ -3375,7 +3375,7 @@ else:
 
             st.markdown(f"""<div style="background:var(--bg2);border:1px solid var(--border);
             border-radius:var(--r-sm);padding:12px 14px;margin-top:8px;text-align:center;">
-            <div style="font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-family:var(--font-mono);">Current P2P Rate</div>
+            <div style="font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-family:var(--font-mono);">Current CBN Rate</div>
             <div style="font-family:var(--font-mono);font-size:20px;font-weight:700;color:var(--green);margin-top:4px;">₦{cbn_rate:,.2f}</div>
             <div style="font-size:10px;color:var(--muted2);">{raw.get("rate_source","—")}</div>
             </div>""", unsafe_allow_html=True)

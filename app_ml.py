@@ -1627,12 +1627,11 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
     # Penalise confidence when models disagree significantly (spread > 1%)
     spread_penalty = max(0.0, (spread_pct - 1.0) * 10)   # -10 pts per % above 1%
 
-    # Confidence — floor at 65% with ≥200 real CBN points (1,163 seed pts justify this)
+    # Confidence — no artificial floor; let the model speak honestly.
+    # Components: agreement (model spread), MAE accuracy, data size bonus, spread penalty.
     size_bonus = min(15.0, n * 0.01)
-    raw_conf   = int(min(92, max(30,
+    confidence = int(min(92, max(10,
         round(agreement * 0.40 + mae_conf * 0.45 + size_bonus * 0.15 - spread_penalty))))
-    data_floor = 65 if n >= 200 else (55 if n >= 50 else 30)
-    confidence = max(raw_conf, data_floor)
 
     vol        = current_feat.get("volatility", current_rate * 0.003) or current_rate * 0.003
     half_range = max(vol * 2.0, current_rate * 0.004, pred_std)
@@ -1680,6 +1679,9 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
         "pred_std": pred_std,
         "ridge_cv_mae": ridge_cv_mae, "rf_cv_mae": rf_cv_mae, "gb_cv_mae": gb_cv_mae,
         "agreement_score": agreement, "spread_pct": spread_pct, "mae_conf": mae_conf, "size_bonus": size_bonus,
+        "conf_raw": confidence, "conf_agreement_contrib": round(agreement * 0.40, 1),
+        "conf_mae_contrib": round(mae_conf * 0.45, 1), "conf_size_contrib": round(size_bonus * 0.15, 1),
+        "conf_spread_penalty": round(spread_penalty, 1),
         "rf_feature_importance": top_features,
         "clipped_models": clipped, "outliers_removed": int(np.sum(~mask)),
         "feat_src_live":  feat_sources.get("live", 0),
@@ -2400,7 +2402,7 @@ else:
 
     dc    = "var(--green)" if direction=="BULLISH" else "var(--red)" if direction=="BEARISH" else "var(--amber)"
     da    = "▲" if direction=="BULLISH" else "▼" if direction=="BEARISH" else "◆"
-    cc    = "var(--green)" if conf>=65 else "var(--amber)" if conf>=45 else "var(--red)"
+    cc    = "var(--green)" if conf>=55 else "var(--amber)" if conf>=35 else "var(--red)"
     bias_col = "var(--green)" if _bias=="BUY" else "var(--red)" if _bias=="SELL" else "var(--amber)"
 
     # 24H blended forecast values (used in KPI card — matches the Forecasts tab exactly)
@@ -2586,24 +2588,42 @@ else:
                 st.markdown("</div>", unsafe_allow_html=True)
 
         with right:
-            # Confidence Ring visualization
-            conf_color = "var(--green)" if conf>=65 else "var(--amber)" if conf>=45 else "var(--red)"
-            st.markdown(f"""<div class="card" style="margin-bottom:16px;text-align:center;padding:24px 22px;">
-            <div class="sec-header" style="text-align:left;">📊 CONFIDENCE BREAKDOWN</div>
-            <div style="display:flex;align-items:center;justify-content:center;gap:24px;margin:16px 0;">
-              <div style="border: 6px solid {conf_color};border-radius:50%;width:100px;height:100px;
-              display:flex;flex-direction:column;align-items:center;justify-content:center;">
-                <div style="font-family:var(--font-mono);font-size:24px;font-weight:700;color:{conf_color};">{conf}%</div>
-                <div style="font-size:9px;color:var(--muted);letter-spacing:1px;">CONF</div>
-              </div>
-              <div style="text-align:left;">
-                <div style="font-size:11px;color:var(--text2);margin-bottom:4px;">Model Agreement</div>
-                <div style="font-family:var(--font-mono);font-size:18px;color:var(--blue);">{ml.get("model_agreement",0):.1f}%</div>
-                <div style="font-size:9px;color:var(--muted);margin-top:2px;">Spread: {metrics.get("spread_pct",0):.2f}% of rate</div>
-                <div style="font-size:10px;color:var(--muted);margin-top:8px;">Training Points</div>
-                <div style="font-family:var(--font-mono);font-size:18px;color:var(--purple);">{n_pts}</div>
-              </div>
-            </div></div>""", unsafe_allow_html=True)
+            # Confidence Ring — raw model output, no artificial floor
+            conf_color = "var(--green)" if conf>=55 else "var(--amber)" if conf>=35 else "var(--red)"
+            _c_agr = metrics.get("conf_agreement_contrib", 0)
+            _c_mae = metrics.get("conf_mae_contrib", 0)
+            _c_siz = metrics.get("conf_size_contrib", 0)
+            _c_pen = metrics.get("conf_spread_penalty", 0)
+            _mag   = ml.get("model_agreement", 0)
+            _spr   = metrics.get("spread_pct", 0)
+            _conf_html = (
+                "<div class=\"card\" style=\"margin-bottom:16px;padding:20px 22px;\">"
+                "<div class=\"sec-header\" style=\"text-align:left;\">&#x1F4CA; CONFIDENCE BREAKDOWN &mdash; raw, no floor</div>"
+                "<div style=\"display:flex;align-items:center;gap:20px;margin:14px 0 16px;\">"
+                f"<div style=\"border:6px solid {conf_color};border-radius:50%;min-width:90px;height:90px;"
+                "display:flex;flex-direction:column;align-items:center;justify-content:center;flex-shrink:0;\">"
+                f"<div style=\"font-family:var(--font-mono);font-size:26px;font-weight:700;color:{conf_color};\">{conf}%</div>"
+                "<div style=\"font-size:8px;color:var(--muted);letter-spacing:1px;\">RAW CONF</div></div>"
+                "<div style=\"flex:1;\">"
+                "<div style=\"font-size:10px;color:var(--text2);\">Model Agreement</div>"
+                f"<div style=\"font-family:var(--font-mono);font-size:15px;color:var(--blue);\">{_mag:.1f}%"
+                f" <span style=\"font-size:9px;color:var(--muted);\">spread: {_spr:.2f}%</span></div>"
+                "<div style=\"font-size:10px;color:var(--muted);margin-top:5px;\">Training Points</div>"
+                f"<div style=\"font-family:var(--font-mono);font-size:15px;color:var(--purple);\">{n_pts}</div>"
+                "</div></div>"
+                "<div style=\"border-top:1px solid var(--border);padding-top:10px;\">"
+                f"<div style=\"font-size:9px;color:var(--muted);margin-bottom:7px;\">How {conf}% was computed</div>"
+                "<table style=\"width:100%;font-size:11px;font-family:var(--font-mono);border-collapse:collapse;\">"
+                f"<tr><td style=\"color:var(--text2);padding:2px 0;\">Agreement &times;0.40</td><td style=\"color:var(--blue);text-align:right;\">+{_c_agr:.1f}</td></tr>"
+                f"<tr><td style=\"color:var(--text2);\">MAE accuracy &times;0.45</td><td style=\"color:var(--green);text-align:right;\">+{_c_mae:.1f}</td></tr>"
+                f"<tr><td style=\"color:var(--text2);\">Data size &times;0.15</td><td style=\"color:var(--purple);text-align:right;\">+{_c_siz:.1f}</td></tr>"
+                f"<tr><td style=\"color:var(--text2);\">Spread penalty</td><td style=\"color:var(--red);text-align:right;\">&minus;{_c_pen:.1f}</td></tr>"
+                "<tr style=\"border-top:1px solid var(--border);\">"
+                "<td style=\"color:var(--text2);padding-top:4px;\">Total (capped 10&ndash;92)</td>"
+                f"<td style=\"color:{conf_color};font-weight:700;text-align:right;padding-top:4px;\">{conf}%</td>"
+                "</tr></table></div></div>"
+            )
+            st.markdown(_conf_html, unsafe_allow_html=True)
 
             # Rate Summary Table
             st.markdown("""<div class="card" style="margin-bottom:16px;">
@@ -2818,6 +2838,7 @@ else:
                 bull_c = f.get("bull_case", 0)
                 bear_c = f.get("bear_case", 0)
                 fcolor = "var(--green)" if "HIGHER" in direction_lbl else "var(--red)" if "LOWER" in direction_lbl else "var(--amber)"
+                fconf_color = "var(--green)" if fconf>=55 else "var(--amber)" if fconf>=35 else "var(--red)"
                 blend  = f.get("blend", {})
                 blend_str = f"ML{blend.get('ml',0)*100:.0f}%+News{blend.get('news',0)*100:.0f}%+Str{blend.get('structural',0)*100:.0f}%"
                 news_adj_val = f.get("news_adj", 0)
@@ -2830,7 +2851,7 @@ else:
                   <div class="tf-change" style="color:{fcolor};">{direction_lbl}</div>
                   <div class="tf-range">Range: ₦{flow:,.0f} – ₦{fhigh:,.0f}</div>
                   <div style="font-family:var(--font-mono);font-size:12px;color:{fcolor};margin-top:4px;">{pct:+.1f}% from now</div>
-                  <div class="tf-conf">Confidence: {fconf}%</div>
+                  <div class="tf-conf" style="color:{fconf_color};">Confidence: {fconf}%</div>
                   <div style="margin-top:6px;font-size:9px;color:var(--muted);font-family:var(--font-mono);">{blend_str}</div>
                   <div style="margin-top:4px;font-size:9px;color:var(--cyan);font-family:var(--font-mono);">news adj: {news_adj_str}</div>
                   <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:10px;color:var(--muted);">
@@ -2862,6 +2883,7 @@ else:
             f_pct = f_data.get("pct_change", 0)
             f_conf= f_data.get("confidence", 0)
             fclr  = "var(--green)" if f_pct > 0.5 else "var(--red)" if f_pct < -0.5 else "var(--amber)"
+            fconf_clr = "var(--green)" if f_conf>=55 else "var(--amber)" if f_conf>=35 else "var(--red)"
             central_val = f_data.get("central", 0)
             fallback_nar = f"Forecast: \u20a6{central_val:,.0f} ({f_pct:+.1f}% from current rate)"
 
@@ -2882,7 +2904,7 @@ else:
                 f'<div style="display:flex;gap:10px;align-items:center;">'
                 f'<span style="font-family:var(--font-mono);font-size:13px;color:{fclr};font-weight:700;">'
                 f'\u20a6{central_val:,.0f} ({f_pct:+.1f}%)</span>'
-                f'<span style="font-family:var(--font-mono);font-size:9px;color:var(--muted);">CONF {f_conf}%</span>'
+                f'<span style="font-family:var(--font-mono);font-size:9px;color:{fconf_clr};">CONF {f_conf}%</span>'
                 f'</div></div>'
                 f'{drivers_row}'
                 f'<p style="font-size:12px;color:var(--text2);line-height:1.65;margin:0;">{nar_text}</p>'

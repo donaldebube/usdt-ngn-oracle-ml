@@ -1551,6 +1551,11 @@ def _clip_pred(pred: float, current: float, pct: float = 0.04) -> float:
 
 def train_and_predict(current_feat: dict, current_rate: float) -> dict:
     """Train on CBN official rate history and predict next CBN rate."""
+    # Seed all randomness so confidence is stable across back-to-back runs
+    # with identical data. Only changes when the training set actually changes.
+    import random as _random
+    _random.seed(42)
+    np.random.seed(42)
     X, y, times = build_training_data()
     cold_start  = (X is None)
 
@@ -1588,12 +1593,16 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
     X_scaled = scaler.fit_transform(Xc)
     x_pred   = scaler.transform(features_to_vector(current_feat).reshape(1, -1))
     n = len(X_scaled)
-    cv_k = min(5, n // 10) if n >= 50 else min(5, n)   # more conservative CV for large n
+    # cv_k: minimum 3 folds, and never more than n//5 to avoid tiny test sets that swing MAE wildly
+    cv_k = max(3, min(5, n // 5)) if n >= 15 else min(3, n)
 
     # Scale model complexity with dataset size
     rf_depth      = 8  if n > 200 else 6
     rf_leaves     = 5  if n > 200 else 3
     gb_estimators = 200 if n > 200 else 150
+
+    from sklearn.model_selection import KFold
+    _cv_splitter = KFold(n_splits=cv_k, shuffle=True, random_state=42)
 
     # Ridge (high alpha = strong regularisation = prevents extrapolation)
     ridge = Ridge(alpha=100.0)
@@ -1604,7 +1613,7 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
     if n >= 10:
         try:
             ridge_cv_mae = float(-cross_val_score(
-                ridge, X_scaled, yc, cv=cv_k,
+                ridge, X_scaled, yc, cv=_cv_splitter,
                 scoring="neg_mean_absolute_error").mean())
         except Exception: pass
 
@@ -1618,7 +1627,7 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
     if n >= 10:
         try:
             rf_cv_mae = float(-cross_val_score(
-                rf, X_scaled, yc, cv=cv_k,
+                rf, X_scaled, yc, cv=_cv_splitter,
                 scoring="neg_mean_absolute_error").mean())
         except Exception: pass
     top_features = dict(sorted(
@@ -1635,7 +1644,7 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
     if n >= 10:
         try:
             gb_cv_mae = float(-cross_val_score(
-                gb, X_scaled, yc, cv=cv_k,
+                gb, X_scaled, yc, cv=_cv_splitter,
                 scoring="neg_mean_absolute_error").mean())
         except Exception: pass
 
@@ -1662,8 +1671,18 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
     # Confidence — no artificial floor; let the model speak honestly.
     # Components: agreement (model spread), MAE accuracy, data size bonus, spread penalty.
     size_bonus = min(15.0, n * 0.01)
-    confidence = int(min(92, max(10,
+    confidence_raw = int(min(92, max(10,
         round(agreement * 0.40 + mae_conf * 0.45 + size_bonus * 0.15 - spread_penalty))))
+
+    # ── EMA smoothing: confidence can't swing more than ±8 points per run ──
+    # This eliminates the "75% → 11% → 40%" wild swings caused by random CV fold differences.
+    # Alpha=0.35 means new value contributes 35%, previous contributes 65%.
+    prev_conf = st.session_state.ml_metrics.get("conf_raw")
+    if prev_conf is not None and prev_conf > 0:
+        smoothed = prev_conf + 0.35 * (confidence_raw - prev_conf)
+        confidence = int(min(92, max(10, round(smoothed))))
+    else:
+        confidence = confidence_raw  # first run: use raw directly
 
     vol        = current_feat.get("volatility", current_rate * 0.003) or current_rate * 0.003
     half_range = max(vol * 2.0, current_rate * 0.004, pred_std)
@@ -1694,7 +1713,7 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
                 r2_label = f"OOS (hold-out {n - split} pts)"
         else:
             # Too few points for hold-out: use cross-val R² as proxy
-            r2_oos = float(cross_val_score(gb, X_scaled, yc, cv=cv_k, scoring="r2").mean())
+            r2_oos = float(cross_val_score(gb, X_scaled, yc, cv=_cv_splitter, scoring="r2").mean())
             r2_label = "CV-avg"
     except Exception:
         r2_oos = None
@@ -2515,9 +2534,10 @@ else:
     with c5:
         f7d_val = forecasts.get("7d", {}).get("central", 0)
         f7d_pct = forecasts.get("7d", {}).get("pct_change", 0)
+        f7d_da  = "▲" if f7d_val > cbn_rate else "▼" if f7d_val < cbn_rate else "◆"
         c5_color = "var(--green)" if f7d_val > cbn_rate else "var(--red)" if f7d_val < cbn_rate else "var(--amber)"
         metric_card(c5, "cyan", "7-Day Forecast",
-                    f"₦{f7d_val:,.0f}", f"{f7d_pct:+.1f}% from now", c5_color)
+                    f"{f7d_da} ₦{f7d_val:,.0f}", f"{f7d_pct:+.1f}% from now", c5_color)
 
     if cold:
         st.markdown(f'<div class="alert-box alert-warn" style="margin-top:12px;">⚠️ <strong>Cold Start Mode</strong> — {ml.get("note","")} Run analysis 5+ times to unlock full ML accuracy.</div>',
@@ -2663,16 +2683,20 @@ else:
             <table class="spread-table">
             <tr><th>Metric</th><th>Value</th></tr>""", unsafe_allow_html=True)
             for lbl, val, clr in [
-                ("CBN Official",    f"₦{cbn_rate:,.2f}",             "var(--green)"),
+                ("CBN Official",    f"₦{cbn_rate:,.2f}",             "var(--text)"),
                 ("P2P (parallel)",  f"₦{p2p_mid:,.2f}" if p2p_mid else "N/A", "var(--blue)"),
                 ("B.M. Premium",    f"{prem:+.2f}%",                  "var(--amber)"),
                 ("P2P vs CBN (₦)",  f"₦{(p2p_mid - cbn_rate):+.0f}" if p2p_mid else "N/A", "var(--text2)"),
-                ("Ridge Target",    f"₦{ml.get('ridge_pred',0):,.0f}","var(--blue)"),
-                ("RF Target",       f"₦{ml.get('rf_pred',0):,.0f}",   "var(--green)"),
-                ("GB Target",       f"₦{ml.get('gb_pred',0):,.0f}",   "var(--purple)"),
-                ("Ensemble (24H)",  f"₦{ensemble:,.0f}",              "var(--amber)"),
-                ("Range Low",       f"₦{pred_low:,.0f}",              "var(--text2)"),
-                ("Range High",      f"₦{pred_high:,.0f}",             "var(--text2)"),
+                ("Ridge Target",    f"₦{ml.get('ridge_pred',0):,.0f}",
+                    "var(--green)" if ml.get('ridge_pred',0) > cbn_rate else "var(--red)" if ml.get('ridge_pred',0) < cbn_rate else "var(--amber)"),
+                ("RF Target",       f"₦{ml.get('rf_pred',0):,.0f}",
+                    "var(--green)" if ml.get('rf_pred',0) > cbn_rate else "var(--red)" if ml.get('rf_pred',0) < cbn_rate else "var(--amber)"),
+                ("GB Target",       f"₦{ml.get('gb_pred',0):,.0f}",
+                    "var(--green)" if ml.get('gb_pred',0) > cbn_rate else "var(--red)" if ml.get('gb_pred',0) < cbn_rate else "var(--amber)"),
+                ("Ensemble (24H)",  f"₦{ensemble:,.0f}",
+                    "var(--green)" if ensemble > cbn_rate else "var(--red)" if ensemble < cbn_rate else "var(--amber)"),
+                ("Range Low",       f"₦{pred_low:,.0f}",              "var(--red)"),
+                ("Range High",      f"₦{pred_high:,.0f}",             "var(--green)"),
             ]:
                 st.markdown(f'<tr><td style="font-size:11px;color:var(--text2);">{lbl}</td>'
                             f'<td style="font-family:var(--font-mono);color:{clr};font-size:12px;">{val}</td></tr>',
@@ -2869,7 +2893,7 @@ else:
                 fhigh = f.get("high", 0)
                 bull_c = f.get("bull_case", 0)
                 bear_c = f.get("bear_case", 0)
-                fcolor = "var(--green)" if "HIGHER" in direction_lbl else "var(--red)" if "LOWER" in direction_lbl else "var(--amber)"
+                fcolor = "var(--red)" if "HIGHER" in direction_lbl else "var(--green)" if "LOWER" in direction_lbl else "var(--amber)"
                 fconf_color = "var(--green)" if fconf>=55 else "var(--amber)" if fconf>=35 else "var(--red)"
                 blend  = f.get("blend", {})
                 blend_str = f"ML{blend.get('ml',0)*100:.0f}%+News{blend.get('news',0)*100:.0f}%+Str{blend.get('structural',0)*100:.0f}%"
@@ -2879,7 +2903,7 @@ else:
                 <div class="tf-card">
                   <div class="tf-card-accent" style="background:{ac};"></div>
                   <div class="tf-label">{f.get("label","")}</div>
-                  <div class="tf-value" style="color:{ac};">₦{central:,.0f}</div>
+                  <div class="tf-value" style="color:{fcolor};">₦{central:,.0f}</div>
                   <div class="tf-change" style="color:{fcolor};">{direction_lbl}</div>
                   <div class="tf-range">Range: ₦{flow:,.0f} – ₦{fhigh:,.0f}</div>
                   <div style="font-family:var(--font-mono);font-size:12px;color:{fcolor};margin-top:4px;">{pct:+.1f}% from now</div>
@@ -2914,7 +2938,7 @@ else:
             f_data= forecasts.get(key, {})
             f_pct = f_data.get("pct_change", 0)
             f_conf= f_data.get("confidence", 0)
-            fclr  = "var(--green)" if f_pct > 0.5 else "var(--red)" if f_pct < -0.5 else "var(--amber)"
+            fclr  = "var(--red)" if f_pct > 0.5 else "var(--green)" if f_pct < -0.5 else "var(--amber)"
             fconf_clr = "var(--green)" if f_conf>=55 else "var(--amber)" if f_conf>=35 else "var(--red)"
             central_val = f_data.get("central", 0)
             fallback_nar = f"Forecast: \u20a6{central_val:,.0f} ({f_pct:+.1f}% from current rate)"

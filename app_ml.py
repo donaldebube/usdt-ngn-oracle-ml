@@ -1511,8 +1511,9 @@ def build_training_data() -> tuple:
         return None, None, None
     return np.array(X_rows), np.array(y_vals), times
 
-def _clip_pred(pred: float, current: float, pct: float = 0.12) -> float:
-    """Clip model prediction to ±pct of current rate. Prevents Ridge explosion."""
+def _clip_pred(pred: float, current: float, pct: float = 0.04) -> float:
+    """Clip model prediction to +-pct of current rate. 4% cap = max ~+-55 NGN on 1387.
+    Old 12% let Ridge=1221 and RF=1521 diverge, killing model agreement."""
     return float(np.clip(pred, current * (1 - pct), current * (1 + pct)))
 
 
@@ -1611,18 +1612,25 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
     ensemble = _clip_pred(float(np.dot([0.25, 0.35, 0.40], preds)), current_rate)
     pred_std = float(np.std(preds))
 
-    # Confidence
-    agreement = max(0.0, min(100.0,
-        (1.0 - pred_std / max(float(np.mean(preds)) * 0.01, 1.0)) * 100))
+    # ── Model Agreement: % of models within ±0.5% of the ensemble ──
+    # Old formula (1 - std/mean*0.01) breaks when std > ~15 (which happens with clip spread).
+    # New formula: fraction of model preds within ±0.5% band of ensemble, scaled 0-100.
+    # Also express as a continuous spread metric: lower spread % = higher agreement.
+    spread_pct = pred_std / max(abs(ensemble), 1.0) * 100   # spread as % of rate
+    # Agreement: 0% spread → 100% agreement; 2% spread → 0% agreement (linear)
+    agreement = max(0.0, min(100.0, (1.0 - spread_pct / 2.0) * 100))
+
     maes = [m for m in [ridge_cv_mae, rf_cv_mae, gb_cv_mae] if m is not None]
     mae_conf   = max(0.0, min(100.0,
-        100.0 - (np.mean(maes) / max(current_rate, 1) * 500))) if maes else 50.0
-    # Confidence — raise floor to 65% once we have sufficient historical CBN data (≥200 pts)
-    # because with 1,163 real seed points the model has genuine predictive power.
-    # Raw formula can underestimate due to MAE scaling; floor reflects actual data richness.
-    size_bonus = min(15.0, n * 0.01)   # smaller bonus now that n is large
+        100.0 - (np.mean(maes) / max(current_rate, 1) * 300))) if maes else 60.0
+
+    # Penalise confidence when models disagree significantly (spread > 1%)
+    spread_penalty = max(0.0, (spread_pct - 1.0) * 10)   # -10 pts per % above 1%
+
+    # Confidence — floor at 65% with ≥200 real CBN points (1,163 seed pts justify this)
+    size_bonus = min(15.0, n * 0.01)
     raw_conf   = int(min(92, max(30,
-        round(agreement * 0.45 + mae_conf * 0.40 + size_bonus * 0.15))))
+        round(agreement * 0.40 + mae_conf * 0.45 + size_bonus * 0.15 - spread_penalty))))
     data_floor = 65 if n >= 200 else (55 if n >= 50 else 30)
     confidence = max(raw_conf, data_floor)
 
@@ -1671,7 +1679,7 @@ def train_and_predict(current_feat: dict, current_rate: float) -> dict:
         "n_training_points": n, "r2_in_sample": r2_oos, "r2_label": r2_label,
         "pred_std": pred_std,
         "ridge_cv_mae": ridge_cv_mae, "rf_cv_mae": rf_cv_mae, "gb_cv_mae": gb_cv_mae,
-        "agreement_score": agreement, "mae_conf": mae_conf, "size_bonus": size_bonus,
+        "agreement_score": agreement, "spread_pct": spread_pct, "mae_conf": mae_conf, "size_bonus": size_bonus,
         "rf_feature_importance": top_features,
         "clipped_models": clipped, "outliers_removed": int(np.sum(~mask)),
         "feat_src_live":  feat_sources.get("live", 0),
@@ -2401,10 +2409,12 @@ else:
     f24h_low  = f24h.get("low", pred_low)
     f24h_high = f24h.get("high", pred_high)
     f24h_pct  = f24h.get("pct_change", 0)
-    f24h_conf = f24h.get("confidence", conf)   # 24H-specific confidence from blended forecast
+    # Use the ML confidence (floor-applied, same as Confidence Breakdown ring)
+    # so KPI card and breakdown card are ALWAYS in sync.
+    f24h_conf = conf
     f24h_da   = "▲" if f24h_val > cbn_rate else "▼" if f24h_val < cbn_rate else "◆"
     f24h_dc   = "var(--green)" if f24h_val > cbn_rate else "var(--red)" if f24h_val < cbn_rate else "var(--amber)"
-    f24h_cc   = "var(--green)" if f24h_conf>=65 else "var(--amber)" if f24h_conf>=45 else "var(--red)"
+    f24h_cc   = cc   # same colour as the ring
 
     # ── LIVE TICKER ──
     btc_u = _sig.get("btc_usd"); btc_c = _sig.get("btc_24h") or 0
@@ -2587,8 +2597,9 @@ else:
                 <div style="font-size:9px;color:var(--muted);letter-spacing:1px;">CONF</div>
               </div>
               <div style="text-align:left;">
-                <div style="font-size:11px;color:var(--text2);margin-bottom:6px;">Model Agreement</div>
+                <div style="font-size:11px;color:var(--text2);margin-bottom:4px;">Model Agreement</div>
                 <div style="font-family:var(--font-mono);font-size:18px;color:var(--blue);">{ml.get("model_agreement",0):.1f}%</div>
+                <div style="font-size:9px;color:var(--muted);margin-top:2px;">Spread: {metrics.get("spread_pct",0):.2f}% of rate</div>
                 <div style="font-size:10px;color:var(--muted);margin-top:8px;">Training Points</div>
                 <div style="font-family:var(--font-mono);font-size:18px;color:var(--purple);">{n_pts}</div>
               </div>
@@ -3489,12 +3500,16 @@ else:
                 r2_color = "var(--text2)"; r2_note = ""
 
             mm1, mm2, mm3, mm4 = st.columns(4)
+            _agreement  = metrics.get("agreement_score", 0)
+            _spread_pct = metrics.get("spread_pct", 0)
+            _agr_color  = "var(--green)" if _agreement >= 70 else "var(--amber)" if _agreement >= 40 else "var(--red)"
             for col, lbl, val, clr, sub in [
-                (mm1, "Training Points",       str(metrics.get("n_training_points",0)), "var(--amber)",
+                (mm1, "Training Points",  str(metrics.get("n_training_points",0)), "var(--amber)",
                  f"{feat_live} live · {feat_synth} synthesised"),
-                (mm2, f"R² ({r2_lbl})",        r2_display, r2_color, r2_note),
-                (mm3, "Model Agreement",       f"{metrics.get('agreement_score',0):.1f}%", "var(--green)", "3-model ensemble spread"),
-                (mm4, "MAE Confidence",        f"{metrics.get('mae_conf',0):.1f}%", "var(--purple)", "cross-val error quality"),
+                (mm2, f"R² ({r2_lbl})",  r2_display, r2_color, r2_note),
+                (mm3, "Model Agreement", f"{_agreement:.1f}%", _agr_color,
+                 f"Spread: {_spread_pct:.2f}% of rate — lower = more agreement"),
+                (mm4, "MAE Confidence",  f"{metrics.get('mae_conf',0):.1f}%", "var(--purple)", "cross-val error quality"),
             ]:
                 col.markdown(f"""<div class="card">
                 <div class="card-label">{lbl}</div>

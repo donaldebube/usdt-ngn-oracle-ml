@@ -2917,6 +2917,104 @@ else:
             unsafe_allow_html=True
         )
 
+        # ── XGBOOST SHORT-HORIZON CARDS (2H / 10H / 24H / 48H / 7D) ──
+        _inf = ml.get("inference_full", {})
+        _inf_horizons = _inf.get("horizons", {}) if _inf.get("available") else {}
+
+        if _inf_horizons:
+            st.markdown(
+                '<div style="font-family:var(--font-mono);font-size:9px;letter-spacing:3px;'
+                'text-transform:uppercase;color:var(--green);margin-bottom:12px;">'
+                '🤖 XGBOOST PRECISION FORECASTS — SHORT HORIZONS</div>',
+                unsafe_allow_html=True
+            )
+            xgb_cols = st.columns(5)
+            xgb_horizon_order = ["2h", "10h", "24h", "48h", "7d"]
+            xgb_colors = {
+                "2h":  "var(--cyan)",
+                "10h": "var(--blue)",
+                "24h": "var(--green)",
+                "48h": "var(--amber)",
+                "7d":  "var(--purple)",
+            }
+            for col, hkey in zip(xgb_cols, xgb_horizon_order):
+                hdata = _inf_horizons.get(hkey, {})
+                if not hdata or "error" in hdata:
+                    col.markdown(
+                        f'<div class="tf-card" style="opacity:0.4;text-align:center;">'
+                        f'<div class="tf-label">{hkey.upper()}</div>'
+                        f'<div style="font-size:10px;color:var(--muted);">unavailable</div>'
+                        f'</div>', unsafe_allow_html=True)
+                    continue
+
+                h_rate   = hdata.get("rate", cbn_rate)
+                h_pct    = hdata.get("pct_change", 0) or 0
+                h_dir    = hdata.get("direction", "STABLE ◆")
+                h_conf   = hdata.get("confidence", 0) or 0
+                h_low    = hdata.get("pred_low", h_rate * 0.995)
+                h_high   = hdata.get("pred_high", h_rate * 1.005)
+                h_label  = hdata.get("label", hkey.upper())
+                h_pup    = hdata.get("prob_up", 33) or 33
+                h_pdown  = hdata.get("prob_down", 33) or 33
+                h_pstab  = hdata.get("prob_stable", 33) or 33
+                h_mae    = hdata.get("val_mae", None)
+                h_dacc   = hdata.get("dir_accuracy", None)
+
+                ac       = xgb_colors.get(hkey, "var(--blue)")
+                val_color = "var(--red)" if h_pct > 0.15 else "var(--green)" if h_pct < -0.15 else "var(--amber)"
+                conf_color = "var(--green)" if h_conf >= 65 else "var(--amber)" if h_conf >= 45 else "var(--red)"
+                mae_str  = f"MAE ₦{h_mae:.0f}" if h_mae else ""
+                dacc_str = f"Dir {h_dacc:.0f}%" if h_dacc else ""
+
+                col.markdown(f"""
+                <div class="tf-card" style="border-top:3px solid {ac};position:relative;">
+                  <div style="font-family:var(--font-mono);font-size:9px;letter-spacing:2px;
+                  text-transform:uppercase;color:{ac};margin-bottom:6px;">{h_label}</div>
+                  <div style="font-family:var(--font-mono);font-size:22px;font-weight:700;
+                  color:{val_color};margin-bottom:2px;">₦{h_rate:,.0f}</div>
+                  <div style="font-family:var(--font-mono);font-size:11px;color:{val_color};
+                  margin-bottom:6px;">{h_pct:+.2f}%</div>
+                  <div style="font-size:12px;font-weight:600;color:{val_color};
+                  margin-bottom:8px;">{h_dir}</div>
+                  <div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);
+                  margin-bottom:4px;">Range: ₦{h_low:,.0f}–₦{h_high:,.0f}</div>
+                  <div style="font-size:10px;color:{conf_color};font-family:var(--font-mono);
+                  margin-bottom:8px;">Conf {h_conf:.0f}%</div>
+                  <div style="display:flex;gap:4px;margin-bottom:6px;">
+                    <div style="flex:1;background:rgba(0,229,160,0.15);border-radius:4px;
+                    padding:3px 4px;text-align:center;">
+                      <div style="font-size:8px;color:var(--muted);">▼ DOWN</div>
+                      <div style="font-size:10px;font-family:var(--font-mono);
+                      color:var(--green);">{h_pdown:.0f}%</div>
+                    </div>
+                    <div style="flex:1;background:rgba(255,176,32,0.15);border-radius:4px;
+                    padding:3px 4px;text-align:center;">
+                      <div style="font-size:8px;color:var(--muted);">◆ FLAT</div>
+                      <div style="font-size:10px;font-family:var(--font-mono);
+                      color:var(--amber);">{h_pstab:.0f}%</div>
+                    </div>
+                    <div style="flex:1;background:rgba(255,68,102,0.15);border-radius:4px;
+                    padding:3px 4px;text-align:center;">
+                      <div style="font-size:8px;color:var(--muted);">▲ UP</div>
+                      <div style="font-size:10px;font-family:var(--font-mono);
+                      color:var(--red);">{h_pup:.0f}%</div>
+                    </div>
+                  </div>
+                  <div style="font-size:8px;color:var(--muted2);font-family:var(--font-mono);">
+                    {mae_str}{"  ·  " if mae_str and dacc_str else ""}{dacc_str}
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+            st.markdown('<div class="hdivider"></div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div style="font-size:10px;color:var(--muted);margin-bottom:20px;">'
+                '⬆️ XGBoost models trained offline in Google Colab on full CBN history. '
+                'UP = NGN weakening (rate rises). DOWN = NGN strengthening (rate falls). '
+                'Probability bars show confidence split across directions.'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
         # ── 7 TIMEFRAME CARDS ──
         # Row 1: 24H + 7D + 30D
         tf_row1 = st.columns(3)

@@ -1,0 +1,75 @@
+{
+  "trained_at": "2026-03-10T22:57:50.484662",
+  "training_rows": 1456,
+  "validation_rows": 364,
+  "train_date_start": "2015-10-12",
+  "train_date_end": "2024-05-07",
+  "val_date_start": "2024-05-08",
+  "val_date_end": "2026-11-08",
+  "n_features": 95,
+  "direction_threshold": 0.15,
+  "direction_map": {
+    "0": "DOWN",
+    "1": "STABLE",
+    "2": "UP"
+  },
+  "horizons": {
+    "2h": {
+      "days_forward": 1,
+      "hours": 2,
+      "label": "2 Hours"
+    },
+    "10h": {
+      "days_forward": 1,
+      "hours": 10,
+      "label": "10 Hours"
+    },
+    "24h": {
+      "days_forward": 1,
+      "hours": 24,
+      "label": "24 Hours"
+    },
+    "48h": {
+      "days_forward": 2,
+      "hours": 48,
+      "label": "48 Hours"
+    },
+    "7d": {
+      "days_forward": 7,
+      "hours": 168,
+      "label": "7 Days"
+    }
+  },
+  "performance": {
+    "2h": {
+      "val_mae_ngn": 57.87,
+      "val_mape_pct": 3.9707,
+      "dir_accuracy": 68.68
+    },
+    "10h": {
+      "val_mae_ngn": 58.21,
+      "val_mape_pct": 4.0159,
+      "dir_accuracy": 59.34
+    },
+    "24h": {
+      "val_mae_ngn": 65.59,
+      "val_mape_pct": 4.4707,
+      "dir_accuracy": 56.59
+    },
+    "48h": {
+      "val_mae_ngn": 186.92,
+      "val_mape_pct": 12.6103,
+      "dir_accuracy": 57.69
+    },
+    "7d": {
+      "val_mae_ngn": 68.12,
+      "val_mape_pct": 4.691,
+      "dir_accuracy": 42.03
+    }
+  },
+  "retraining_policy": {
+    "recommended_frequency": "biweekly",
+    "retrain_if_mae_above": 50.0,
+    "retrain_if_accuracy_below": 55.0
+  }
+}
